@@ -9,6 +9,7 @@ import (
 	"crypto/md5"
 	"crypto/rand"
 	"database/sql"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -30,6 +31,7 @@ import (
 	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
 	"github.com/redis/go-redis/v9"
+	"golang.org/x/net/proxy"
 )
 
 // 从环境变量加载的配置
@@ -45,6 +47,7 @@ var (
 	redisPort       int
 	apiKeyCacheTTL  time.Duration
 	sessionTTL      time.Duration
+	upstreamProxy   string
 )
 
 const (
@@ -239,21 +242,47 @@ func sanitizeGetModelsResponse(respBody []byte) []byte {
 	return sanitized
 }
 
-var httpClient = &http.Client{
-	Transport: &http.Transport{
-		MaxIdleConns:        100,
-		MaxIdleConnsPerHost: 20,
-		IdleConnTimeout:     90 * time.Second,
-	},
-}
+var httpClient *http.Client
+var sseHttpClient *http.Client
 
-var sseHttpClient = &http.Client{
-	Transport: &http.Transport{
-		MaxIdleConns:        100,
-		MaxIdleConnsPerHost: 20,
-		IdleConnTimeout:     90 * time.Second,
-		DisableCompression:  true, // 禁用压缩以支持流式传输
-	},
+// upstreamProxyFunc 给定一个目标请求，返回应使用的代理 URL（nil 表示直连）。
+// 与 httpClient.Transport.Proxy 共享同一份解析逻辑，供 health probe 复用。
+var upstreamProxyFunc func(*http.Request) (*url.URL, error)
+
+// initHTTPClients 根据配置初始化向上游请求的 HTTP 客户端。
+// 若设置了 UPSTREAM_PROXY 则强制走该代理，否则回退到标准的
+// HTTP_PROXY / HTTPS_PROXY / NO_PROXY 环境变量。
+func initHTTPClients() {
+	proxyFunc := http.ProxyFromEnvironment
+	if upstreamProxy != "" {
+		u, err := url.Parse(upstreamProxy)
+		if err != nil || u.Scheme == "" || u.Host == "" {
+			log.Printf("[PROXY] UPSTREAM_PROXY 无效，已忽略: %q (err=%v)", upstreamProxy, err)
+		} else {
+			proxyFunc = http.ProxyURL(u)
+			log.Printf("[PROXY] 上游请求将通过代理: %s://%s", u.Scheme, u.Host)
+		}
+	}
+	upstreamProxyFunc = proxyFunc
+
+	httpClient = &http.Client{
+		Transport: &http.Transport{
+			Proxy:               proxyFunc,
+			MaxIdleConns:        100,
+			MaxIdleConnsPerHost: 20,
+			IdleConnTimeout:     90 * time.Second,
+		},
+	}
+
+	sseHttpClient = &http.Client{
+		Transport: &http.Transport{
+			Proxy:               proxyFunc,
+			MaxIdleConns:        100,
+			MaxIdleConnsPerHost: 20,
+			IdleConnTimeout:     90 * time.Second,
+			DisableCompression:  true, // 禁用压缩以支持流式传输
+		},
+	}
 }
 
 // 全局数据库连接
@@ -277,6 +306,7 @@ func loadConfig() {
 	redisPort = getEnvInt("REDIS_PORT", 6379)
 	apiKeyCacheTTL = getEnvDuration("API_KEY_CACHE_TTL", 30*time.Minute)
 	sessionTTL = getEnvDuration("SESSION_TTL", 5*time.Minute)
+	upstreamProxy = getEnv("UPSTREAM_PROXY", "")
 }
 
 func getEnv(key, defaultValue string) string {
@@ -1103,6 +1133,75 @@ func healthProbeHeaders() http.Header {
 	return h
 }
 
+// dialUpstreamForPing 建立到上游 hostPort 的 TCP 连接，必要时穿过 proxyURL 指定的代理。
+// 用于健康检查测量"本地→（代理→）上游"的完整握手 RTT。调用方负责 Close 返回的 conn。
+// 仅支持 socks5 / socks5h / http 代理；https-proxy（到代理本身走 TLS）暂不支持。
+func dialUpstreamForPing(ctx context.Context, upstreamHostPort string, proxyURL *url.URL) (net.Conn, error) {
+	dialer := &net.Dialer{}
+	if proxyURL == nil {
+		return dialer.DialContext(ctx, "tcp", upstreamHostPort)
+	}
+	switch strings.ToLower(proxyURL.Scheme) {
+	case "socks5", "socks5h":
+		var auth *proxy.Auth
+		if proxyURL.User != nil {
+			pass, _ := proxyURL.User.Password()
+			auth = &proxy.Auth{User: proxyURL.User.Username(), Password: pass}
+		}
+		d, err := proxy.SOCKS5("tcp", proxyURL.Host, auth, dialer)
+		if err != nil {
+			return nil, err
+		}
+		if cd, ok := d.(proxy.ContextDialer); ok {
+			return cd.DialContext(ctx, "tcp", upstreamHostPort)
+		}
+		return d.Dial("tcp", upstreamHostPort)
+	case "http":
+		return dialViaHTTPConnect(ctx, dialer, upstreamHostPort, proxyURL)
+	default:
+		return nil, fmt.Errorf("unsupported proxy scheme for tcp-ping: %q", proxyURL.Scheme)
+	}
+}
+
+// dialViaHTTPConnect 通过 HTTP CONNECT 代理建立到 target 的隧道连接。
+func dialViaHTTPConnect(ctx context.Context, dialer *net.Dialer, target string, proxyURL *url.URL) (net.Conn, error) {
+	proxyHost := proxyURL.Host
+	if !strings.Contains(proxyHost, ":") {
+		proxyHost += ":80"
+	}
+	conn, err := dialer.DialContext(ctx, "tcp", proxyHost)
+	if err != nil {
+		return nil, err
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = conn.SetDeadline(deadline)
+	}
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n", target, target)
+	if proxyURL.User != nil {
+		pass, _ := proxyURL.User.Password()
+		token := base64.StdEncoding.EncodeToString([]byte(proxyURL.User.Username() + ":" + pass))
+		fmt.Fprintf(&sb, "Proxy-Authorization: Basic %s\r\n", token)
+	}
+	sb.WriteString("\r\n")
+	if _, err := conn.Write([]byte(sb.String())); err != nil {
+		conn.Close()
+		return nil, err
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: "CONNECT"})
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		conn.Close()
+		return nil, fmt.Errorf("proxy CONNECT %s: %s", target, resp.Status)
+	}
+	_ = conn.SetDeadline(time.Time{})
+	return conn, nil
+}
+
 func runHealthProbe() {
 	ctx, cancel := context.WithTimeout(context.Background(), HealthCheckTimeout)
 	defer cancel()
@@ -1126,6 +1225,10 @@ func runHealthProbe() {
 	base := strings.TrimRight(augmentAPIURL, "/")
 
 	// Step 0: TCP ping
+	// 测的是建立到"上游 IP"的 TCP 连接所需时间。
+	// 若配置了代理，会穿过代理（SOCKS5/HTTP CONNECT）建立隧道，时延 ≈
+	// 本地→代理 RTT + 代理→上游 RTT。本地代理的第一段 <1ms 是噪声，
+	// 主体就是代理到上游的真实握手 RTT。
 	u, _ := url.Parse(augmentAPIURL)
 	tcpHost := u.Host
 	if !strings.Contains(tcpHost, ":") {
@@ -1135,8 +1238,15 @@ func runHealthProbe() {
 			tcpHost += ":80"
 		}
 	}
+	var proxyURL *url.URL
+	if upstreamProxyFunc != nil {
+		fakeReq, _ := http.NewRequest("GET", augmentAPIURL, nil)
+		if pu, perr := upstreamProxyFunc(fakeReq); perr == nil && pu != nil {
+			proxyURL = pu
+		}
+	}
 	t0 := time.Now()
-	conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", tcpHost)
+	conn, err := dialUpstreamForPing(ctx, tcpHost, proxyURL)
 	tcpPingMs = sql.NullInt64{Int64: time.Since(t0).Milliseconds(), Valid: true}
 	if err != nil {
 		status = "error"
@@ -1240,6 +1350,9 @@ func startHealthScheduler(ctx context.Context) {
 func main() {
 	// 加载配置
 	loadConfig()
+
+	// 初始化 HTTP 客户端（含上游代理配置）
+	initHTTPClients()
 
 	// 设置日志同时输出到控制台和文件
 	logFile, err := os.OpenFile("gin.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
