@@ -182,8 +182,8 @@ func generateRandomTenantName() string {
 
 // 模拟 CLI/插件 的 User-Agent，每个 session 随机绑定一种
 var fakeUserAgents = []string{
-	"augment.cli/0.15.0 (commit 8c3839b5)/interactive",
-	"Augment.vscode-augment/0.754.3 (darwin; arm64; 25.2.0) vscode/1.109.2",
+	"augment.cli/0.27.1 (commit c7a6130f)/interactive",
+	"Augment.vscode-augment/0.859.7 (darwin; arm64; 25.2.0) vscode/1.120.0",
 }
 
 // sessionInfo 存储在 Redis 中的会话信息
