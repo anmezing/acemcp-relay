@@ -29,6 +29,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/joho/godotenv"
+	"github.com/klauspost/compress/zstd"
 	_ "github.com/lib/pq"
 	"github.com/redis/go-redis/v9"
 	"golang.org/x/net/proxy"
@@ -639,7 +640,12 @@ func validateChatStreamRequest(body []byte) error {
 // ── 压缩相关 ──────────────────────────────────────────────────────────────
 
 // compressMinBytes 低于此大小的 body 不压缩，避免小数据压缩后膨胀
-const compressMinBytes = 128
+const compressMinBytes = 1024
+
+// brotliLevel brotli 压缩等级。
+// 默认 DefaultCompression(=6) 在 profile 中占用 CPU 过高，
+// 降到 4 后速度约 3-5x，压缩比仅低 5-10%。
+const brotliLevel = 4
 
 // encodingPriority 定义支持的编码及其优先级，数值越大越优先
 var encodingPriority = map[string]int{
@@ -649,20 +655,28 @@ var encodingPriority = map[string]int{
 	"identity": 1,
 }
 
-// compressBodyBrotli 使用 brotli 压缩数据，失败时返回原始数据和 error
-func compressBodyBrotli(data []byte) ([]byte, error) {
+// zstdEncoder 进程级全局 zstd encoder。EncodeAll 并发安全，
+// klauspost/compress 内部已池化 encoder state，无需我们再加 sync.Pool。
+// 用 SpeedFastest（接近 gzip-1 速度但压缩比更好），优先把 CPU 占用打下来。
+// WithEncoderConcurrency(1) 避免每次调用 fork 多个 goroutine 并行压一个 body —
+// 我们的并发已经在请求层面，再 fork 反而抢 CPU。
+var zstdEncoder = func() *zstd.Encoder {
+	enc, err := zstd.NewWriter(nil,
+		zstd.WithEncoderLevel(zstd.SpeedFastest),
+		zstd.WithEncoderConcurrency(1),
+	)
+	if err != nil {
+		log.Fatalf("[ZSTD] init encoder failed: %v", err)
+	}
+	return enc
+}()
+
+// compressBodyZstd 使用 zstd 压缩请求体。小于阈值的不压缩。
+func compressBodyZstd(data []byte) []byte {
 	if len(data) < compressMinBytes {
-		return data, nil
+		return data
 	}
-	var buf bytes.Buffer
-	w := brotli.NewWriterLevel(&buf, brotli.DefaultCompression)
-	if _, err := w.Write(data); err != nil {
-		return data, fmt.Errorf("brotli write: %w", err)
-	}
-	if err := w.Close(); err != nil {
-		return data, fmt.Errorf("brotli close: %w", err)
-	}
-	return buf.Bytes(), nil
+	return zstdEncoder.EncodeAll(data, nil)
 }
 
 // negotiateEncoding 解析 Accept-Encoding 头，返回最佳匹配编码
@@ -753,7 +767,7 @@ func compressResponse(data []byte, encoding string) ([]byte, string) {
 
 	switch encoding {
 	case "br":
-		w := brotli.NewWriterLevel(&buf, brotli.DefaultCompression)
+		w := brotli.NewWriterLevel(&buf, brotliLevel)
 		_, err = w.Write(data)
 		if closeErr := w.Close(); err == nil {
 			err = closeErr
@@ -796,12 +810,9 @@ func proxyHandler(c *gin.Context) {
 		return
 	}
 
-	// 请求体 brotli 压缩（小于阈值不压缩）
-	compressedBody, compErr := compressBodyBrotli(body)
-	useCompressedReq := compErr == nil && len(body) >= compressMinBytes
-	if compErr != nil {
-		log.Printf("[COMPRESS] Request brotli compression failed: %v, sending uncompressed", compErr)
-	}
+	// 请求体 zstd 压缩（小于阈值不压缩）
+	compressedBody := compressBodyZstd(body)
+	useCompressedReq := len(body) >= compressMinBytes
 
 	targetURL := augmentAPIURL + c.Request.URL.Path
 
@@ -830,7 +841,7 @@ func proxyHandler(c *gin.Context) {
 	}
 
 	if useCompressedReq {
-		req.Header.Set("Content-Encoding", "br")
+		req.Header.Set("Content-Encoding", "zstd")
 	}
 
 	// 注入模拟 CLI/插件 请求头
