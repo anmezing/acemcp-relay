@@ -7,10 +7,8 @@ require (
 	github.com/gin-gonic/gin v1.11.0
 	github.com/google/uuid v1.6.0
 	github.com/joho/godotenv v1.5.1
-	github.com/klauspost/compress v1.18.6
 	github.com/lib/pq v1.10.9
 	github.com/redis/go-redis/v9 v9.17.2
-	golang.org/x/net v0.42.0
 )
 
 require (
@@ -41,6 +39,7 @@ require (
 	golang.org/x/arch v0.20.0 // indirect
 	golang.org/x/crypto v0.40.0 // indirect
 	golang.org/x/mod v0.25.0 // indirect
+	golang.org/x/net v0.42.0 // indirect
 	golang.org/x/sync v0.16.0 // indirect
 	golang.org/x/sys v0.35.0 // indirect
 	golang.org/x/text v0.27.0 // indirect
