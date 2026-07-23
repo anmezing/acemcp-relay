@@ -941,6 +941,14 @@ func handleMCPToolsCall(c *gin.Context, id json.RawMessage, params json.RawMessa
 	}
 	p.Arguments["tenant_id"] = userID
 
+	if p.Name == "codebase_clear_index" {
+		if err := checkClearIndexCooldown(c.Request.Context(), userID); err != nil {
+			c.JSON(http.StatusOK, rpcError(id, -32000, err.Error()))
+			completeRequestLogAsync(getRequestLogEntry(c, http.StatusOK))
+			return
+		}
+	}
+
 	result, err := lce.callTool(c.Request.Context(), p.Name, p.Arguments)
 	if err != nil {
 		if errors.Is(c.Request.Context().Err(), context.Canceled) {
@@ -951,6 +959,11 @@ func handleMCPToolsCall(c *gin.Context, id json.RawMessage, params json.RawMessa
 		c.JSON(http.StatusOK, rpcError(id, -32000, err.Error()))
 		completeRequestLogAsync(getRequestLogEntry(c, http.StatusOK))
 		return
+	}
+
+	if p.Name == "codebase_clear_index" {
+		setClearIndexCooldown(c.Request.Context(), userID)
+		deleteUserLogsAsync(userID)
 	}
 
 	if shouldDebugCapture("/mcp") {
@@ -964,6 +977,88 @@ func handleMCPToolsCall(c *gin.Context, id json.RawMessage, params json.RawMessa
 		},
 		"isError": result.IsError,
 	}))
+	completeRequestLogAsync(getRequestLogEntry(c, http.StatusOK))
+}
+
+// ── 清除索引（冷却 + 日志清理）──────────────────────────────────────────
+
+const clearIndexCooldownSeconds = 72 * 60 * 60 // 72 hours
+
+func clearIndexCooldownKey(userID string) string {
+	return "clear_cooldown:" + userID
+}
+
+func checkClearIndexCooldown(ctx context.Context, userID string) error {
+	if redisClient == nil {
+		return nil
+	}
+	ttl, err := redisClient.TTL(ctx, clearIndexCooldownKey(userID)).Result()
+	if err != nil || ttl <= 0 {
+		return nil
+	}
+	hours := int(ttl.Hours())
+	minutes := int(ttl.Minutes()) % 60
+	return fmt.Errorf("清除索引冷却中，剩余 %d 小时 %d 分钟后可再次操作", hours, minutes)
+}
+
+func setClearIndexCooldown(ctx context.Context, userID string) {
+	if redisClient == nil {
+		return
+	}
+	redisClient.Set(ctx, clearIndexCooldownKey(userID), "1", time.Duration(clearIndexCooldownSeconds)*time.Second)
+}
+
+func deleteUserLogsAsync(userID string) {
+	go func() {
+		_, err := db.Exec(`DELETE FROM error_details WHERE request_id IN (SELECT id FROM request_logs WHERE user_id = $1)`, userID)
+		if err != nil {
+			log.Printf("[ERROR] Failed to delete error_details for user %s: %v", userID, err)
+		}
+		result, err := db.Exec(`DELETE FROM request_logs WHERE user_id = $1`, userID)
+		if err != nil {
+			log.Printf("[ERROR] Failed to delete request_logs for user %s: %v", userID, err)
+		} else if rows, _ := result.RowsAffected(); rows > 0 {
+			log.Printf("[CLEAR_INDEX] Deleted %d request logs for user %s", rows, userID)
+		}
+	}()
+}
+
+func handleClearIndex(c *gin.Context) {
+	userID, _ := c.Get(ContextKeyUserID)
+	userIDStr, _ := userID.(string)
+	if userIDStr == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+		completeRequestLogAsync(getRequestLogEntry(c, http.StatusUnauthorized))
+		return
+	}
+
+	if err := checkClearIndexCooldown(c.Request.Context(), userIDStr); err != nil {
+		c.JSON(http.StatusTooManyRequests, gin.H{"error": err.Error()})
+		completeRequestLogAsync(getRequestLogEntry(c, http.StatusTooManyRequests))
+		return
+	}
+
+	args := map[string]interface{}{"tenant_id": userIDStr}
+	result, err := lce.callTool(c.Request.Context(), "codebase_clear_index", args)
+	if err != nil {
+		logIDStr, _ := c.Get(ContextKeyLogID)
+		logIDVal, _ := logIDStr.(string)
+		saveErrorDetailsAsync(logIDVal, "lce", err.Error(), getInsertDone(c))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "清除索引失败: " + err.Error()})
+		completeRequestLogAsync(getRequestLogEntry(c, http.StatusInternalServerError))
+		return
+	}
+
+	if result.IsError {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "清除索引失败", "detail": string(result.Content)})
+		completeRequestLogAsync(getRequestLogEntry(c, http.StatusInternalServerError))
+		return
+	}
+
+	setClearIndexCooldown(c.Request.Context(), userIDStr)
+	deleteUserLogsAsync(userIDStr)
+
+	c.JSON(http.StatusOK, gin.H{"success": true, "message": "索引和日志已清除"})
 	completeRequestLogAsync(getRequestLogEntry(c, http.StatusOK))
 }
 
@@ -1322,6 +1417,7 @@ func main() {
 
 	r.POST("/mcp", handleMCPPost)
 	r.DELETE("/mcp", handleMCPDelete)
+	r.POST("/mcp/clear-index", handleClearIndex)
 
 	r.NoRoute(func(c *gin.Context) {
 		if shouldDebugCapture(c.Request.URL.Path) {
