@@ -1062,6 +1062,51 @@ func handleClearIndex(c *gin.Context) {
 	completeRequestLogAsync(getRequestLogEntry(c, http.StatusOK))
 }
 
+func handleTenantStats(c *gin.Context) {
+	userID, _ := c.Get(ContextKeyUserID)
+	userIDStr, _ := userID.(string)
+	if userIDStr == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+		completeRequestLogAsync(getRequestLogEntry(c, http.StatusUnauthorized))
+		return
+	}
+
+	args := map[string]interface{}{"tenant_id": userIDStr}
+	result, err := lce.callTool(c.Request.Context(), "codebase_tenant_stats", args)
+	if err != nil {
+		logIDStr, _ := c.Get(ContextKeyLogID)
+		logIDVal, _ := logIDStr.(string)
+		saveErrorDetailsAsync(logIDVal, "lce", err.Error(), getInsertDone(c))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "获取统计失败: " + err.Error()})
+		completeRequestLogAsync(getRequestLogEntry(c, http.StatusInternalServerError))
+		return
+	}
+
+	if result.IsError {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "获取统计失败", "detail": string(result.Content)})
+		completeRequestLogAsync(getRequestLogEntry(c, http.StatusInternalServerError))
+		return
+	}
+
+	var stats map[string]interface{}
+	if err := json.Unmarshal(result.Content, &stats); err != nil {
+		c.JSON(http.StatusOK, gin.H{"raw": string(result.Content)})
+		completeRequestLogAsync(getRequestLogEntry(c, http.StatusOK))
+		return
+	}
+
+	var indexingCount int
+	row := db.QueryRow(
+		`SELECT COUNT(*) FROM request_logs WHERE user_id = $1 AND request_path = '/mcp' AND status_code = 200`,
+		userIDStr,
+	)
+	_ = row.Scan(&indexingCount)
+	stats["indexingCount"] = indexingCount
+
+	c.JSON(http.StatusOK, stats)
+	completeRequestLogAsync(getRequestLogEntry(c, http.StatusOK))
+}
+
 func handleMCPDelete(c *gin.Context) {
 	sessionID := c.GetHeader("Mcp-Session-Id")
 	if sessionID == "" {
@@ -1418,6 +1463,7 @@ func main() {
 	r.POST("/mcp", handleMCPPost)
 	r.DELETE("/mcp", handleMCPDelete)
 	r.POST("/mcp/clear-index", handleClearIndex)
+	r.GET("/mcp/tenant-stats", handleTenantStats)
 
 	r.NoRoute(func(c *gin.Context) {
 		if shouldDebugCapture(c.Request.URL.Path) {
