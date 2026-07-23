@@ -1,28 +1,4 @@
 services:
-  postgres:
-    image: postgres:17-alpine
-    restart: unless-stopped
-    environment:
-      POSTGRES_USER: ${POSTGRES_USER:-postgres}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
-      POSTGRES_DB: ${POSTGRES_DB:-lce_relay}
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
-      interval: 5s
-      timeout: 3s
-      retries: 5
-
-  redis:
-    image: redis:7-alpine
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
-      timeout: 3s
-      retries: 5
-
   lce:
     build: ../../lce
     restart: unless-stopped
@@ -50,21 +26,20 @@ services:
     restart: unless-stopped
     ports:
       - "127.0.0.1:3009:3009"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
       lce:
         condition: service_healthy
     environment:
       SERVER_ADDR: "0.0.0.0:3009"
       LCE_MCP_URL: http://lce:3000/mcp
-      DB_HOST: postgres
+      DB_HOST: host.docker.internal
       DB_PORT: "5432"
       DB_USER: ${POSTGRES_USER:-postgres}
       DB_PASSWORD: ${POSTGRES_PASSWORD}
       DB_NAME: ${POSTGRES_DB:-lce_relay}
+      REDIS_HOST: host.docker.internal
       REDIS_PORT: "6379"
       API_KEY_CACHE_TTL: ${API_KEY_CACHE_TTL:-30m}
 
@@ -73,11 +48,8 @@ services:
     restart: unless-stopped
     ports:
       - "127.0.0.1:3001:3001"
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
       PORT: "3001"
       BETTER_AUTH_URL: ${BETTER_AUTH_URL:-https://513689.xyz}
@@ -87,14 +59,13 @@ services:
       AUTH_GITHUB_ID: ${AUTH_GITHUB_ID:-}
       AUTH_GITHUB_SECRET: ${AUTH_GITHUB_SECRET:-}
       AUTH_GITHUB_MIN_ACCOUNT_AGE_DAYS: ${AUTH_GITHUB_MIN_ACCOUNT_AGE_DAYS:-365}
-      POSTGRES_HOST: postgres
+      POSTGRES_HOST: host.docker.internal
       POSTGRES_PORT: "5432"
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB:-lce_relay}
-      REDIS_HOST: redis
+      REDIS_HOST: host.docker.internal
       REDIS_PORT: "6379"
 
 volumes:
-  pgdata:
   lce_data:
