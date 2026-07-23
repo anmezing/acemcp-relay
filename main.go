@@ -40,6 +40,7 @@ var (
 	dbUser               string
 	dbPassword           string
 	dbName               string
+	redisHost            string
 	redisPort            int
 	apiKeyCacheTTL       time.Duration
 	debugCapturePaths    map[string]bool
@@ -74,6 +75,7 @@ func loadConfig() {
 	dbUser = getEnv("DB_USER", "postgres")
 	dbPassword = getEnv("DB_PASSWORD", "")
 	dbName = getEnv("DB_NAME", "postgres")
+	redisHost = getEnv("REDIS_HOST", "localhost")
 	redisPort = getEnvInt("REDIS_PORT", 6379)
 	apiKeyCacheTTL = getEnvDuration("API_KEY_CACHE_TTL", 30*time.Minute)
 	debugCapturePaths = parsePathSet(getEnv("DEBUG_CAPTURE_PATHS", ""))
@@ -528,7 +530,7 @@ func initDB() error {
 
 func initRedis() error {
 	redisClient = redis.NewClient(&redis.Options{
-		Addr: fmt.Sprintf("localhost:%d", redisPort),
+		Addr: fmt.Sprintf("%s:%d", redisHost, redisPort),
 		DB:   0,
 	})
 	_, err := redisClient.Ping(context.Background()).Result()
