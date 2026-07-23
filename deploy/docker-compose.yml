@@ -48,6 +48,8 @@ services:
   relay:
     build: ../
     restart: unless-stopped
+    ports:
+      - "127.0.0.1:3009:3009"
     depends_on:
       postgres:
         condition: service_healthy
@@ -69,6 +71,8 @@ services:
   frontend:
     build: ../../acemcp-relay-frontend
     restart: unless-stopped
+    ports:
+      - "127.0.0.1:3001:3001"
     depends_on:
       postgres:
         condition: service_healthy
@@ -90,19 +94,6 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-lce_relay}
       REDIS_HOST: redis
       REDIS_PORT: "6379"
-
-  nginx:
-    image: nginx:alpine
-    restart: unless-stopped
-    ports:
-      - "${HTTP_PORT:-80}:80"
-      - "${HTTPS_PORT:-443}:443"
-    volumes:
-      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
-      - ${SSL_CERT_PATH:-./certs}:/etc/nginx/certs:ro
-    depends_on:
-      - relay
-      - frontend
 
 volumes:
   pgdata:
