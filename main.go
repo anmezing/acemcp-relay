@@ -345,7 +345,7 @@ func (m *mcpClient) toolsList(ctx context.Context) error {
 
 	req, _ := http.NewRequestWithContext(ctx, "POST", lceMCPURL, bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
 	req.Header.Set("Mcp-Session-Id", sid)
 
 	resp, err := m.http.Do(req)
