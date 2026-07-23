@@ -1023,6 +1023,153 @@ func deleteUserLogsAsync(userID string) {
 	}()
 }
 
+func handleFindMissing(c *gin.Context) {
+	userID, _ := c.Get(ContextKeyUserID)
+	userIDStr, _ := userID.(string)
+	if userIDStr == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+		completeRequestLogAsync(getRequestLogEntry(c, http.StatusUnauthorized))
+		return
+	}
+
+	var req struct {
+		Files []struct {
+			Path string `json:"path"`
+			Hash string `json:"hash"`
+			Size int64  `json:"size"`
+		} `json:"files"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		completeRequestLogAsync(getRequestLogEntry(c, http.StatusBadRequest))
+		return
+	}
+
+	filesArg := make([]map[string]interface{}, len(req.Files))
+	for i, f := range req.Files {
+		filesArg[i] = map[string]interface{}{"path": f.Path, "hash": f.Hash, "size": f.Size}
+	}
+	args := map[string]interface{}{"tenant_id": userIDStr, "files": filesArg}
+	result, err := lce.callTool(c.Request.Context(), "codebase_find_missing", args)
+	if err != nil {
+		logIDStr, _ := c.Get(ContextKeyLogID)
+		logIDVal, _ := logIDStr.(string)
+		saveErrorDetailsAsync(logIDVal, "lce", err.Error(), getInsertDone(c))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		completeRequestLogAsync(getRequestLogEntry(c, http.StatusInternalServerError))
+		return
+	}
+
+	if result.IsError {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": string(result.Content)})
+		completeRequestLogAsync(getRequestLogEntry(c, http.StatusInternalServerError))
+		return
+	}
+
+	c.Data(http.StatusOK, "application/json", result.Content)
+	completeRequestLogAsync(getRequestLogEntry(c, http.StatusOK))
+}
+
+func handleRemoteIndex(c *gin.Context) {
+	userID, _ := c.Get(ContextKeyUserID)
+	userIDStr, _ := userID.(string)
+	if userIDStr == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+		completeRequestLogAsync(getRequestLogEntry(c, http.StatusUnauthorized))
+		return
+	}
+
+	var req struct {
+		Files []struct {
+			Path    string `json:"path"`
+			Content string `json:"content"`
+			Hash    string `json:"hash"`
+		} `json:"files"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		completeRequestLogAsync(getRequestLogEntry(c, http.StatusBadRequest))
+		return
+	}
+
+	filesArg := make([]map[string]interface{}, len(req.Files))
+	for i, f := range req.Files {
+		filesArg[i] = map[string]interface{}{"path": f.Path, "content": f.Content, "hash": f.Hash}
+	}
+	args := map[string]interface{}{"tenant_id": userIDStr, "files": filesArg}
+	result, err := lce.callTool(c.Request.Context(), "codebase_remote_index", args)
+	if err != nil {
+		logIDStr, _ := c.Get(ContextKeyLogID)
+		logIDVal, _ := logIDStr.(string)
+		saveErrorDetailsAsync(logIDVal, "lce", err.Error(), getInsertDone(c))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		completeRequestLogAsync(getRequestLogEntry(c, http.StatusInternalServerError))
+		return
+	}
+
+	if result.IsError {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": string(result.Content)})
+		completeRequestLogAsync(getRequestLogEntry(c, http.StatusInternalServerError))
+		return
+	}
+
+	c.Data(http.StatusOK, "application/json", result.Content)
+	completeRequestLogAsync(getRequestLogEntry(c, http.StatusOK))
+}
+
+func handleCodebaseRetrieval(c *gin.Context) {
+	userID, _ := c.Get(ContextKeyUserID)
+	userIDStr, _ := userID.(string)
+	if userIDStr == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+		completeRequestLogAsync(getRequestLogEntry(c, http.StatusUnauthorized))
+		return
+	}
+
+	var req struct {
+		InformationRequest string      `json:"information_request"`
+		Blobs              interface{} `json:"blobs"`
+		MaxOutputLength    int         `json:"max_output_length"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		completeRequestLogAsync(getRequestLogEntry(c, http.StatusBadRequest))
+		return
+	}
+
+	if req.MaxOutputLength <= 0 {
+		req.MaxOutputLength = 20000
+	}
+
+	args := map[string]interface{}{
+		"tenant_id": userIDStr,
+		"query":     req.InformationRequest,
+	}
+	result, err := lce.callTool(c.Request.Context(), "codebase-retrieval", args)
+	if err != nil {
+		logIDStr, _ := c.Get(ContextKeyLogID)
+		logIDVal, _ := logIDStr.(string)
+		saveErrorDetailsAsync(logIDVal, "lce", err.Error(), getInsertDone(c))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		completeRequestLogAsync(getRequestLogEntry(c, http.StatusInternalServerError))
+		return
+	}
+
+	if result.IsError {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": string(result.Content)})
+		completeRequestLogAsync(getRequestLogEntry(c, http.StatusInternalServerError))
+		return
+	}
+
+	content := string(result.Content)
+	if len(content) > req.MaxOutputLength {
+		content = content[:req.MaxOutputLength]
+	}
+
+	c.JSON(http.StatusOK, gin.H{"formatted_retrieval": content})
+	completeRequestLogAsync(getRequestLogEntry(c, http.StatusOK))
+}
+
 func handleClearIndex(c *gin.Context) {
 	userID, _ := c.Get(ContextKeyUserID)
 	userIDStr, _ := userID.(string)
@@ -1464,6 +1611,10 @@ func main() {
 	r.DELETE("/mcp", handleMCPDelete)
 	r.POST("/mcp/clear-index", handleClearIndex)
 	r.GET("/mcp/tenant-stats", handleTenantStats)
+
+	r.POST("/relay/find-missing", handleFindMissing)
+	r.POST("/relay/remote-index", handleRemoteIndex)
+	r.POST("/relay/agents/codebase-retrieval", handleCodebaseRetrieval)
 
 	r.NoRoute(func(c *gin.Context) {
 		if shouldDebugCapture(c.Request.URL.Path) {
