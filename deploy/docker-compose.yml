@@ -1,6 +1,7 @@
 services:
   lce:
     build: ../../lce
+    container_name: lce
     restart: unless-stopped
     volumes:
       - lce_data:/data
@@ -23,6 +24,7 @@ services:
 
   relay:
     build: ../
+    container_name: relay
     restart: unless-stopped
     ports:
       - "127.0.0.1:3009:3009"
@@ -49,6 +51,7 @@ services:
 
   frontend:
     build: ../../acemcp-relay-frontend
+    container_name: frontend
     restart: unless-stopped
     ports:
       - "127.0.0.1:3001:3001"
