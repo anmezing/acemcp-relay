@@ -427,6 +427,9 @@ func handleRemoteIndex(c *gin.Context) {
 	if len(deleted) > 0 {
 		args["deleted_files"] = deleted
 	}
+	if cfg := resolveModelConfigArg(c.Request.Context(), userID); cfg != nil {
+		args["model_config"] = cfg
+	}
 	result, err := lce.callTool(c.Request.Context(), "codebase_remote_index", args)
 	if err != nil {
 		finishIndexToolError(c, err)

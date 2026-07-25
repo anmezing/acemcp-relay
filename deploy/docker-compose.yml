@@ -49,6 +49,7 @@ services:
       DEVICE_IP_WINDOW: ${DEVICE_IP_WINDOW:-10m}
       DEVICE_MAX_IPS: ${DEVICE_MAX_IPS:-3}
       DEFAULT_DAILY_REQUEST_LIMIT: ${DEFAULT_DAILY_REQUEST_LIMIT:-0}
+      MODEL_CONFIG_SECRET: ${MODEL_CONFIG_SECRET:-}
 
   frontend:
     build: ../../acemcp-relay-frontend
@@ -83,6 +84,7 @@ services:
       RERANK_PROVIDER: ${RERANK_PROVIDER:-}
       RERANK_MODEL: ${RERANK_MODEL:-}
       RERANK_BASE_URL: ${RERANK_BASE_URL:-}
+      MODEL_CONFIG_SECRET: ${MODEL_CONFIG_SECRET:-}
 
 volumes:
   lce_data:

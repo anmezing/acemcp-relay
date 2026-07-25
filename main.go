@@ -92,6 +92,7 @@ func loadConfig() {
 	deviceIPWindow = getEnvDuration("DEVICE_IP_WINDOW", 10*time.Minute)
 	deviceMaxIPs = getEnvInt("DEVICE_MAX_IPS", 3)
 	defaultDailyRequestLimit = getEnvInt("DEFAULT_DAILY_REQUEST_LIMIT", 0)
+	initModelConfigKey()
 	debugCapturePaths = parsePathSet(getEnv("DEBUG_CAPTURE_PATHS", ""))
 	debugCaptureMaxBytes = getEnvInt("DEBUG_CAPTURE_MAX_BYTES", 4096)
 }
@@ -544,6 +545,10 @@ func initDB() error {
 	}
 
 	if err := migrateQuotaTables(); err != nil {
+		return err
+	}
+
+	if err := migrateModelConfigTables(); err != nil {
 		return err
 	}
 
@@ -1020,6 +1025,9 @@ func handleMCPToolsCall(c *gin.Context, id json.RawMessage, params json.RawMessa
 		p.Arguments = make(map[string]interface{})
 	}
 	p.Arguments["tenant_id"] = userID
+	if cfg := resolveModelConfigArg(c.Request.Context(), userID); cfg != nil {
+		p.Arguments["model_config"] = cfg
+	}
 
 	result, err := lce.callTool(c.Request.Context(), p.Name, p.Arguments)
 	if err != nil {
@@ -1117,6 +1125,9 @@ func handleCodebaseRetrieval(c *gin.Context) {
 	args := map[string]interface{}{
 		"tenant_id": userIDStr,
 		"query":     req.InformationRequest,
+	}
+	if cfg := resolveModelConfigArg(c.Request.Context(), userIDStr); cfg != nil {
+		args["model_config"] = cfg
 	}
 	result, err := lce.callTool(c.Request.Context(), "codebase-retrieval", args)
 	if err != nil {
