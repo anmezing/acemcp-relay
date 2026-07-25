@@ -129,6 +129,7 @@ go build -o acemcp-relay .
 | `DEVICE_CACHE_TTL` | 设备注册状态的 Redis 缓存 TTL | `5m` |
 | `DEVICE_IP_WINDOW` | 同设备多 IP 检测的滑动窗口 | `10m` |
 | `DEVICE_MAX_IPS` | 窗口内允许的最大来源 IP 数，超过写 `device_alerts` 告警；`0` 关闭检测 | `3` |
+| `DEFAULT_DAILY_REQUEST_LIMIT` | 每用户每日请求上限默认值（Asia/Shanghai 自然日），超限返回 429；`0` 不限。可在控制台「配额管理」按用户覆盖（`user_quotas` 表，改后即时生效） | `0` |
 
 设备在前端 `/api/auth/device` 登录时注册（插件上报 `vscode.env.machineId`）。
 活跃设备数由前端 `MAX_DEVICES_PER_USER` 控制，默认 `1`，即**单设备互踢**：

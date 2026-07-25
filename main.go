@@ -33,22 +33,23 @@ import (
 // ── 配置 ──────────────────────────────────────────────────────────────────
 
 var (
-	serverAddr           string
-	lceMCPURL            string
-	dbHost               string
-	dbPort               int
-	dbUser               string
-	dbPassword           string
-	dbName               string
-	redisHost            string
-	redisPort            int
-	apiKeyCacheTTL       time.Duration
-	deviceBindingMode    string
-	deviceCacheTTL       time.Duration
-	deviceIPWindow       time.Duration
-	deviceMaxIPs         int
-	debugCapturePaths    map[string]bool
-	debugCaptureMaxBytes int
+	serverAddr               string
+	lceMCPURL                string
+	dbHost                   string
+	dbPort                   int
+	dbUser                   string
+	dbPassword               string
+	dbName                   string
+	redisHost                string
+	redisPort                int
+	apiKeyCacheTTL           time.Duration
+	deviceBindingMode        string
+	deviceCacheTTL           time.Duration
+	deviceIPWindow           time.Duration
+	deviceMaxIPs             int
+	defaultDailyRequestLimit int
+	debugCapturePaths        map[string]bool
+	debugCaptureMaxBytes     int
 )
 
 const (
@@ -90,6 +91,7 @@ func loadConfig() {
 	deviceCacheTTL = getEnvDuration("DEVICE_CACHE_TTL", 5*time.Minute)
 	deviceIPWindow = getEnvDuration("DEVICE_IP_WINDOW", 10*time.Minute)
 	deviceMaxIPs = getEnvInt("DEVICE_MAX_IPS", 3)
+	defaultDailyRequestLimit = getEnvInt("DEFAULT_DAILY_REQUEST_LIMIT", 0)
 	debugCapturePaths = parsePathSet(getEnv("DEBUG_CAPTURE_PATHS", ""))
 	debugCaptureMaxBytes = getEnvInt("DEBUG_CAPTURE_MAX_BYTES", 4096)
 }
@@ -541,6 +543,10 @@ func initDB() error {
 		return err
 	}
 
+	if err := migrateQuotaTables(); err != nil {
+		return err
+	}
+
 	return migrateIndexingTables()
 }
 
@@ -604,6 +610,11 @@ func authMiddleware() gin.HandlerFunc {
 
 		if isUserBanned(userID) {
 			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "account banned; contact the administrator"})
+			return
+		}
+
+		if ok, limit := checkRequestQuota(userID); !ok {
+			c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{"error": fmt.Sprintf("daily request quota exceeded (%d/day)", limit)})
 			return
 		}
 
