@@ -43,6 +43,10 @@ var (
 	redisHost            string
 	redisPort            int
 	apiKeyCacheTTL       time.Duration
+	deviceBindingMode    string
+	deviceCacheTTL       time.Duration
+	deviceIPWindow       time.Duration
+	deviceMaxIPs         int
 	debugCapturePaths    map[string]bool
 	debugCaptureMaxBytes int
 )
@@ -78,6 +82,14 @@ func loadConfig() {
 	redisHost = getEnv("REDIS_HOST", "localhost")
 	redisPort = getEnvInt("REDIS_PORT", 6379)
 	apiKeyCacheTTL = getEnvDuration("API_KEY_CACHE_TTL", 30*time.Minute)
+	deviceBindingMode = strings.ToLower(getEnv("DEVICE_BINDING_MODE", DeviceModeLog))
+	if deviceBindingMode != DeviceModeOff && deviceBindingMode != DeviceModeLog && deviceBindingMode != DeviceModeEnforce {
+		log.Printf("[CONFIG] invalid DEVICE_BINDING_MODE %q, falling back to %q", deviceBindingMode, DeviceModeLog)
+		deviceBindingMode = DeviceModeLog
+	}
+	deviceCacheTTL = getEnvDuration("DEVICE_CACHE_TTL", 5*time.Minute)
+	deviceIPWindow = getEnvDuration("DEVICE_IP_WINDOW", 10*time.Minute)
+	deviceMaxIPs = getEnvInt("DEVICE_MAX_IPS", 3)
 	debugCapturePaths = parsePathSet(getEnv("DEBUG_CAPTURE_PATHS", ""))
 	debugCaptureMaxBytes = getEnvInt("DEBUG_CAPTURE_MAX_BYTES", 4096)
 }
@@ -184,7 +196,7 @@ func (m *mcpClient) initSession(ctx context.Context) (string, error) {
 		"method":  "initialize",
 		"params": map[string]interface{}{
 			"protocolVersion": "2025-03-26",
-			"capabilities":   map[string]interface{}{},
+			"capabilities":    map[string]interface{}{},
 			"clientInfo": map[string]interface{}{
 				"name":    "acemcp-relay",
 				"version": "1.0.0",
@@ -525,7 +537,11 @@ func initDB() error {
 		return fmt.Errorf("failed to create health_checks index: %w", err)
 	}
 
-	return nil
+	if err := migrateDeviceTables(); err != nil {
+		return err
+	}
+
+	return migrateIndexingTables()
 }
 
 func initRedis() error {
@@ -585,6 +601,20 @@ func authMiddleware() gin.HandlerFunc {
 		}
 
 		c.Set(ContextKeyUserID, userID)
+
+		if isUserBanned(userID) {
+			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "account banned; contact the administrator"})
+			return
+		}
+
+		deviceID, deviceOK := checkDeviceBinding(c, userID)
+		if !deviceOK {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "device not authorized: this account is signed in on another device; log in again to use it here"})
+			return
+		}
+		if deviceID != "" {
+			go recordDeviceActivity(userID, deviceID, c.ClientIP())
+		}
 
 		logID := uuid.New().String()
 		c.Set(ContextKeyLogID, logID)
@@ -716,6 +746,36 @@ const (
 	toolsCacheTTL           = 5 * time.Minute
 )
 
+var chatMCPDeniedTools = map[string]struct{}{
+	"codebase_clear_index":  {},
+	"codebase_remote_index": {},
+}
+
+func isChatMCPToolAllowed(name string) bool {
+	_, denied := chatMCPDeniedTools[strings.TrimSpace(name)]
+	return !denied
+}
+
+func filterChatMCPTools(raw json.RawMessage) (json.RawMessage, error) {
+	var tools []json.RawMessage
+	if err := json.Unmarshal(raw, &tools); err != nil {
+		return nil, fmt.Errorf("parse MCP tools: %w", err)
+	}
+	filtered := make([]json.RawMessage, 0, len(tools))
+	for _, tool := range tools {
+		var metadata struct {
+			Name string `json:"name"`
+		}
+		if err := json.Unmarshal(tool, &metadata); err != nil {
+			return nil, fmt.Errorf("parse MCP tool metadata: %w", err)
+		}
+		if isChatMCPToolAllowed(metadata.Name) {
+			filtered = append(filtered, tool)
+		}
+	}
+	return json.Marshal(filtered)
+}
+
 type mcpServerSession struct {
 	userID       string
 	lastActivity time.Time
@@ -807,6 +867,10 @@ func getCachedToolsList(ctx context.Context) (json.RawMessage, error) {
 	if err != nil {
 		return nil, err
 	}
+	tools, err = filterChatMCPTools(tools)
+	if err != nil {
+		return nil, err
+	}
 
 	toolsCacheMu.Lock()
 	toolsCache = tools
@@ -871,8 +935,8 @@ func handleMCPPost(c *gin.Context) {
 		c.Header("Mcp-Session-Id", newSID)
 		c.JSON(http.StatusOK, rpcResult(rpc.ID, map[string]interface{}{
 			"protocolVersion": mcpProtocolVersion,
-			"capabilities":   map[string]interface{}{"tools": map[string]interface{}{}},
-			"serverInfo":     map[string]interface{}{"name": mcpRelayName, "version": mcpRelayVersion},
+			"capabilities":    map[string]interface{}{"tools": map[string]interface{}{}},
+			"serverInfo":      map[string]interface{}{"name": mcpRelayName, "version": mcpRelayVersion},
 		}))
 		completeRequestLogAsync(getRequestLogEntry(c, http.StatusOK))
 		log.Printf("[MCP_SERVER] Session created: %s for user %s", newSID, userID)
@@ -930,6 +994,11 @@ func handleMCPToolsCall(c *gin.Context, id json.RawMessage, params json.RawMessa
 		completeRequestLogAsync(getRequestLogEntry(c, http.StatusOK))
 		return
 	}
+	if !isChatMCPToolAllowed(p.Name) {
+		c.JSON(http.StatusOK, rpcError(id, -32601, "Tool not available through chat MCP: "+p.Name))
+		completeRequestLogAsync(getRequestLogEntry(c, http.StatusOK))
+		return
+	}
 
 	logIDStr, _ := c.Get(ContextKeyLogID)
 	logIDVal, _ := logIDStr.(string)
@@ -941,14 +1010,6 @@ func handleMCPToolsCall(c *gin.Context, id json.RawMessage, params json.RawMessa
 	}
 	p.Arguments["tenant_id"] = userID
 
-	if p.Name == "codebase_clear_index" {
-		if err := checkClearIndexCooldown(c.Request.Context(), userID); err != nil {
-			c.JSON(http.StatusOK, rpcError(id, -32000, err.Error()))
-			completeRequestLogAsync(getRequestLogEntry(c, http.StatusOK))
-			return
-		}
-	}
-
 	result, err := lce.callTool(c.Request.Context(), p.Name, p.Arguments)
 	if err != nil {
 		if errors.Is(c.Request.Context().Err(), context.Canceled) {
@@ -959,11 +1020,6 @@ func handleMCPToolsCall(c *gin.Context, id json.RawMessage, params json.RawMessa
 		c.JSON(http.StatusOK, rpcError(id, -32000, err.Error()))
 		completeRequestLogAsync(getRequestLogEntry(c, http.StatusOK))
 		return
-	}
-
-	if p.Name == "codebase_clear_index" {
-		setClearIndexCooldown(c.Request.Context(), userID)
-		deleteUserLogsAsync(userID)
 	}
 
 	if shouldDebugCapture("/mcp") {
@@ -1021,100 +1077,6 @@ func deleteUserLogsAsync(userID string) {
 			log.Printf("[CLEAR_INDEX] Deleted %d request logs for user %s", rows, userID)
 		}
 	}()
-}
-
-func handleFindMissing(c *gin.Context) {
-	userID, _ := c.Get(ContextKeyUserID)
-	userIDStr, _ := userID.(string)
-	if userIDStr == "" {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
-		completeRequestLogAsync(getRequestLogEntry(c, http.StatusUnauthorized))
-		return
-	}
-
-	var req struct {
-		Files []struct {
-			Path string `json:"path"`
-			Hash string `json:"hash"`
-			Size int64  `json:"size"`
-		} `json:"files"`
-	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
-		completeRequestLogAsync(getRequestLogEntry(c, http.StatusBadRequest))
-		return
-	}
-
-	filesArg := make([]map[string]interface{}, len(req.Files))
-	for i, f := range req.Files {
-		filesArg[i] = map[string]interface{}{"path": f.Path, "hash": f.Hash, "size": f.Size}
-	}
-	args := map[string]interface{}{"tenant_id": userIDStr, "files": filesArg}
-	result, err := lce.callTool(c.Request.Context(), "codebase_find_missing", args)
-	if err != nil {
-		logIDStr, _ := c.Get(ContextKeyLogID)
-		logIDVal, _ := logIDStr.(string)
-		saveErrorDetailsAsync(logIDVal, "lce", err.Error(), getInsertDone(c))
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		completeRequestLogAsync(getRequestLogEntry(c, http.StatusInternalServerError))
-		return
-	}
-
-	if result.IsError {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": string(result.Content)})
-		completeRequestLogAsync(getRequestLogEntry(c, http.StatusInternalServerError))
-		return
-	}
-
-	c.Data(http.StatusOK, "application/json", result.Content)
-	completeRequestLogAsync(getRequestLogEntry(c, http.StatusOK))
-}
-
-func handleRemoteIndex(c *gin.Context) {
-	userID, _ := c.Get(ContextKeyUserID)
-	userIDStr, _ := userID.(string)
-	if userIDStr == "" {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
-		completeRequestLogAsync(getRequestLogEntry(c, http.StatusUnauthorized))
-		return
-	}
-
-	var req struct {
-		Files []struct {
-			Path    string `json:"path"`
-			Content string `json:"content"`
-			Hash    string `json:"hash"`
-		} `json:"files"`
-	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
-		completeRequestLogAsync(getRequestLogEntry(c, http.StatusBadRequest))
-		return
-	}
-
-	filesArg := make([]map[string]interface{}, len(req.Files))
-	for i, f := range req.Files {
-		filesArg[i] = map[string]interface{}{"path": f.Path, "content": f.Content, "hash": f.Hash}
-	}
-	args := map[string]interface{}{"tenant_id": userIDStr, "files": filesArg}
-	result, err := lce.callTool(c.Request.Context(), "codebase_remote_index", args)
-	if err != nil {
-		logIDStr, _ := c.Get(ContextKeyLogID)
-		logIDVal, _ := logIDStr.(string)
-		saveErrorDetailsAsync(logIDVal, "lce", err.Error(), getInsertDone(c))
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		completeRequestLogAsync(getRequestLogEntry(c, http.StatusInternalServerError))
-		return
-	}
-
-	if result.IsError {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": string(result.Content)})
-		completeRequestLogAsync(getRequestLogEntry(c, http.StatusInternalServerError))
-		return
-	}
-
-	c.Data(http.StatusOK, "application/json", result.Content)
-	completeRequestLogAsync(getRequestLogEntry(c, http.StatusOK))
 }
 
 func handleCodebaseRetrieval(c *gin.Context) {
@@ -1204,6 +1166,7 @@ func handleClearIndex(c *gin.Context) {
 
 	setClearIndexCooldown(c.Request.Context(), userIDStr)
 	deleteUserLogsAsync(userIDStr)
+	clearUserIndexState(c.Request.Context(), userIDStr)
 
 	c.JSON(http.StatusOK, gin.H{"success": true, "message": "索引和日志已清除"})
 	completeRequestLogAsync(getRequestLogEntry(c, http.StatusOK))
@@ -1244,8 +1207,9 @@ func handleTenantStats(c *gin.Context) {
 
 	var indexingCount int
 	row := db.QueryRow(
-		`SELECT COUNT(*) FROM request_logs WHERE user_id = $1 AND request_path = '/mcp' AND status_code = 200`,
+		`SELECT COUNT(*) FROM index_jobs WHERE user_id = $1 AND status = $2`,
 		userIDStr,
+		indexJobStatusCompleted,
 	)
 	_ = row.Scan(&indexingCount)
 	stats["indexingCount"] = indexingCount
@@ -1590,6 +1554,7 @@ func main() {
 	go startHealthScheduler(ctx)
 
 	go startMCPSessionSweeper(ctx)
+	go startIndexJobSweeper(ctx)
 
 	go func() {
 		pprofMux := http.NewServeMux()
@@ -1612,7 +1577,10 @@ func main() {
 	r.POST("/mcp/clear-index", handleClearIndex)
 	r.GET("/mcp/tenant-stats", handleTenantStats)
 
-	r.POST("/relay/find-missing", handleFindMissing)
+	r.POST("/relay/index-jobs", handleCreateIndexJob)
+	r.GET("/relay/index-jobs/:id", handleGetIndexJob)
+	r.POST("/relay/index-jobs/:id/complete", handleCompleteIndexJob)
+	r.POST("/relay/index-jobs/:id/fail", handleFailIndexJob)
 	r.POST("/relay/remote-index", handleRemoteIndex)
 	r.POST("/relay/agents/codebase-retrieval", handleCodebaseRetrieval)
 

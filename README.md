@@ -1,48 +1,35 @@
 # acemcp-relay
 
-Go HTTP 反向代理服务，用于中继请求到 Augment API。基于 Gin 框架构建，支持标准 HTTP 请求转发和 SSE（Server-Sent Events）流式传输。
+Go HTTP relay 服务，用于在 LCE Coding Agent 插件与 LCE MCP 服务之间协调代码索引和检索。基于 Gin 构建，并使用 PostgreSQL 保存工作区索引快照、任务进度和请求记录。
 
 ## 功能特性
 
-- **API 请求代理**：将客户端请求转发到 Augment API，支持多个预定义的 API 路径
-- **SSE 流式传输**：支持 `/chat-stream` 和 `/prompt-enhancer` 端点的实时流式响应
+- **首次与增量索引**：比较客户端工作区 manifest 与服务端快照，首次返回全量文件，后续只返回新增或变更文件并检测删除文件
+- **索引任务进度**：持久化任务阶段、文件数、chunk 数、分支、revision、心跳和完成状态
+- **LCE MCP 对接**：通过 `codebase_remote_index` 执行索引，通过 `codebase-retrieval` 执行向量召回和精排
 - **API Key 认证**：基于 Bearer Token 的认证中间件，通过 PostgreSQL 存储 API Key，Redis 缓存加速验证
 - **请求日志**：自动记录每个请求的状态、耗时、来源 IP 等信息到 PostgreSQL
 - **错误追踪**：异步记录代理层和上游服务的错误详情
-- **隐私保护**：对 `/get-models` 响应中的用户敏感信息（邮箱、ID、租户等）进行脱敏处理
-- **使用排行榜**：定时统计 `/agents/codebase-retrieval` 端点的用户请求量排行榜（每 30 分钟更新）
-- **请求验证**：对 `/chat-stream` 端点的请求体进行严格校验（mode、system_prompt、message 前缀）
-- **安全拦截**：`/record-request-events` 和 `/report-error` 请求不转发到上游，避免被追踪
-- **健康检查**：每 2 分钟对上游执行一次探活（TCP ping + `/find-missing` + `/batch-upload` + `/agents/codebase-retrieval`），结果写入 `health_checks` 表；TCP ping 测的是建立到上游 IP 的连接耗时 —— 配置了 `UPSTREAM_PROXY` 时会穿过代理（SOCKS5 / HTTP CONNECT）测整条隧道的握手 RTT，主体即代理→上游的真实延迟
-- **上游代理**：通过 `UPSTREAM_PROXY` 配置可将所有发往 Augment API 的请求（含健康检查 TCP ping）走指定代理（http / https / socks5），未配置时回退到标准 `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY` 环境变量
+- **任务回收**：索引任务完成或失败后删除暂存文件；运行任务心跳超时后自动标记并回收
+- **使用排行榜**：定时统计 LCE `codebase-retrieval` 工具请求量（每 30 分钟更新）
+- **健康检查**：每 2 分钟调用 LCE MCP `tools/list`，将可用性和延迟写入 `health_checks`
 - **请求/响应压缩**：对上游请求体使用 zstd 压缩（`SpeedFastest` 等级，小于 1024 字节的 payload 跳过压缩）；响应按客户端 `Accept-Encoding` 协商编码（`br` / `gzip` / `deflate` / `identity`，brotli 等级 4），压缩失败时回退到 identity
 - **性能观测**：内置 pprof 服务（仅监听 `127.0.0.1:6060`），用于运行时 CPU / 内存 profiling
 
 ## 支持的 API 路径
 
-### 标准代理路径
+### Relay 数据面
 
 | 路径 | 说明 |
 |------|------|
-| `/get-models` | 获取模型列表（响应会脱敏） |
-| `/agents/list-remote-tools` | 列出远程工具 |
-| `/find-missing` | 查找缺失资源 |
-| `/batch-upload` | 批量上传 |
-| `/checkpoint-blobs` | 检查点数据 |
-| `/agents/codebase-retrieval` | 代码库检索 |
-| `/record-request-events` | 记录请求事件（拦截，不转发） |
-| `/report-error` | 上报错误（拦截，不转发） |
-| `/settings/get-mcp-user-configs` | 获取用户级 MCP 配置 |
-| `/settings/get-mcp-tenant-configs` | 获取租户级 MCP 配置 |
-| `/indexed-commits/register-blobset` | 注册已索引 commit 的 blobset |
-| `/indexed-commits/get-latest-blobset` | 获取最新的 blobset |
+| `POST /relay/index-jobs` | 提交工作区 manifest，创建全量或增量索引任务并返回待索引、待删除文件 |
+| `GET /relay/index-jobs/:id` | 查询任务阶段、文件进度、chunk 进度和状态，同时刷新任务心跳 |
+| `POST /relay/remote-index` | 上传一个任务批次并调用 LCE `codebase_remote_index` |
+| `POST /relay/index-jobs/:id/complete` | 完成任务，提交服务端工作区快照并回收任务暂存文件 |
+| `POST /relay/index-jobs/:id/fail` | 标记任务失败并回收任务暂存文件 |
+| `POST /relay/agents/codebase-retrieval` | 调用 LCE `codebase-retrieval`，返回向量召回和精排结果 |
 
-### SSE 流式路径
-
-| 路径 | 说明 |
-|------|------|
-| `/chat-stream` | 聊天流式传输（有请求体校验） |
-| `/prompt-enhancer` | Prompt 增强 |
+旧 Augment `/find-missing`、`/batch-upload` 和 `/checkpoint-blobs` blob 协议不再由 relay 提供。插件仅在本地短路遗留的 `/find-missing` 调用，实际索引统一走上述 index-job 链路。
 
 ## 技术栈
 
@@ -84,7 +71,7 @@ cp .env.example .env
 ### 4. 运行
 
 ```bash
-go run main.go
+go run .
 ```
 
 ### 5. 构建
@@ -103,13 +90,11 @@ go build -o acemcp-relay .
 |------|------|--------|
 | `SERVER_ADDR` | 服务监听地址 | `127.0.0.1:8080` |
 
-### Augment API 配置
+### LCE MCP 配置
 
 | 变量 | 说明 | 默认值 |
 |------|------|--------|
-| `AUGMENT_API_URL` | Augment API 上游地址 | （空） |
-| `AUGMENT_API_TOKEN` | Augment API 认证 Token | （空） |
-| `UPSTREAM_PROXY` | 上游请求代理地址（http/https/socks5），留空则回退到 `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` | （空） |
+| `LCE_MCP_URL` | LCE MCP HTTP endpoint | `http://127.0.0.1:3000/mcp` |
 
 ### PostgreSQL 配置
 
@@ -136,6 +121,39 @@ go build -o acemcp-relay .
 |------|------|--------|
 | `SESSION_TTL` | 模拟 CLI/插件 session 的 Redis TTL（Go duration 格式） | `5m` |
 
+### 设备绑定（防账号共用）
+
+| 变量 | 说明 | 默认值 |
+|------|------|--------|
+| `DEVICE_BINDING_MODE` | `off` 不校验；`log` 只记告警不拦截；`enforce` 未注册设备返回 401 | `log` |
+| `DEVICE_CACHE_TTL` | 设备注册状态的 Redis 缓存 TTL | `5m` |
+| `DEVICE_IP_WINDOW` | 同设备多 IP 检测的滑动窗口 | `10m` |
+| `DEVICE_MAX_IPS` | 窗口内允许的最大来源 IP 数，超过写 `device_alerts` 告警；`0` 关闭检测 | `3` |
+
+设备在前端 `/api/auth/device` 登录时注册（插件上报 `vscode.env.machineId`）。
+活跃设备数由前端 `MAX_DEVICES_PER_USER` 控制，默认 `1`，即**单设备互踢**：
+新设备登录立即踢掉旧设备，被踢设备在 `enforce` 模式下收到 401，必须重新走网页
+登录才能使用 —— 换设备无感，共用账号则互相踢下线且每次都要重新 OAuth。
+单设备模式下，**换设备（发生互踢）时还会轮换 API token**：被踢机器上的旧 token
+（包括被复制走的副本）立即失效；此防线不依赖 `DEVICE_BINDING_MODE`，部署前端后
+立即生效。同一台机器的重复登录（多个 IDE / 多窗口 / 重装，machineId 相同）不触发
+互踢也不轮换 token，同机多 IDE 各自登录一次即可共用当前 token。
+每次踢出都会写一条 `device_evicted` 告警，频繁互踢即共用信号：
+
+```sql
+-- 最近 24h 换设备（互踢）次数排行，次数高的基本就是共用账号
+SELECT user_id, COUNT(*) AS evictions
+FROM device_alerts
+WHERE kind = 'device_evicted' AND created_at > NOW() - INTERVAL '1 day'
+GROUP BY user_id ORDER BY evictions DESC LIMIT 20;
+```
+
+灰度路径：先发插件新版本（默认 `log` 模式观察告警），确认老客户端换代完成后切 `enforce`。
+封禁：管理员在控制台「用户管理」封禁账号后写入 `banned_users` 表，relay 对该用户
+所有请求返回 403（缓存 `banned:{user}`，封禁/解封即时生效）；设备登录同样被拒。
+排查：`SELECT * FROM device_alerts ORDER BY created_at DESC LIMIT 50;`
+（`missing_client_id` = 老版本插件或非插件流量；`unregistered_device` = 未登录注册或已被踢的设备；`multi_ip` = 疑似 token 被复制共用；`device_evicted` = 新设备登录踢出旧设备。）
+
 ## 数据库表结构
 
 服务启动时会自动迁移创建以下表：
@@ -143,13 +161,17 @@ go build -o acemcp-relay .
 - **`request_logs`**：请求日志，记录每个请求的用户、路径、状态码、耗时等；日志 INSERT 为异步写入（channel 协调，确保后续 UPDATE / 外键操作等待 INSERT 完成），并在 `(user_id, request_timestamp)` 上建有复合索引
 - **`error_details`**：错误详情，关联到 request_logs，区分代理层（proxy）和上游（upstream）错误
 - **`leaderboard`**：每日用户请求量排行榜
-- **`health_checks`**：上游健康检查历史，记录状态、TCP ping 耗时、codebase-retrieval 耗时、错误信息及下次检查时间
+- **`health_checks`**：LCE MCP 健康检查历史，记录状态、延迟、错误信息及下次检查时间
+- **`index_workspaces`**：用户工作区最近一次完成索引的分支、revision 和时间
+- **`index_jobs`**：索引任务状态、阶段、文件/chunk 进度、心跳和错误
+- **`index_job_files`**：运行中任务的 manifest 和批次提交状态，任务完成、失败或超时后回收
+- **`indexed_files`**：服务端已完成索引的工作区文件快照，用于后续增量比较和删除检测
 
 > 数据库连接池配置为最多 25 个打开/空闲连接，连接生命周期 30 分钟，以减少 SCRAM-SHA-256 认证带来的 CPU 开销。
 
 ## 已知限制
 
-- `/chat-stream` 端点的请求体校验目前不够完善，部分未符合预期的请求仍可能通过校验并转发到上游，导致消耗 credit。
+- chunk 数优先采用 LCE 返回值；LCE 未返回精确数量时，relay 会使用客户端估算值并将 `chunkCountEstimated` 标记为 `true`。
 
 ## 日志
 
