@@ -231,6 +231,25 @@ func diffManifest(previous map[string]indexManifestFile, current []indexManifest
 	return pending, deleted, estimatedChunks
 }
 
+func lockIndexUserTx(ctx context.Context, tx *sql.Tx, userID string) error {
+	_, err := tx.ExecContext(ctx, `
+		SELECT pg_advisory_xact_lock(hashtext('acemcp:index-user'), hashtext($1))
+	`, userID)
+	return err
+}
+
+func beginLockedIndexUserTx(ctx context.Context, userID string) (*sql.Tx, error) {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	if err := lockIndexUserTx(ctx, tx, userID); err != nil {
+		_ = tx.Rollback()
+		return nil, err
+	}
+	return tx, nil
+}
+
 func handleCreateIndexJob(c *gin.Context) {
 	userID := c.GetString(ContextKeyUserID)
 	var req createIndexJobRequest
@@ -252,7 +271,7 @@ func handleCreateIndexJob(c *gin.Context) {
 		return
 	}
 
-	tx, err := db.BeginTx(c.Request.Context(), nil)
+	tx, err := beginLockedIndexUserTx(c.Request.Context(), userID)
 	if err != nil {
 		finishIndexError(c, err)
 		return
@@ -369,9 +388,17 @@ func handleGetIndexJob(c *gin.Context) {
 }
 
 func loadIndexJob(ctx context.Context, userID, jobID string) (indexJobView, error) {
+	return loadIndexJobFrom(ctx, db, userID, jobID)
+}
+
+type indexJobQueryer interface {
+	QueryRowContext(context.Context, string, ...interface{}) *sql.Row
+}
+
+func loadIndexJobFrom(ctx context.Context, queryer indexJobQueryer, userID, jobID string) (indexJobView, error) {
 	var job indexJobView
 	var fallback bool
-	err := db.QueryRowContext(ctx, `
+	err := queryer.QueryRowContext(ctx, `
 		SELECT id::text, workspace_id, workspace_name, branch, revision, mode, phase, status,
 			workspace_files, total_files, indexed_files, failed_files, total_chunks,
 			indexed_chunks, chunk_count_fallback, deleted_count, error,
@@ -407,7 +434,20 @@ func handleRemoteIndex(c *gin.Context) {
 		return
 	}
 
-	job, staged, deleted, err := prepareIndexBatch(c.Request.Context(), userID, req)
+	modelConfig, err := resolveModelConfigArg(c.Request.Context(), userID)
+	if err != nil {
+		finishJSON(c, http.StatusServiceUnavailable, gin.H{"error": err.Error()})
+		return
+	}
+
+	tx, err := beginLockedIndexUserTx(c.Request.Context(), userID)
+	if err != nil {
+		finishIndexError(c, err)
+		return
+	}
+	defer tx.Rollback()
+
+	job, staged, deleted, err := prepareIndexBatch(c.Request.Context(), tx, userID, req)
 	if err == sql.ErrNoRows {
 		finishJSON(c, http.StatusNotFound, gin.H{"error": "index job not found"})
 		return
@@ -427,8 +467,8 @@ func handleRemoteIndex(c *gin.Context) {
 	if len(deleted) > 0 {
 		args["deleted_files"] = deleted
 	}
-	if cfg := resolveModelConfigArg(c.Request.Context(), userID); cfg != nil {
-		args["model_config"] = cfg
+	if modelConfig != nil {
+		args["model_config"] = modelConfig
 	}
 	result, err := lce.callTool(c.Request.Context(), "codebase_remote_index", args)
 	if err != nil {
@@ -446,7 +486,11 @@ func handleRemoteIndex(c *gin.Context) {
 			chunks += int64(file.EstimatedChunks)
 		}
 	}
-	if err := commitIndexBatch(c.Request.Context(), userID, job.ID, staged, chunks, !exact, len(deleted) > 0); err != nil {
+	if err := commitIndexBatch(c.Request.Context(), tx, userID, job.ID, staged, chunks, !exact, len(deleted) > 0); err != nil {
+		finishIndexError(c, err)
+		return
+	}
+	if err := tx.Commit(); err != nil {
 		finishIndexError(c, err)
 		return
 	}
@@ -462,8 +506,8 @@ func handleRemoteIndex(c *gin.Context) {
 	finishJSON(c, http.StatusOK, gin.H{"job": updated, "lce": lceResponse})
 }
 
-func prepareIndexBatch(ctx context.Context, userID string, req remoteIndexRequest) (indexJobView, []indexManifestFile, []string, error) {
-	job, err := loadIndexJob(ctx, userID, req.JobID)
+func prepareIndexBatch(ctx context.Context, tx *sql.Tx, userID string, req remoteIndexRequest) (indexJobView, []indexManifestFile, []string, error) {
+	job, err := loadIndexJobFrom(ctx, tx, userID, req.JobID)
 	if err != nil {
 		return job, nil, nil, err
 	}
@@ -485,7 +529,7 @@ func prepareIndexBatch(ctx context.Context, userID string, req remoteIndexReques
 		var expectedHash string
 		var estimatedChunks int
 		var needsIndex, indexed bool
-		err := db.QueryRowContext(ctx, `
+		err := tx.QueryRowContext(ctx, `
 			SELECT hash, estimated_chunks, needs_index, indexed
 			FROM index_job_files
 			WHERE job_id = $1 AND path = $2
@@ -502,13 +546,13 @@ func prepareIndexBatch(ctx context.Context, userID string, req remoteIndexReques
 	}
 
 	var deletionsSent bool
-	err = db.QueryRowContext(ctx, `SELECT deletions_sent FROM index_jobs WHERE id = $1`, req.JobID).Scan(&deletionsSent)
+	err = tx.QueryRowContext(ctx, `SELECT deletions_sent FROM index_jobs WHERE id = $1`, req.JobID).Scan(&deletionsSent)
 	if err != nil {
 		return job, nil, nil, err
 	}
 	var deleted []string
 	if !deletionsSent && job.DeletedCount > 0 {
-		rows, err := db.QueryContext(ctx, `
+		rows, err := tx.QueryContext(ctx, `
 			SELECT old.path
 			FROM indexed_files old
 			WHERE old.user_id = $1 AND old.workspace_id = $2
@@ -536,13 +580,7 @@ func prepareIndexBatch(ctx context.Context, userID string, req remoteIndexReques
 	return job, staged, deleted, nil
 }
 
-func commitIndexBatch(ctx context.Context, userID, jobID string, files []indexManifestFile, chunks int64, fallback, sentDeletions bool) error {
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-
+func commitIndexBatch(ctx context.Context, tx *sql.Tx, userID, jobID string, files []indexManifestFile, chunks int64, fallback, sentDeletions bool) error {
 	var status string
 	if err := tx.QueryRowContext(ctx, `
 		SELECT status FROM index_jobs WHERE id = $1 AND user_id = $2 FOR UPDATE
@@ -565,7 +603,7 @@ func commitIndexBatch(ctx context.Context, userID, jobID string, files []indexMa
 			return fmt.Errorf("index batch was already committed: %s", file.Path)
 		}
 	}
-	_, err = tx.ExecContext(ctx, `
+	_, err := tx.ExecContext(ctx, `
 		UPDATE index_jobs
 		SET phase = 'indexing',
 			indexed_files = indexed_files + $1,
@@ -578,7 +616,7 @@ func commitIndexBatch(ctx context.Context, userID, jobID string, files []indexMa
 	if err != nil {
 		return err
 	}
-	return tx.Commit()
+	return nil
 }
 
 type finishIndexJobRequest struct {
@@ -588,7 +626,7 @@ type finishIndexJobRequest struct {
 func handleCompleteIndexJob(c *gin.Context) {
 	userID := c.GetString(ContextKeyUserID)
 	jobID := strings.TrimSpace(c.Param("id"))
-	tx, err := db.BeginTx(c.Request.Context(), nil)
+	tx, err := beginLockedIndexUserTx(c.Request.Context(), userID)
 	if err != nil {
 		finishIndexError(c, err)
 		return
@@ -701,7 +739,7 @@ func handleFailIndexJob(c *gin.Context) {
 	if req.Error == "" {
 		req.Error = "client reported indexing failure"
 	}
-	tx, err := db.BeginTx(c.Request.Context(), nil)
+	tx, err := beginLockedIndexUserTx(c.Request.Context(), userID)
 	if err != nil {
 		finishIndexError(c, err)
 		return
@@ -739,14 +777,25 @@ func handleFailIndexJob(c *gin.Context) {
 	finishJSON(c, http.StatusOK, gin.H{"job": job})
 }
 
-func clearUserIndexState(ctx context.Context, userID string) {
-	if _, err := db.ExecContext(ctx, `
+func clearUserIndexStateTx(ctx context.Context, tx *sql.Tx, userID string) error {
+	_, err := tx.ExecContext(ctx, `
 		DELETE FROM index_jobs WHERE user_id = $1;
 		DELETE FROM indexed_files WHERE user_id = $1;
 		DELETE FROM index_workspaces WHERE user_id = $1;
-	`, userID); err != nil {
-		log.Printf("[INDEX] Failed to clear task state for user %s: %v", userID, err)
+	`, userID)
+	return err
+}
+
+func clearUserIndexState(ctx context.Context, userID string) error {
+	tx, err := beginLockedIndexUserTx(ctx, userID)
+	if err != nil {
+		return err
 	}
+	defer tx.Rollback()
+	if err := clearUserIndexStateTx(ctx, tx, userID); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func sweepExpiredIndexJobs(ctx context.Context) {

@@ -11,6 +11,8 @@ import (
 	"fmt"
 	"log"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // ── 按用户模型配置（BYO 模型）─────────────────────────────────────────────
@@ -30,7 +32,7 @@ import (
 
 const (
 	modelConfigCacheTTL   = 5 * time.Minute
-	modelConfigApplyLock  = time.Minute
+	modelConfigApplyLock  = 5 * time.Minute
 	modelConfigNoRowValue = "0"
 )
 
@@ -131,14 +133,45 @@ func decryptModelConfig(enc string) (map[string]interface{}, error) {
 	return cfg, nil
 }
 
-// applyModelConfigChange 配置指纹变化时清租户索引并推进 applied_fingerprint。
-// Redis 锁防止并发请求重复清理；失败释放锁以便下个请求重试。
-func applyModelConfigChange(ctx context.Context, userID string, row *userModelConfigRow) {
-	lockKey := "modelcfg:apply:" + userID
-	ok, err := redisClient.SetNX(ctx, lockKey, "1", modelConfigApplyLock).Result()
-	if err != nil || !ok {
-		return
+func releaseModelConfigApplyLock(ctx context.Context, lockKey, token string) {
+	const compareAndDelete = `
+		if redis.call("GET", KEYS[1]) == ARGV[1] then
+			return redis.call("DEL", KEYS[1])
+		end
+		return 0
+	`
+	if err := redisClient.Eval(ctx, compareAndDelete, []string{lockKey}, token).Err(); err != nil {
+		log.Printf("[MODELCFG] apply lock release failed (user=%s): %v", userIDFromModelConfigLockKey(lockKey), err)
 	}
+}
+
+func userIDFromModelConfigLockKey(lockKey string) string {
+	const prefix = "modelcfg:apply:"
+	if len(lockKey) >= len(prefix) && lockKey[:len(prefix)] == prefix {
+		return lockKey[len(prefix):]
+	}
+	return lockKey
+}
+
+// applyModelConfigChange clears both LCE data and relay snapshots while holding
+// the same per-user database lock used by indexing jobs.
+func applyModelConfigChange(ctx context.Context, userID string, row *userModelConfigRow) error {
+	lockKey := "modelcfg:apply:" + userID
+	lockToken := uuid.NewString()
+	ok, err := redisClient.SetNX(ctx, lockKey, lockToken, modelConfigApplyLock).Result()
+	if err != nil {
+		return fmt.Errorf("model config apply lock failed: %w", err)
+	}
+	if !ok {
+		return fmt.Errorf("model config update is already in progress; retry shortly")
+	}
+	defer releaseModelConfigApplyLock(context.Background(), lockKey, lockToken)
+
+	tx, err := beginLockedIndexUserTx(ctx, userID)
+	if err != nil {
+		return fmt.Errorf("model config index lock failed: %w", err)
+	}
+	defer tx.Rollback()
 
 	result, err := lce.callTool(ctx, "codebase_clear_index", map[string]interface{}{"tenant_id": userID})
 	if err != nil || (result != nil && result.IsError) {
@@ -149,45 +182,62 @@ func applyModelConfigChange(ctx context.Context, userID string, row *userModelCo
 			detail = string(result.Content)
 		}
 		log.Printf("[MODELCFG] tenant index clear failed (user=%s): %s", userID, detail)
-		redisClient.Del(ctx, lockKey)
-		return
+		return fmt.Errorf("model config index reset failed: %s", detail)
 	}
 
-	if _, err := db.Exec(
-		`UPDATE user_model_configs SET applied_fingerprint = $2, updated_at = NOW() WHERE user_id = $1`,
+	if err := clearUserIndexStateTx(ctx, tx, userID); err != nil {
+		return fmt.Errorf("model config relay snapshot reset failed: %w", err)
+	}
+	updateResult, err := tx.ExecContext(ctx,
+		`UPDATE user_model_configs
+		 SET applied_fingerprint = $2, updated_at = NOW()
+		 WHERE user_id = $1 AND fingerprint = $2`,
 		userID, row.Fingerprint,
-	); err != nil {
-		log.Printf("[MODELCFG] applied_fingerprint update failed (user=%s): %v", userID, err)
-		redisClient.Del(ctx, lockKey)
-		return
+	)
+	if err != nil {
+		return fmt.Errorf("model config fingerprint update failed: %w", err)
+	}
+	rows, err := updateResult.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("model config fingerprint result failed: %w", err)
+	}
+	if rows != 1 {
+		return fmt.Errorf("model config changed while applying; retry")
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("model config apply commit failed: %w", err)
 	}
 
 	row.Applied = row.Fingerprint
-	redisClient.Del(ctx, "modelcfg:"+userID)
-	log.Printf("[MODELCFG] model config applied for user %s: tenant index cleared (fingerprint=%s)", userID, row.Fingerprint)
+	if err := redisClient.Del(ctx, "modelcfg:"+userID).Err(); err != nil {
+		log.Printf("[MODELCFG] cache invalidation failed (user=%s): %v", userID, err)
+	}
+	log.Printf("[MODELCFG] model config applied for user %s: LCE and relay indexes cleared (fingerprint=%s)", userID, row.Fingerprint)
+	return nil
 }
 
 // resolveModelConfigArg 返回要注入 LCE 工具调用的 model_config 参数
-//（nil = 使用平台默认），并在配置变化时惰性触发租户索引重建。
-func resolveModelConfigArg(ctx context.Context, userID string) map[string]interface{} {
+// （nil = 使用平台默认），并在配置变化时惰性触发租户索引重建。
+func resolveModelConfigArg(ctx context.Context, userID string) (map[string]interface{}, error) {
 	if modelConfigKey == nil {
-		return nil
+		return nil, nil
 	}
 	row := getUserModelConfigRow(ctx, userID)
 	if row == nil {
-		return nil
+		return nil, nil
 	}
 	if row.Applied != row.Fingerprint {
-		applyModelConfigChange(ctx, userID, row)
+		if err := applyModelConfigChange(ctx, userID, row); err != nil {
+			return nil, err
+		}
 	}
 	if row.Enc == "" {
-		return nil // 已恢复平台默认
+		return nil, nil // 已恢复平台默认
 	}
 	cfg, err := decryptModelConfig(row.Enc)
 	if err != nil {
-		// 解密失败按平台默认放行并告警：通常是 MODEL_CONFIG_SECRET 两侧不一致
 		log.Printf("[MODELCFG] decrypt failed (user=%s): %v", userID, err)
-		return nil
+		return nil, fmt.Errorf("model config decrypt failed")
 	}
-	return cfg
+	return cfg, nil
 }

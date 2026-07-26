@@ -112,3 +112,28 @@ func TestChatMCPToolPolicyKeepsQueriesAndRejectsManagement(t *testing.T) {
 		t.Fatal("clear index must remain an explicit user action")
 	}
 }
+
+func TestIndexControlPathsDoNotConsumeChatQuota(t *testing.T) {
+	exempt := []string{
+		"/relay/index-jobs",
+		"/relay/index-jobs/job-id",
+		"/relay/index-jobs/job-id/complete",
+		"/relay/remote-index",
+	}
+	for _, requestPath := range exempt {
+		if !isIndexControlPath(requestPath) {
+			t.Fatalf("expected index control path to be exempt: %s", requestPath)
+		}
+	}
+
+	charged := []string{
+		"/relay/agents/codebase-retrieval",
+		"/relay/index-jobs-extra",
+		"/mcp",
+	}
+	for _, requestPath := range charged {
+		if isIndexControlPath(requestPath) {
+			t.Fatalf("unexpected quota exemption: %s", requestPath)
+		}
+	}
+}

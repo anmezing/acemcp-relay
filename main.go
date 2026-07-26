@@ -621,9 +621,11 @@ func authMiddleware() gin.HandlerFunc {
 
 		trustedConsole := isTrustedConsoleRequest(c)
 		if !trustedConsole {
-			if ok, limit := checkRequestQuota(userID); !ok {
-				c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{"error": fmt.Sprintf("daily request quota exceeded (%d/day)", limit)})
-				return
+			if !isIndexControlPath(c.Request.URL.Path) {
+				if ok, limit := checkRequestQuota(userID); !ok {
+					c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{"error": fmt.Sprintf("daily request quota exceeded (%d/day)", limit)})
+					return
+				}
 			}
 
 			deviceID, deviceOK := checkDeviceBinding(c, userID)
@@ -663,6 +665,12 @@ func authMiddleware() gin.HandlerFunc {
 
 		c.Next()
 	}
+}
+
+func isIndexControlPath(requestPath string) bool {
+	return requestPath == "/relay/remote-index" ||
+		requestPath == "/relay/index-jobs" ||
+		strings.HasPrefix(requestPath, "/relay/index-jobs/")
 }
 
 // ── 请求日志 ──────────────────────────────────────────────────────────────
@@ -768,6 +776,7 @@ const (
 	mcpSessionTTL           = 30 * time.Minute
 	mcpSessionSweepInterval = 60 * time.Second
 	mcpMaxSessions          = 1000
+	mcpMaxSessionsPerUser   = 16
 	toolsCacheTTL           = 5 * time.Minute
 )
 
@@ -854,15 +863,92 @@ func rpcError(id json.RawMessage, code int, message string) jsonRPCErrorResp {
 	}
 }
 
+func pruneExpiredMCPSessions(sessions map[string]*mcpServerSession, now time.Time, ttl time.Duration) []string {
+	expired := make([]string, 0)
+	for id, session := range sessions {
+		if now.Sub(session.lastActivity) > ttl {
+			delete(sessions, id)
+			expired = append(expired, id)
+		}
+	}
+	return expired
+}
+
+func evictOldestMCPSession(sessions map[string]*mcpServerSession, userID string) (string, bool) {
+	oldestID := ""
+	var oldestActivity time.Time
+	for id, session := range sessions {
+		if userID != "" && session.userID != userID {
+			continue
+		}
+		if oldestID == "" || session.lastActivity.Before(oldestActivity) ||
+			(session.lastActivity.Equal(oldestActivity) && id < oldestID) {
+			oldestID = id
+			oldestActivity = session.lastActivity
+		}
+	}
+	if oldestID == "" {
+		return "", false
+	}
+	delete(sessions, oldestID)
+	return oldestID, true
+}
+
+func countMCPSessionsForUser(sessions map[string]*mcpServerSession, userID string) int {
+	count := 0
+	for _, session := range sessions {
+		if session.userID == userID {
+			count++
+		}
+	}
+	return count
+}
+
+func prepareMCPSessionSlot(
+	sessions map[string]*mcpServerSession,
+	userID string,
+	now time.Time,
+	ttl time.Duration,
+	perUserLimit int,
+	globalLimit int,
+) (expired []string, evicted []string) {
+	expired = pruneExpiredMCPSessions(sessions, now, ttl)
+	for perUserLimit > 0 && countMCPSessionsForUser(sessions, userID) >= perUserLimit {
+		id, ok := evictOldestMCPSession(sessions, userID)
+		if !ok {
+			break
+		}
+		evicted = append(evicted, id)
+	}
+	for globalLimit > 0 && len(sessions) >= globalLimit {
+		id, ok := evictOldestMCPSession(sessions, "")
+		if !ok {
+			break
+		}
+		evicted = append(evicted, id)
+	}
+	return expired, evicted
+}
+
+func touchMCPSession(
+	sessions map[string]*mcpServerSession,
+	sessionID string,
+	userID string,
+	now time.Time,
+) bool {
+	session, ok := sessions[sessionID]
+	if !ok || session.userID != userID {
+		return false
+	}
+	session.lastActivity = now
+	return true
+}
+
 func sweepExpiredMCPSessions() {
 	serverSessionsMu.Lock()
 	defer serverSessionsMu.Unlock()
-	now := time.Now()
-	for id, session := range serverSessions {
-		if now.Sub(session.lastActivity) > mcpSessionTTL {
-			delete(serverSessions, id)
-			log.Printf("[MCP_SERVER] Session expired: %s", id)
-		}
+	for _, id := range pruneExpiredMCPSessions(serverSessions, time.Now(), mcpSessionTTL) {
+		log.Printf("[MCP_SERVER] Session expired: %s", id)
 	}
 }
 
@@ -930,12 +1016,6 @@ func handleMCPPost(c *gin.Context) {
 
 	sessionID := c.GetHeader("Mcp-Session-Id")
 
-	if rpc.Method == "notifications/initialized" {
-		c.Status(http.StatusAccepted)
-		completeRequestLogAsync(getRequestLogEntry(c, http.StatusAccepted))
-		return
-	}
-
 	if rpc.Method == "initialize" {
 		if sessionID != "" {
 			c.JSON(http.StatusBadRequest, rpcError(rpc.ID, -32600, "initialize must not include Mcp-Session-Id"))
@@ -944,16 +1024,25 @@ func handleMCPPost(c *gin.Context) {
 		}
 
 		serverSessionsMu.Lock()
-		if len(serverSessions) >= mcpMaxSessions {
-			serverSessionsMu.Unlock()
-			c.JSON(http.StatusServiceUnavailable, rpcError(rpc.ID, -32000, "session limit exceeded"))
-			completeRequestLogAsync(getRequestLogEntry(c, http.StatusServiceUnavailable))
-			return
+		now := time.Now()
+		expired, evicted := prepareMCPSessionSlot(
+			serverSessions,
+			userID,
+			now,
+			mcpSessionTTL,
+			mcpMaxSessionsPerUser,
+			mcpMaxSessions,
+		)
+		for _, id := range expired {
+			log.Printf("[MCP_SERVER] Session expired during initialize: %s", id)
+		}
+		for _, id := range evicted {
+			log.Printf("[MCP_SERVER] Session evicted during initialize: %s", id)
 		}
 		newSID := uuid.New().String()
 		serverSessions[newSID] = &mcpServerSession{
 			userID:       userID,
-			lastActivity: time.Now(),
+			lastActivity: now,
 		}
 		serverSessionsMu.Unlock()
 
@@ -974,15 +1063,20 @@ func handleMCPPost(c *gin.Context) {
 		return
 	}
 
-	serverSessionsMu.RLock()
-	session, ok := serverSessions[sessionID]
-	serverSessionsMu.RUnlock()
+	serverSessionsMu.Lock()
+	ok := touchMCPSession(serverSessions, sessionID, userID, time.Now())
+	serverSessionsMu.Unlock()
 	if !ok {
 		c.JSON(http.StatusNotFound, rpcError(rpc.ID, -32000, "Invalid or expired session"))
 		completeRequestLogAsync(getRequestLogEntry(c, http.StatusNotFound))
 		return
 	}
-	session.lastActivity = time.Now()
+
+	if rpc.Method == "notifications/initialized" {
+		c.Status(http.StatusAccepted)
+		completeRequestLogAsync(getRequestLogEntry(c, http.StatusAccepted))
+		return
+	}
 
 	switch rpc.Method {
 	case "tools/list":
@@ -1034,7 +1128,13 @@ func handleMCPToolsCall(c *gin.Context, id json.RawMessage, params json.RawMessa
 		p.Arguments = make(map[string]interface{})
 	}
 	p.Arguments["tenant_id"] = userID
-	if cfg := resolveModelConfigArg(c.Request.Context(), userID); cfg != nil {
+	cfg, err := resolveModelConfigArg(c.Request.Context(), userID)
+	if err != nil {
+		c.JSON(http.StatusOK, rpcError(id, -32000, err.Error()))
+		completeRequestLogAsync(getRequestLogEntry(c, http.StatusOK))
+		return
+	}
+	if cfg != nil {
 		p.Arguments["model_config"] = cfg
 	}
 
@@ -1135,7 +1235,13 @@ func handleCodebaseRetrieval(c *gin.Context) {
 		"tenant_id": userIDStr,
 		"query":     req.InformationRequest,
 	}
-	if cfg := resolveModelConfigArg(c.Request.Context(), userIDStr); cfg != nil {
+	cfg, err := resolveModelConfigArg(c.Request.Context(), userIDStr)
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
+		completeRequestLogAsync(getRequestLogEntry(c, http.StatusServiceUnavailable))
+		return
+	}
+	if cfg != nil {
 		args["model_config"] = cfg
 	}
 	result, err := lce.callTool(c.Request.Context(), "codebase-retrieval", args)
@@ -1178,6 +1284,14 @@ func handleClearIndex(c *gin.Context) {
 		return
 	}
 
+	tx, err := beginLockedIndexUserTx(c.Request.Context(), userIDStr)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "清除索引失败: " + err.Error()})
+		completeRequestLogAsync(getRequestLogEntry(c, http.StatusInternalServerError))
+		return
+	}
+	defer tx.Rollback()
+
 	args := map[string]interface{}{"tenant_id": userIDStr}
 	result, err := lce.callTool(c.Request.Context(), "codebase_clear_index", args)
 	if err != nil {
@@ -1195,9 +1309,19 @@ func handleClearIndex(c *gin.Context) {
 		return
 	}
 
+	if err := clearUserIndexStateTx(c.Request.Context(), tx, userIDStr); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "清除 Relay 索引状态失败: " + err.Error()})
+		completeRequestLogAsync(getRequestLogEntry(c, http.StatusInternalServerError))
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "提交索引清理失败: " + err.Error()})
+		completeRequestLogAsync(getRequestLogEntry(c, http.StatusInternalServerError))
+		return
+	}
+
 	setClearIndexCooldown(c.Request.Context(), userIDStr)
 	deleteUserLogsAsync(userIDStr)
-	clearUserIndexState(c.Request.Context(), userIDStr)
 
 	c.JSON(http.StatusOK, gin.H{"success": true, "message": "索引和日志已清除"})
 	completeRequestLogAsync(getRequestLogEntry(c, http.StatusOK))
@@ -1250,6 +1374,7 @@ func handleTenantStats(c *gin.Context) {
 }
 
 func handleMCPDelete(c *gin.Context) {
+	userID := c.GetString(ContextKeyUserID)
 	sessionID := c.GetHeader("Mcp-Session-Id")
 	if sessionID == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "missing Mcp-Session-Id"})
@@ -1258,8 +1383,12 @@ func handleMCPDelete(c *gin.Context) {
 	}
 
 	serverSessionsMu.Lock()
-	_, existed := serverSessions[sessionID]
-	delete(serverSessions, sessionID)
+	session, existed := serverSessions[sessionID]
+	if existed && session.userID == userID {
+		delete(serverSessions, sessionID)
+	} else {
+		existed = false
+	}
 	serverSessionsMu.Unlock()
 
 	if !existed {
