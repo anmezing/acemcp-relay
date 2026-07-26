@@ -621,7 +621,7 @@ func authMiddleware() gin.HandlerFunc {
 
 		trustedConsole := isTrustedConsoleRequest(c)
 		if !trustedConsole {
-			if !isIndexControlPath(c.Request.URL.Path) {
+			if !isIndexQuotaExempt(c.Request.Method, c.Request.URL.Path) {
 				if ok, limit := checkRequestQuota(userID); !ok {
 					c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{"error": fmt.Sprintf("daily request quota exceeded (%d/day)", limit)})
 					return
@@ -671,6 +671,16 @@ func isIndexControlPath(requestPath string) bool {
 	return requestPath == "/relay/remote-index" ||
 		requestPath == "/relay/index-jobs" ||
 		strings.HasPrefix(requestPath, "/relay/index-jobs/")
+}
+
+// isIndexQuotaExempt 让一次索引任务只在创建时计 1 次配额：轮询、batch 上传和
+// 完成/失败上报都是同一次扫描的内部步骤，不重复计费；但创建不能豁免，否则
+// 索引通道可以零成本无限驱动 LCE embedding。
+func isIndexQuotaExempt(method, requestPath string) bool {
+	if !isIndexControlPath(requestPath) {
+		return false
+	}
+	return !(method == http.MethodPost && requestPath == "/relay/index-jobs")
 }
 
 // ── 请求日志 ──────────────────────────────────────────────────────────────
@@ -1734,6 +1744,12 @@ func main() {
 
 	r.POST("/mcp", handleMCPPost)
 	r.DELETE("/mcp", handleMCPDelete)
+	// Streamable HTTP 规范：不提供服务端 SSE 推流时对 GET 回 405，
+	// MCP SDK 客户端会按"无推流"优雅降级；回 404 会被当成连接错误。
+	r.GET("/mcp", func(c *gin.Context) {
+		c.Header("Allow", "POST, DELETE")
+		c.JSON(http.StatusMethodNotAllowed, gin.H{"error": "SSE stream not supported; use POST"})
+	})
 	r.POST("/mcp/clear-index", handleClearIndex)
 	r.GET("/mcp/tenant-stats", handleTenantStats)
 

@@ -137,3 +137,87 @@ func TestIndexControlPathsDoNotConsumeChatQuota(t *testing.T) {
 		}
 	}
 }
+
+func TestIndexQuotaChargesOnlyJobCreation(t *testing.T) {
+	exempt := []struct{ method, path string }{
+		{"GET", "/relay/index-jobs/job-id"},
+		{"POST", "/relay/index-jobs/job-id/complete"},
+		{"POST", "/relay/index-jobs/job-id/fail"},
+		{"POST", "/relay/remote-index"},
+	}
+	for _, request := range exempt {
+		if !isIndexQuotaExempt(request.method, request.path) {
+			t.Fatalf("expected quota exemption: %s %s", request.method, request.path)
+		}
+	}
+
+	charged := []struct{ method, path string }{
+		{"POST", "/relay/index-jobs"},
+		{"POST", "/relay/agents/codebase-retrieval"},
+		{"POST", "/mcp"},
+	}
+	for _, request := range charged {
+		if isIndexQuotaExempt(request.method, request.path) {
+			t.Fatalf("unexpected quota exemption: %s %s", request.method, request.path)
+		}
+	}
+}
+
+func TestNormalizeIndexRootID(t *testing.T) {
+	if got := normalizeIndexRootID("  acemcp-relay  "); got != "acemcp-relay" {
+		t.Fatalf("expected trimmed rootId, got %q", got)
+	}
+	if got := normalizeIndexRootID(""); got != "" {
+		t.Fatalf("empty rootId must stay empty (falls back to LCE default root), got %q", got)
+	}
+	long := make([]byte, maxIndexRootIDLen+50)
+	for i := range long {
+		long[i] = 'a'
+	}
+	if got := normalizeIndexRootID(string(long)); len(got) != maxIndexRootIDLen {
+		t.Fatalf("expected rootId capped at %d, got len %d", maxIndexRootIDLen, len(got))
+	}
+}
+
+func TestGraftUnreadablePathsKeepsPreviouslyIndexedFiles(t *testing.T) {
+	previous := map[string]indexManifestFile{
+		"locked.go":  {Path: "locked.go", Hash: "old-hash", Size: 10, EstimatedChunks: 2},
+		"same.go":    {Path: "same.go", Hash: "same", Size: 5, EstimatedChunks: 1},
+		"deleted.go": {Path: "deleted.go", Hash: "gone", Size: 5, EstimatedChunks: 1},
+	}
+	current := []indexManifestFile{
+		{Path: "same.go", Hash: "same", Size: 5, EstimatedChunks: 1},
+	}
+
+	files, err := graftUnreadablePaths(previous, current, []string{`locked.go`, "never-indexed.go", "", "locked.go"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := []string{files[0].Path, files[1].Path}; !reflect.DeepEqual(got, []string{"locked.go", "same.go"}) {
+		t.Fatalf("unexpected grafted manifest: %#v", got)
+	}
+
+	pending, deleted, _ := diffManifest(previous, files)
+	if len(pending) != 0 {
+		t.Fatalf("unreadable files must not be re-uploaded: %#v", pending)
+	}
+	if !reflect.DeepEqual(deleted, []string{"deleted.go"}) {
+		t.Fatalf("only truly missing files may be deleted: %#v", deleted)
+	}
+}
+
+func TestGraftUnreadablePathsPrefersCurrentManifestEntry(t *testing.T) {
+	previous := map[string]indexManifestFile{
+		"a.go": {Path: "a.go", Hash: "old", Size: 1, EstimatedChunks: 1},
+	}
+	current := []indexManifestFile{
+		{Path: "a.go", Hash: "new", Size: 2, EstimatedChunks: 1},
+	}
+	files, err := graftUnreadablePaths(previous, current, []string{"a.go"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 1 || files[0].Hash != "new" {
+		t.Fatalf("current manifest entry must win over grafted snapshot entry: %#v", files)
+	}
+}

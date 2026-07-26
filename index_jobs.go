@@ -39,11 +39,12 @@ type indexManifestFile struct {
 }
 
 type createIndexJobRequest struct {
-	WorkspaceID   string              `json:"workspaceId"`
-	WorkspaceName string              `json:"workspaceName"`
-	Branch        string              `json:"branch"`
-	Revision      string              `json:"revision"`
-	Files         []indexManifestFile `json:"files"`
+	WorkspaceID     string              `json:"workspaceId"`
+	WorkspaceName   string              `json:"workspaceName"`
+	Branch          string              `json:"branch"`
+	Revision        string              `json:"revision"`
+	Files           []indexManifestFile `json:"files"`
+	UnreadableFiles []string            `json:"unreadableFiles"`
 }
 
 type indexJobView struct {
@@ -208,6 +209,44 @@ func loadIndexedSnapshot(ctx context.Context, tx *sql.Tx, userID, workspaceID st
 	return out, rows.Err()
 }
 
+// graftUnreadablePaths 把"本次扫描读不了、但上次已索引"的文件按旧快照条目并入
+// manifest 当作未变更处理：不重传、不判删，完成时快照保留旧哈希；文件恢复可读
+// 后由正常 diff 按哈希差异重新上传。不在旧快照里的 unreadable 路径没有可保留
+// 的状态，直接忽略。
+func graftUnreadablePaths(previous map[string]indexManifestFile, files []indexManifestFile, unreadable []string) ([]indexManifestFile, error) {
+	if len(unreadable) == 0 {
+		return files, nil
+	}
+	if len(unreadable) > maxIndexManifestFiles {
+		return nil, fmt.Errorf("unreadable file list exceeds %d files", maxIndexManifestFiles)
+	}
+	current := make(map[string]bool, len(files))
+	for _, file := range files {
+		current[file.Path] = true
+	}
+	grafted := false
+	for _, rawPath := range unreadable {
+		filePath := normalizeIndexPath(rawPath)
+		if filePath == "" || current[filePath] {
+			continue
+		}
+		current[filePath] = true
+		old, ok := previous[filePath]
+		if !ok {
+			continue
+		}
+		files = append(files, old)
+		grafted = true
+	}
+	if len(files) > maxIndexManifestFiles {
+		return nil, fmt.Errorf("manifest exceeds %d files", maxIndexManifestFiles)
+	}
+	if grafted {
+		sort.Slice(files, func(i, j int) bool { return files[i].Path < files[j].Path })
+	}
+	return files, nil
+}
+
 func diffManifest(previous map[string]indexManifestFile, current []indexManifestFile) ([]string, []string, int64) {
 	pending := make([]string, 0)
 	deletedMap := make(map[string]bool, len(previous))
@@ -316,6 +355,12 @@ func handleCreateIndexJob(c *gin.Context) {
 		return
 	}
 
+	files, err = graftUnreadablePaths(previous, files, req.UnreadableFiles)
+	if err != nil {
+		finishJSON(c, http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
 	pending, deleted, estimatedChunks := diffManifest(previous, files)
 	pendingSet := make(map[string]bool, len(pending))
 	for _, filePath := range pending {
@@ -419,6 +464,21 @@ func loadIndexJobFrom(ctx context.Context, queryer indexJobQueryer, userID, jobI
 type remoteIndexRequest struct {
 	JobID string              `json:"jobId"`
 	Files []indexManifestFile `json:"files"`
+	// 仓库维度：多 root 工作区按文件夹拆分索引任务，每个 job 一个稳定 rootId。
+	// 同一 job 的所有批次应携带相同 rootId；缺省 = 单仓默认 root（向后兼容）。
+	RootID string `json:"rootId"`
+}
+
+const maxIndexRootIDLen = 128
+
+// normalizeIndexRootID 清洗客户端上报的仓库标识：去空白、限长；空则返回 ""，
+// 由 LCE 侧落默认 root。
+func normalizeIndexRootID(value string) string {
+	v := strings.TrimSpace(value)
+	if len(v) > maxIndexRootIDLen {
+		v = v[:maxIndexRootIDLen]
+	}
+	return v
 }
 
 func handleRemoteIndex(c *gin.Context) {
@@ -466,6 +526,9 @@ func handleRemoteIndex(c *gin.Context) {
 	args := map[string]interface{}{"tenant_id": userID, "files": filesArg}
 	if len(deleted) > 0 {
 		args["deleted_files"] = deleted
+	}
+	if rootID := normalizeIndexRootID(req.RootID); rootID != "" {
+		args["root_id"] = rootID
 	}
 	if modelConfig != nil {
 		args["model_config"] = modelConfig
