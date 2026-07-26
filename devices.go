@@ -2,8 +2,12 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/hex"
 	"fmt"
 	"log"
+	"net/http"
 	"strings"
 	"time"
 
@@ -32,7 +36,43 @@ const (
 	deviceNegCacheTTL   = time.Minute
 	deviceTouchInterval = time.Minute
 	deviceAlertCooldown = 30 * time.Minute
+
+	consoleTokenHeader  = "X-LCE-Console-Token"
+	consoleTokenContext = "acemcp-relay-console:"
 )
+
+var trustedConsoleToken string
+
+func configureTrustedConsole(secret string) {
+	secret = strings.TrimSpace(secret)
+	if secret == "" {
+		trustedConsoleToken = ""
+		return
+	}
+
+	hash := sha256.Sum256([]byte(consoleTokenContext + secret))
+	trustedConsoleToken = hex.EncodeToString(hash[:])
+}
+
+func isTrustedConsoleRequest(c *gin.Context) bool {
+	if trustedConsoleToken == "" {
+		return false
+	}
+
+	path := c.Request.URL.Path
+	method := c.Request.Method
+	allowed := (method == http.MethodGet && path == "/mcp/tenant-stats") ||
+		(method == http.MethodPost && path == "/mcp/clear-index")
+	if !allowed {
+		return false
+	}
+
+	token := strings.TrimSpace(c.GetHeader(consoleTokenHeader))
+	if len(token) != len(trustedConsoleToken) {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(token), []byte(trustedConsoleToken)) == 1
+}
 
 func migrateDeviceTables() error {
 	_, err := db.Exec(`

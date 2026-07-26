@@ -91,6 +91,7 @@ func loadConfig() {
 	deviceCacheTTL = getEnvDuration("DEVICE_CACHE_TTL", 5*time.Minute)
 	deviceIPWindow = getEnvDuration("DEVICE_IP_WINDOW", 10*time.Minute)
 	deviceMaxIPs = getEnvInt("DEVICE_MAX_IPS", 3)
+	configureTrustedConsole(getEnv("CONSOLE_API_SECRET", ""))
 	defaultDailyRequestLimit = getEnvInt("DEFAULT_DAILY_REQUEST_LIMIT", 0)
 	initModelConfigKey()
 	debugCapturePaths = parsePathSet(getEnv("DEBUG_CAPTURE_PATHS", ""))
@@ -618,18 +619,26 @@ func authMiddleware() gin.HandlerFunc {
 			return
 		}
 
-		if ok, limit := checkRequestQuota(userID); !ok {
-			c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{"error": fmt.Sprintf("daily request quota exceeded (%d/day)", limit)})
-			return
+		trustedConsole := isTrustedConsoleRequest(c)
+		if !trustedConsole {
+			if ok, limit := checkRequestQuota(userID); !ok {
+				c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{"error": fmt.Sprintf("daily request quota exceeded (%d/day)", limit)})
+				return
+			}
+
+			deviceID, deviceOK := checkDeviceBinding(c, userID)
+			if !deviceOK {
+				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "device not authorized: this account is signed in on another device; log in again to use it here"})
+				return
+			}
+			if deviceID != "" {
+				go recordDeviceActivity(userID, deviceID, c.ClientIP())
+			}
 		}
 
-		deviceID, deviceOK := checkDeviceBinding(c, userID)
-		if !deviceOK {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "device not authorized: this account is signed in on another device; log in again to use it here"})
+		if trustedConsole {
+			c.Next()
 			return
-		}
-		if deviceID != "" {
-			go recordDeviceActivity(userID, deviceID, c.ClientIP())
 		}
 
 		logID := uuid.New().String()
