@@ -95,6 +95,13 @@ go build -o acemcp-relay .
 | 变量 | 说明 | 默认值 |
 |------|------|--------|
 | `LCE_MCP_URL` | LCE MCP HTTP endpoint | `http://127.0.0.1:3000/mcp` |
+| `LCE_TENANT_ASSERTION_SECRET` | 与 LCE 共享的租户断言密钥（≥32 字符）。relay 用它为每次带 `tenant_id` 的调用签发短时效断言，LCE 校验通过才认这个租户 | 空（不签发） |
+
+`tenant_id` 在 MCP 里只是普通工具入参，LCE 无法区分授权调用与伪造调用——不做校验时，任何能连到 LCE 端口的人都可以读、写、甚至用 `codebase_clear_index` 清空**任意**租户的索引。配置该密钥后，租户隔离不再只依赖"LCE 端口不对外暴露"这一条前提。
+
+健康探测走 LCE 的 `GET {LCE_MCP_URL}/health`：不建立 session、不占用 LCE 的请求并发额度。不要用完整的 `initialize` 当探针——每次探测都会占掉一个 session 名额，且只在空闲 TTL 后释放，稳态下会把自己挡在 503 外面。
+
+升级顺序：先部署 relay（LCE 未配密钥时会忽略该请求头），再给 LCE 配上同一个密钥。反过来会在 relay 更新前中断租户调用。
 
 ### PostgreSQL 配置
 

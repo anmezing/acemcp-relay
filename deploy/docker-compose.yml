@@ -7,6 +7,10 @@ services:
       - lce_data:/data
     environment:
       LCE_HOME: /data
+      # 与 relay 共享的租户断言密钥。LCE 以 --host 0.0.0.0 启动（relay 要跨容器访问），
+      # 属于"远程调用方"，不配这个密钥时 LCE 会把所有租户工具下架——因为此时它无法
+      # 验证 tenant_id 的真伪，而 tenant_id 只是一个普通工具入参。
+      LCE_TENANT_ASSERTION_SECRET: ${LCE_TENANT_ASSERTION_SECRET:?set LCE_TENANT_ASSERTION_SECRET in .env (>=32 chars, shared with relay)}
       EMBEDDINGS_PROVIDER: ${EMBEDDINGS_PROVIDER:-}
       EMBEDDINGS_MODEL: ${EMBEDDINGS_MODEL:-}
       EMBEDDINGS_BASE_URL: ${EMBEDDINGS_BASE_URL:-}
@@ -16,7 +20,11 @@ services:
       RERANK_BASE_URL: ${RERANK_BASE_URL:-}
       RERANK_API_KEY: ${RERANK_API_KEY:-}
     healthcheck:
-      test: ["CMD-SHELL", "node -e \"fetch('http://localhost:3000/mcp',{method:'POST',headers:{'Content-Type':'application/json','Accept':'application/json, text/event-stream'},body:JSON.stringify({jsonrpc:'2.0',id:1,method:'initialize',params:{protocolVersion:'2025-03-26',capabilities:{},clientInfo:{name:'healthcheck',version:'1.0.0'}}})}).then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))\""]
+      # 存活端点：不建 session、不占并发额度。
+      # 旧的探测发的是完整 initialize，每 30 秒占掉一个 session 名额，而 session 只在
+      # 空闲 10 分钟后回收——稳态下约 20 个 > maxSessions 默认 16，探测最终会被 503
+      # 挡住并把一个健康的容器标成 unhealthy。
+      test: ["CMD-SHELL", "node -e \"fetch('http://localhost:3000/mcp/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -36,6 +44,8 @@ services:
     environment:
       SERVER_ADDR: "0.0.0.0:3009"
       LCE_MCP_URL: http://lce:3000/mcp
+      # 必须与 lce 服务里的值一致：relay 用它签发租户断言，LCE 用它校验。
+      LCE_TENANT_ASSERTION_SECRET: ${LCE_TENANT_ASSERTION_SECRET:?set LCE_TENANT_ASSERTION_SECRET in .env (>=32 chars, shared with lce)}
       DB_HOST: host.docker.internal
       DB_PORT: "5432"
       DB_USER: ${POSTGRES_USER:-acemcp}
