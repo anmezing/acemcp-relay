@@ -74,6 +74,44 @@ func getUserDailyLimit(userID string) int {
 	return limit
 }
 
+// ── 每日索引字节配额 ──────────────────────────────────────────────────────
+//
+// 请求数配额挡不住索引通道：创建 job 只算 1 次请求，之后的 /relay/remote-index
+// 批次上传全部豁免（它们是同一次扫描的内部步骤，按请求数计费会把一次正常扫描
+// 记成上千次）。但真正产生 embedding 成本的恰恰是这些批次，且 manifest 上限
+// 10 万文件、每请求可达 100MB —— 换算下来 1 次请求配额能驱动上百 GB 的
+// embedding 调用。
+//
+// 因此索引单独按"当日累计上传字节"计费，计的是实际送进 LCE 的内容长度，
+// 正常增量扫描只传变更文件、消耗很小，而批量灌数据会立刻撞上限。
+// DAILY_INDEX_BYTES_LIMIT=0 表示不限（仅建议在自用部署上这么配）。
+
+func indexBytesKey(userID string) string {
+	day := time.Now().In(quotaLocation()).Format("20060102")
+	return "quota:indexbytes:" + userID + ":" + day
+}
+
+// chargeIndexBytes 累加当日已索引字节并判断是否超限，返回 (是否放行, 已用, 上限)。
+// 与请求数配额一致：Redis 故障时放行，避免基础设施抖动演变成全站不可索引。
+func chargeIndexBytes(userID string, bytes int64) (bool, int64, int64) {
+	if dailyIndexBytesLimit <= 0 || bytes <= 0 {
+		return true, 0, dailyIndexBytesLimit
+	}
+
+	ctx := context.Background()
+	key := indexBytesKey(userID)
+	used, err := redisClient.IncrBy(ctx, key, bytes).Result()
+	if err != nil {
+		log.Printf("[QUOTA] index byte accounting failed (user=%s): %v", userID, err)
+		return true, 0, dailyIndexBytesLimit
+	}
+	// 首次写入才设过期：IncrBy 从 0 起算，used == bytes 即本日第一次。
+	if used == bytes {
+		redisClient.Expire(ctx, key, 48*time.Hour)
+	}
+	return used <= dailyIndexBytesLimit, used, dailyIndexBytesLimit
+}
+
 // checkRequestQuota 累加当日计数并判断是否超限。Redis 故障时放行。
 func checkRequestQuota(userID string) (bool, int) {
 	limit := getUserDailyLimit(userID)

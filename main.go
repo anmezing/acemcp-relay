@@ -50,6 +50,7 @@ var (
 	deviceIPWindow           time.Duration
 	deviceMaxIPs             int
 	defaultDailyRequestLimit int
+	dailyIndexBytesLimit     int64
 	debugCapturePaths        map[string]bool
 	debugCaptureMaxBytes     int
 )
@@ -108,6 +109,9 @@ func loadConfig() {
 	deviceMaxIPs = getEnvInt("DEVICE_MAX_IPS", 3)
 	configureTrustedConsole(getEnv("CONSOLE_API_SECRET", ""))
 	defaultDailyRequestLimit = getEnvInt("DEFAULT_DAILY_REQUEST_LIMIT", 0)
+	// 索引通道按字节计费，与请求数配额分开：一次 job 创建只算 1 个请求，但随后
+	// 的批次上传可以推送任意多的内容，请求数配额对这条路径几乎没有约束力。
+	dailyIndexBytesLimit = getEnvInt64("DAILY_INDEX_BYTES_LIMIT", defaultDailyIndexBytes)
 	initModelConfigKey()
 	debugCapturePaths = parsePathSet(getEnv("DEBUG_CAPTURE_PATHS", ""))
 	debugCaptureMaxBytes = getEnvInt("DEBUG_CAPTURE_MAX_BYTES", 4096)
@@ -159,6 +163,18 @@ func getEnvInt(key string, defaultValue int) int {
 		if intVal, err := strconv.Atoi(value); err == nil {
 			return intVal
 		}
+	}
+	return defaultValue
+}
+
+// getEnvInt64 用于字节数这类可能超出 32 位 int 的配置：Atoi 在 32 位平台上
+// 解析 2GiB 会失败并静默退回默认值，那种降级在配额上是危险的。
+func getEnvInt64(key string, defaultValue int64) int64 {
+	if value := os.Getenv(key); value != "" {
+		if intVal, err := strconv.ParseInt(value, 10, 64); err == nil {
+			return intVal
+		}
+		log.Printf("[CONFIG] invalid %s=%q, falling back to %d", key, value, defaultValue)
 	}
 	return defaultValue
 }

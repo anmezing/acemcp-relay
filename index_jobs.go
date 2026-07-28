@@ -28,6 +28,15 @@ const (
 	indexJobSweepInterval    = time.Minute
 	maxIndexManifestFiles    = 100000
 	maxIndexBatchFiles       = 100
+	// 单个文件的内容上限。源码文件极少接近这个量级，而 embedding 本身也有
+	// token 上限——超过这个大小的"源码"要么是生成物要么是灌进来的负载。
+	maxIndexFileBytes = 1 << 20 // 1 MiB
+	// 单批内容总量上限。没有这一条时，每批 100 个文件可以各带 100MB，
+	// 单个请求就能推送上 GB 的 embedding 负载。
+	maxIndexBatchBytes = 8 << 20 // 8 MiB
+	// 每用户每日索引字节的默认上限。正常项目首次全量索引通常在百 MB 量级，
+	// 之后只传变更；这个默认值对真实使用足够宽松，但能挡住批量灌数据。
+	defaultDailyIndexBytes = 2 << 30 // 2 GiB
 )
 
 type indexManifestFile struct {
@@ -481,6 +490,25 @@ func normalizeIndexRootID(value string) string {
 	return v
 }
 
+// validateIndexBatchSize 校验一个批次的体积并返回其内容总字节数。
+//
+// 两道上限缺一不可：只限单文件的话，凑满一批同样能推送巨量内容；只限单批的话，
+// 一个超大文件就能占满整批。返回的字节数即该批次要计入索引配额的量。
+func validateIndexBatchSize(files []indexManifestFile) (int64, error) {
+	var total int64
+	for _, file := range files {
+		size := int64(len(file.Content))
+		if size > maxIndexFileBytes {
+			return 0, fmt.Errorf("file exceeds the %d byte limit: %s", maxIndexFileBytes, file.Path)
+		}
+		total += size
+	}
+	if total > maxIndexBatchBytes {
+		return 0, fmt.Errorf("index batch exceeds the %d byte limit", maxIndexBatchBytes)
+	}
+	return total, nil
+}
+
 func handleRemoteIndex(c *gin.Context) {
 	userID := c.GetString(ContextKeyUserID)
 	var req remoteIndexRequest
@@ -491,6 +519,22 @@ func handleRemoteIndex(c *gin.Context) {
 	req.JobID = strings.TrimSpace(req.JobID)
 	if req.JobID == "" || len(req.Files) > maxIndexBatchFiles {
 		finishJSON(c, http.StatusBadRequest, gin.H{"error": "invalid index batch"})
+		return
+	}
+
+	// 体积校验放在最前：这些字节最终都会变成 embedding 调用，超限的批次不该
+	// 走到建事务、查 manifest 这些更贵的步骤。
+	batchBytes, err := validateIndexBatchSize(req.Files)
+	if err != nil {
+		finishJSON(c, http.StatusRequestEntityTooLarge, gin.H{"error": err.Error()})
+		return
+	}
+	// 按实际内容量扣当日索引配额。计费点必须在调用 LCE 之前：超限的负载不能
+	// 先付出 embedding 成本再被拒绝。
+	if ok, used, limit := chargeIndexBytes(userID, batchBytes); !ok {
+		finishJSON(c, http.StatusTooManyRequests, gin.H{
+			"error": fmt.Sprintf("daily index quota exceeded (%d/%d bytes)", used, limit),
+		})
 		return
 	}
 

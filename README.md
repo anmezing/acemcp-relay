@@ -138,6 +138,7 @@ go build -o acemcp-relay .
 | `DEVICE_MAX_IPS` | 窗口内允许的最大来源 IP 数，超过写 `device_alerts` 告警；`0` 关闭检测 | `3` |
 | `CONSOLE_API_SECRET` | 网页控制台调用索引统计/清除接口的内部凭据，须与前端 `BETTER_AUTH_SECRET` 相同；Compose 部署已自动传入 | （空） |
 | `DEFAULT_DAILY_REQUEST_LIMIT` | 每用户每日请求上限默认值（Asia/Shanghai 自然日），超限返回 429；`0` 不限。可在控制台「配额管理」按用户覆盖（`user_quotas` 表，改后即时生效） | `0` |
+| `DAILY_INDEX_BYTES_LIMIT` | 每用户每日索引字节上限（Asia/Shanghai 自然日），超限返回 429；`0` 不限。索引通道**不能**靠请求数配额约束：创建一次 job 只计 1 次请求，之后的 `/relay/remote-index` 批次全部豁免（一次扫描上千批，按请求计费会误伤正常用户），而 embedding 成本全在那些批次上——无此上限时 1 次请求配额可驱动上百 GB 的 embedding 调用。单文件上限 1 MiB、单批上限 8 MiB 为硬编码常量 | `2147483648`（2 GiB） |
 | `MODEL_CONFIG_SECRET` | 按用户模型配置（BYO 模型）的加密密钥，须与前端设置相同的值；未设置时该特性关闭。用户在控制台「模型设置」配置自己的 embedding/rerank（含自己的 API key，AES-256-GCM 加密存于 `user_model_configs`），relay 解密后按请求注入 LCE；配置变化时 relay 自动清空该租户索引，插件下次扫描全量重建 | （空） |
 
 设备在前端 `/api/auth/device` 登录时注册（插件上报 `vscode.env.machineId`）。
