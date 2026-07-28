@@ -1267,9 +1267,11 @@ func handleCodebaseRetrieval(c *gin.Context) {
 		req.MaxOutputLength = 20000
 	}
 
+	// 字段名必须与 LCE 的 codebase-retrieval schema 一致：它必填 information_request
+	// 且是 strict 的，发 "query" 会被两头拒——缺必填字段 + 未知键。
 	args := map[string]interface{}{
-		"tenant_id": userIDStr,
-		"query":     req.InformationRequest,
+		"tenant_id":           userIDStr,
+		"information_request": req.InformationRequest,
 	}
 	cfg, err := resolveModelConfigArg(c.Request.Context(), userIDStr)
 	if err != nil {
