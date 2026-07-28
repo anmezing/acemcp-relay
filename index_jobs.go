@@ -508,6 +508,9 @@ func handleRemoteIndex(c *gin.Context) {
 	defer tx.Rollback()
 
 	job, staged, deleted, err := prepareIndexBatch(c.Request.Context(), tx, userID, req)
+	// 不变量：prepareIndexBatch 只在"job 不存在或不属于该用户"这一种情况下
+	// 外传 sql.ErrNoRows；它内部的按文件、按 job 字段查询都会把各自的 ErrNoRows
+	// 包装成带上下文的错误。新增查询时请保持这条，否则 404 会指向错误的原因。
 	if err == sql.ErrNoRows {
 		finishJSON(c, http.StatusNotFound, gin.H{"error": "index job not found"})
 		return
@@ -597,6 +600,15 @@ func prepareIndexBatch(ctx context.Context, tx *sql.Tx, userID string, req remot
 			FROM index_job_files
 			WHERE job_id = $1 AND path = $2
 		`, req.JobID, input.Path).Scan(&expectedHash, &estimatedChunks, &needsIndex, &indexed)
+		// 这里的 ErrNoRows 是"这个文件不在该 job 的清单里"，不是"job 不存在"。
+		// 直接外传会被 handleRemoteIndex 判成 404 index job not found，把一个
+		// 客户端批次错误报成任务丢失，排查时指向完全错误的方向。
+		// 这里的 ErrNoRows 是"这个文件不在该 job 的清单里"，不是"job 不存在"。
+		// 直接外传会被 handleRemoteIndex 判成 404 index job not found，把一个
+		// 客户端批次错误报成任务丢失，排查时指向完全错误的方向。
+		if err == sql.ErrNoRows {
+			return job, nil, nil, fmt.Errorf("batch file is not part of this job: %s", input.Path)
+		}
 		if err != nil {
 			return job, nil, nil, err
 		}
@@ -610,6 +622,11 @@ func prepareIndexBatch(ctx context.Context, tx *sql.Tx, userID string, req remot
 
 	var deletionsSent bool
 	err = tx.QueryRowContext(ctx, `SELECT deletions_sent FROM index_jobs WHERE id = $1`, req.JobID).Scan(&deletionsSent)
+	// job 在本事务开头已确认存在，这里的 ErrNoRows 只可能是并发删除；同样不能
+	// 让它伪装成上面那次 job 查询的 404。
+	if err == sql.ErrNoRows {
+		return job, nil, nil, fmt.Errorf("index job disappeared while staging the batch")
+	}
 	if err != nil {
 		return job, nil, nil, err
 	}
