@@ -35,6 +35,8 @@ import (
 var (
 	serverAddr               string
 	lceMCPURL                string
+	lceHealthURL             string
+	tenantAssertions         *tenantAssertionSigner
 	dbHost                   string
 	dbPort                   int
 	dbUser                   string
@@ -75,6 +77,19 @@ func loadConfig() {
 
 	serverAddr = getEnv("SERVER_ADDR", "127.0.0.1:8080")
 	lceMCPURL = getEnv("LCE_MCP_URL", "http://127.0.0.1:3000/mcp")
+	// LCE 的存活探针：不建 session、不占并发额度，因此可以高频探测。
+	// 它只说明进程活着，功能性判断仍由 tools/list 负责。
+	lceHealthURL = lceMCPURL + "/health"
+	// 与 LCE 共享的租户断言密钥。未配置时不附带断言：LCE 在 loopback 且未配密钥时
+	// 不强制校验，本地开发照旧；LCE 一旦配上密钥，未带断言的租户调用会被拒绝。
+	signer, err := newTenantAssertionSigner(os.Getenv("LCE_TENANT_ASSERTION_SECRET"))
+	if err != nil {
+		log.Fatalf("[CONFIG] %v", err)
+	}
+	tenantAssertions = signer
+	if tenantAssertions == nil {
+		log.Println("[CONFIG] LCE_TENANT_ASSERTION_SECRET 未配置：不签发租户断言。若 LCE 已开启校验，租户调用会被拒绝")
+	}
 	dbHost = getEnv("DB_HOST", "localhost")
 	dbPort = getEnvInt("DB_PORT", 5432)
 	dbUser = getEnv("DB_USER", "postgres")
@@ -291,6 +306,17 @@ func (m *mcpClient) doCallTool(ctx context.Context, sid, name string, args map[s
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/event-stream")
 	req.Header.Set("Mcp-Session-Id", sid)
+	// 断言从本次调用的 args 派生，而不是由各调用点自己传：签发的租户与请求的租户
+	// 因此永远一致，也不存在"某个调用点忘了带"的情况。
+	if tenantID := tenantIDFromArgs(args); tenantID != "" {
+		header, headerErr := tenantAssertions.authorizationHeader(tenantID)
+		if headerErr != nil {
+			return nil, false, fmt.Errorf("MCP tenant assertion: %w", headerErr)
+		}
+		if header != "" {
+			req.Header.Set("Authorization", header)
+		}
+	}
 
 	resp, err := m.http.Do(req)
 	if err != nil {
@@ -1641,10 +1667,40 @@ func startLeaderboardScheduler(ctx context.Context) {
 
 // ── 健康检查 ──────────────────────────────────────────────────────────────
 
+// probeLceLiveness 打 LCE 的存活端点并记录耗时。
+// 该端点不建立 session、不占用 LCE 的请求并发额度，所以可以按探测周期反复调用；
+// 用 initialize 当探针则会每次占掉一个 session 名额，最终把自己挡在 503 外面。
+func probeLceLiveness(ctx context.Context, out *sql.NullInt64) error {
+	t0 := time.Now()
+	req, err := http.NewRequestWithContext(ctx, "GET", lceHealthURL, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := lce.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+	*out = sql.NullInt64{Int64: time.Since(t0).Milliseconds(), Valid: true}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("LCE liveness returned %d", resp.StatusCode)
+	}
+	return nil
+}
+
+func formatNullMs(value sql.NullInt64) string {
+	if !value.Valid {
+		return "n/a"
+	}
+	return fmt.Sprintf("%dms", value.Int64)
+}
+
 func runHealthProbe() {
 	ctx, cancel := context.WithTimeout(context.Background(), HealthCheckTimeout)
 	defer cancel()
 
+	var livenessMs sql.NullInt64
 	var lceLatencyMs sql.NullInt64
 	var errMsg sql.NullString
 	status := "success"
@@ -1654,12 +1710,18 @@ func runHealthProbe() {
 		_, dbErr := db.Exec(
 			`INSERT INTO health_checks (status, tcp_ping_ms, codebase_retrieval_ms, error_message, next_check_at)
 			 VALUES ($1, $2, $3, $4, $5)`,
-			status, sql.NullInt64{}, lceLatencyMs, errMsg, nextCheckAt,
+			status, livenessMs, lceLatencyMs, errMsg, nextCheckAt,
 		)
 		if dbErr != nil {
 			log.Printf("[HEALTH] Failed to save result: %v", dbErr)
 		}
 	}()
+
+	// 两段分开测：存活探针只说明进程和 HTTP 层活着，tools/list 才覆盖 MCP 分发、
+	// session 管理和工具注册表。分开记录后，面板才能区分"LCE 挂了"与"LCE 活着但
+	// MCP 层坏了"——过去两种情况都只显示一个笼统的 error，而 tcp_ping_ms 这一列
+	// 一直写死为 NULL，前端那一栏永远是空的。
+	livenessErr := probeLceLiveness(ctx, &livenessMs)
 
 	t0 := time.Now()
 	err := lce.toolsList(ctx)
@@ -1667,11 +1729,15 @@ func runHealthProbe() {
 
 	if err != nil {
 		status = "error"
-		errMsg = sql.NullString{String: err.Error(), Valid: true}
+		if livenessErr == nil {
+			errMsg = sql.NullString{String: "LCE process is up but MCP dispatch failed: " + err.Error(), Valid: true}
+		} else {
+			errMsg = sql.NullString{String: err.Error(), Valid: true}
+		}
 		return
 	}
 
-	log.Printf("[HEALTH] Probe OK: lce_latency=%dms", lceLatencyMs.Int64)
+	log.Printf("[HEALTH] Probe OK: liveness=%s lce_latency=%dms", formatNullMs(livenessMs), lceLatencyMs.Int64)
 }
 
 func startHealthScheduler(ctx context.Context) {
