@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/redis/go-redis/v9"
 )
 
 // ── 设备绑定（防账号共用）──────────────────────────────────────────────────
@@ -142,9 +143,15 @@ func checkDeviceBinding(c *gin.Context, userID string) (string, bool) {
 	}
 
 	deviceID := strings.TrimSpace(c.GetHeader("X-Client-Id"))
-	if deviceID == "" || len(deviceID) > 128 {
+	if deviceID == "" {
 		deviceAlertAsync(userID, "", "missing_client_id",
 			fmt.Sprintf("path=%s ip=%s", c.Request.URL.Path, c.ClientIP()))
+		return "", deviceBindingMode != DeviceModeEnforce
+	}
+	if len(deviceID) > 128 {
+		// 超长 ID 是畸形/伪造客户端的信号，和"没带 ID"的老客户端要分开统计。
+		deviceAlertAsync(userID, deviceID[:128], "invalid_client_id",
+			fmt.Sprintf("len=%d path=%s ip=%s", len(deviceID), c.Request.URL.Path, c.ClientIP()))
 		return "", deviceBindingMode != DeviceModeEnforce
 	}
 
@@ -199,33 +206,39 @@ func recordDeviceActivity(userID, deviceID, clientIP string) {
 	if clientIP == "" || deviceMaxIPs <= 0 {
 		return
 	}
+	// 滑动窗口用 ZSET（score = 出现时间）：每次先清掉窗口外的成员再计数。
+	// 早先的 SET + EXPIRE 方案没有成员级过期，活跃设备的整个 set 的 TTL 会被
+	// 每次访问刷新，历史 IP 无限累积，必然误报 multi_ip。
 	ipKey := "device:ips:" + userID + ":" + deviceID
-	added, err := redisClient.SAdd(ctx, ipKey, clientIP).Result()
-	if err != nil {
+	now := time.Now()
+	windowStart := now.Add(-deviceIPWindow)
+	pipe := redisClient.TxPipeline()
+	pipe.ZAdd(ctx, ipKey, redis.Z{Score: float64(now.UnixMilli()), Member: clientIP})
+	pipe.ZRemRangeByScore(ctx, ipKey, "-inf", fmt.Sprintf("%d", windowStart.UnixMilli()))
+	countCmd := pipe.ZCard(ctx, ipKey)
+	pipe.Expire(ctx, ipKey, deviceIPWindow+time.Minute)
+	if _, err := pipe.Exec(ctx); err != nil {
 		return
 	}
-	redisClient.Expire(ctx, ipKey, deviceIPWindow)
-	if added == 0 {
+	count := countCmd.Val()
+	if count <= int64(deviceMaxIPs) {
 		return
 	}
-	count, err := redisClient.SCard(ctx, ipKey).Result()
-	if err != nil || count <= int64(deviceMaxIPs) {
-		return
-	}
-	ips, _ := redisClient.SMembers(ctx, ipKey).Result()
+	ips, _ := redisClient.ZRange(ctx, ipKey, 0, -1).Result()
 	deviceAlertAsync(userID, deviceID, "multi_ip",
 		fmt.Sprintf("%d ips within %s: %s", count, deviceIPWindow, strings.Join(ips, ",")))
 }
 
 // deviceAlertAsync 写入 device_alerts 并打日志；同类告警带冷却窗口防刷屏。
+// 整个函数体异步执行：冷却检查那次 Redis 往返也不该阻塞请求路径。
 func deviceAlertAsync(userID, deviceID, kind, detail string) {
-	ctx := context.Background()
-	coolKey := "device:alert:" + userID + ":" + deviceID + ":" + kind
-	if ok, err := redisClient.SetNX(ctx, coolKey, "1", deviceAlertCooldown).Result(); err != nil || !ok {
-		return
-	}
-	log.Printf("[DEVICE_ALERT] kind=%s user=%s device=%s %s", kind, userID, deviceID, detail)
 	go func() {
+		ctx := context.Background()
+		coolKey := "device:alert:" + userID + ":" + deviceID + ":" + kind
+		if ok, err := redisClient.SetNX(ctx, coolKey, "1", deviceAlertCooldown).Result(); err != nil || !ok {
+			return
+		}
+		log.Printf("[DEVICE_ALERT] kind=%s user=%s device=%s %s", kind, userID, deviceID, detail)
 		if _, err := db.Exec(
 			`INSERT INTO device_alerts (user_id, device_id, kind, detail) VALUES ($1, $2, $3, $4)`,
 			userID, deviceID, kind, detail,

@@ -15,6 +15,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 )
 
 const (
@@ -392,11 +393,11 @@ func handleCreateIndexJob(c *gin.Context) {
 		return
 	}
 
-	stmt, err := tx.PrepareContext(c.Request.Context(), `
-		INSERT INTO index_job_files (
-			job_id, path, hash, size, estimated_chunks, needs_index
-		) VALUES ($1, $2, $3, $4, $5, $6)
-	`)
+	// COPY 批量写入 manifest：10 万文件逐条 INSERT 要 10 万次网络往返，
+	// 会把创建 job 的事务拖到分钟级并一直占着 advisory 锁。
+	stmt, err := tx.PrepareContext(c.Request.Context(), pq.CopyIn(
+		"index_job_files", "job_id", "path", "hash", "size", "estimated_chunks", "needs_index",
+	))
 	if err != nil {
 		finishIndexError(c, err)
 		return
@@ -408,7 +409,16 @@ func handleCreateIndexJob(c *gin.Context) {
 			return
 		}
 	}
-	stmt.Close()
+	// 无参 Exec 刷出 COPY 缓冲；错误（如约束冲突）大多在这里才暴露。
+	if _, err := stmt.ExecContext(c.Request.Context()); err != nil {
+		stmt.Close()
+		finishIndexError(c, err)
+		return
+	}
+	if err := stmt.Close(); err != nil {
+		finishIndexError(c, err)
+		return
+	}
 
 	if err := tx.Commit(); err != nil {
 		finishIndexError(c, err)
@@ -530,8 +540,10 @@ func handleRemoteIndex(c *gin.Context) {
 		return
 	}
 	// 按实际内容量扣当日索引配额。计费点必须在调用 LCE 之前：超限的负载不能
-	// 先付出 embedding 成本再被拒绝。
+	// 先付出 embedding 成本再被拒绝。此后任何失败路径都必须 refund，否则客户
+	// 端重试会被双重计费。
 	if ok, used, limit := chargeIndexBytes(userID, batchBytes); !ok {
+		refundIndexBytes(userID, batchBytes)
 		finishJSON(c, http.StatusTooManyRequests, gin.H{
 			"error": fmt.Sprintf("daily index quota exceeded (%d/%d bytes)", used, limit),
 		})
@@ -540,27 +552,39 @@ func handleRemoteIndex(c *gin.Context) {
 
 	modelConfig, err := resolveModelConfigArg(c.Request.Context(), userID)
 	if err != nil {
+		refundIndexBytes(userID, batchBytes)
 		finishJSON(c, http.StatusServiceUnavailable, gin.H{"error": err.Error()})
 		return
 	}
 
+	// 事务A：只做校验与读取，随后立即提交释放连接和 advisory 锁。
+	// 决不能让事务横跨下面那次 LCE 调用（超时 120s）：连接池只有 25 个连接，
+	// 几十个并发 embedding 批次就会把连接占光，阻塞全站的 DB 访问。
 	tx, err := beginLockedIndexUserTx(c.Request.Context(), userID)
 	if err != nil {
+		refundIndexBytes(userID, batchBytes)
 		finishIndexError(c, err)
 		return
 	}
-	defer tx.Rollback()
-
 	job, staged, deleted, err := prepareIndexBatch(c.Request.Context(), tx, userID, req)
 	// 不变量：prepareIndexBatch 只在"job 不存在或不属于该用户"这一种情况下
 	// 外传 sql.ErrNoRows；它内部的按文件、按 job 字段查询都会把各自的 ErrNoRows
 	// 包装成带上下文的错误。新增查询时请保持这条，否则 404 会指向错误的原因。
 	if err == sql.ErrNoRows {
+		_ = tx.Rollback()
+		refundIndexBytes(userID, batchBytes)
 		finishJSON(c, http.StatusNotFound, gin.H{"error": "index job not found"})
 		return
 	}
 	if err != nil {
+		_ = tx.Rollback()
+		refundIndexBytes(userID, batchBytes)
 		finishJSON(c, http.StatusConflict, gin.H{"error": err.Error()})
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		refundIndexBytes(userID, batchBytes)
+		finishIndexError(c, err)
 		return
 	}
 
@@ -582,10 +606,12 @@ func handleRemoteIndex(c *gin.Context) {
 	}
 	result, err := lce.callTool(c.Request.Context(), "codebase_remote_index", args)
 	if err != nil {
+		refundIndexBytes(userID, batchBytes)
 		finishIndexToolError(c, err)
 		return
 	}
 	if result.IsError {
+		refundIndexBytes(userID, batchBytes)
 		finishIndexToolError(c, fmt.Errorf("%s", string(result.Content)))
 		return
 	}
@@ -596,11 +622,23 @@ func handleRemoteIndex(c *gin.Context) {
 			chunks += int64(file.EstimatedChunks)
 		}
 	}
-	if err := commitIndexBatch(c.Request.Context(), tx, userID, job.ID, staged, chunks, !exact, len(deleted) > 0); err != nil {
+	// 事务B：重新加锁提交进度。commitIndexBatch 内部会 SELECT...FOR UPDATE
+	// 复查 job 状态、并对每个文件的 UPDATE 断言 rows==1，因此事务A提交后到
+	// 这里之间发生的 supersede/清除/重放都会被拒绝（拒绝路径同样 refund）。
+	tx2, err := beginLockedIndexUserTx(c.Request.Context(), userID)
+	if err != nil {
+		refundIndexBytes(userID, batchBytes)
 		finishIndexError(c, err)
 		return
 	}
-	if err := tx.Commit(); err != nil {
+	defer tx2.Rollback()
+	if err := commitIndexBatch(c.Request.Context(), tx2, userID, job.ID, staged, chunks, !exact, len(deleted) > 0); err != nil {
+		refundIndexBytes(userID, batchBytes)
+		finishIndexError(c, err)
+		return
+	}
+	if err := tx2.Commit(); err != nil {
+		refundIndexBytes(userID, batchBytes)
 		finishIndexError(c, err)
 		return
 	}
@@ -630,37 +668,63 @@ func prepareIndexBatch(ctx context.Context, tx *sql.Tx, userID string, req remot
 
 	staged := make([]indexManifestFile, 0, len(req.Files))
 	seen := make(map[string]bool, len(req.Files))
+	paths := make([]string, 0, len(req.Files))
+	inputs := make([]indexManifestFile, 0, len(req.Files))
 	for _, input := range req.Files {
 		input.Path = normalizeIndexPath(input.Path)
 		if input.Path == "" || seen[input.Path] {
 			return job, nil, nil, fmt.Errorf("invalid or duplicate batch path")
 		}
 		seen[input.Path] = true
-		var expectedHash string
-		var estimatedChunks int
-		var needsIndex, indexed bool
-		err := tx.QueryRowContext(ctx, `
-			SELECT hash, estimated_chunks, needs_index, indexed
+		paths = append(paths, input.Path)
+		inputs = append(inputs, input)
+	}
+
+	// 一次性把整批文件的服务端记录查出来再内存比对：逐文件 SELECT 会给
+	// 每批 100 个文件各来一次网络往返，全部发生在持 advisory 锁的事务里。
+	type jobFileRow struct {
+		hash            string
+		estimatedChunks int
+		needsIndex      bool
+		indexed         bool
+	}
+	records := make(map[string]jobFileRow, len(paths))
+	if len(paths) > 0 {
+		rows, err := tx.QueryContext(ctx, `
+			SELECT path, hash, estimated_chunks, needs_index, indexed
 			FROM index_job_files
-			WHERE job_id = $1 AND path = $2
-		`, req.JobID, input.Path).Scan(&expectedHash, &estimatedChunks, &needsIndex, &indexed)
-		// 这里的 ErrNoRows 是"这个文件不在该 job 的清单里"，不是"job 不存在"。
-		// 直接外传会被 handleRemoteIndex 判成 404 index job not found，把一个
-		// 客户端批次错误报成任务丢失，排查时指向完全错误的方向。
-		// 这里的 ErrNoRows 是"这个文件不在该 job 的清单里"，不是"job 不存在"。
-		// 直接外传会被 handleRemoteIndex 判成 404 index job not found，把一个
-		// 客户端批次错误报成任务丢失，排查时指向完全错误的方向。
-		if err == sql.ErrNoRows {
-			return job, nil, nil, fmt.Errorf("batch file is not part of this job: %s", input.Path)
-		}
+			WHERE job_id = $1 AND path = ANY($2)
+		`, req.JobID, pq.Array(paths))
 		if err != nil {
 			return job, nil, nil, err
 		}
-		if !needsIndex || indexed || strings.TrimSpace(input.Hash) != expectedHash {
+		for rows.Next() {
+			var p string
+			var rec jobFileRow
+			if err := rows.Scan(&p, &rec.hash, &rec.estimatedChunks, &rec.needsIndex, &rec.indexed); err != nil {
+				rows.Close()
+				return job, nil, nil, err
+			}
+			records[p] = rec
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return job, nil, nil, err
+		}
+	}
+	for _, input := range inputs {
+		// "查不到"表示这个文件不在该 job 的清单里，不是"job 不存在"。
+		// 若表现为 sql.ErrNoRows 会被 handleRemoteIndex 判成 404 index job
+		// not found，把一个客户端批次错误报成任务丢失，排查时指向错误方向。
+		rec, ok := records[input.Path]
+		if !ok {
+			return job, nil, nil, fmt.Errorf("batch file is not part of this job: %s", input.Path)
+		}
+		if !rec.needsIndex || rec.indexed || strings.TrimSpace(input.Hash) != rec.hash {
 			return job, nil, nil, fmt.Errorf("batch file is stale or already indexed: %s", input.Path)
 		}
-		input.Hash = expectedHash
-		input.EstimatedChunks = estimatedChunks
+		input.Hash = rec.hash
+		input.EstimatedChunks = rec.estimatedChunks
 		staged = append(staged, input)
 	}
 
@@ -842,7 +906,6 @@ func handleCompleteIndexJob(c *gin.Context) {
 		finishIndexError(c, err)
 		return
 	}
-	reclaimIndexResources()
 	job, err := loadIndexJob(c.Request.Context(), userID, jobID)
 	if err != nil {
 		finishIndexError(c, err)
@@ -858,7 +921,7 @@ func handleFailIndexJob(c *gin.Context) {
 	_ = c.ShouldBindJSON(&req)
 	req.Error = strings.TrimSpace(req.Error)
 	if len(req.Error) > 2000 {
-		req.Error = req.Error[:2000]
+		req.Error = truncateUTF8(req.Error, 2000)
 	}
 	if req.Error == "" {
 		req.Error = "client reported indexing failure"
@@ -892,7 +955,6 @@ func handleFailIndexJob(c *gin.Context) {
 		finishIndexError(c, err)
 		return
 	}
-	reclaimIndexResources()
 	job, err := loadIndexJob(c.Request.Context(), userID, jobID)
 	if err != nil {
 		finishIndexError(c, err)
@@ -943,11 +1005,20 @@ func sweepExpiredIndexJobs(ctx context.Context) {
 	var ids []string
 	for rows.Next() {
 		var id string
-		if err := rows.Scan(&id); err == nil {
-			ids = append(ids, id)
+		if err := rows.Scan(&id); err != nil {
+			// 出错必须整体放弃：吞掉 Scan 错误会让对应 job 被标成 timed_out
+			// 却漏删 index_job_files，永久泄漏。回滚后下一轮 sweep 重来。
+			rows.Close()
+			log.Printf("[INDEX] Failed to scan timed out job id: %v", err)
+			return
 		}
+		ids = append(ids, id)
 	}
 	rows.Close()
+	if err := rows.Err(); err != nil {
+		log.Printf("[INDEX] Failed to iterate timed out jobs: %v", err)
+		return
+	}
 	for _, id := range ids {
 		if _, err := tx.ExecContext(ctx, `DELETE FROM index_job_files WHERE job_id = $1`, id); err != nil {
 			log.Printf("[INDEX] Failed to clean timed out job %s: %v", id, err)
@@ -959,7 +1030,6 @@ func sweepExpiredIndexJobs(ctx context.Context) {
 		return
 	}
 	if len(ids) > 0 {
-		reclaimIndexResources()
 		log.Printf("[INDEX] Reclaimed %d timed out indexing jobs", len(ids))
 	}
 }
@@ -974,12 +1044,6 @@ func startIndexJobSweeper(ctx context.Context) {
 		case <-ticker.C:
 			sweepExpiredIndexJobs(ctx)
 		}
-	}
-}
-
-func reclaimIndexResources() {
-	if lce != nil && lce.http != nil {
-		lce.http.CloseIdleConnections()
 	}
 }
 

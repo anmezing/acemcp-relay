@@ -21,6 +21,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/andybalholm/brotli"
 	"github.com/gin-gonic/gin"
@@ -65,8 +66,11 @@ const (
 	StatusCompleted = "completed"
 
 	LeaderboardUpdateInterval = 30 * time.Minute
-	LeaderboardPath           = "/mcp/tools/call/codebase-retrieval"
-	LeaderboardTopN           = 10
+	// 检索有两个入口：MCP tools/call（记录时被归一化成下面这个路径）和 REST 端点
+	// /relay/agents/codebase-retrieval。排行榜必须双路径统计，否则 REST 用户不被计入。
+	LeaderboardPath     = "/mcp/tools/call/codebase-retrieval"
+	LeaderboardRESTPath = "/relay/agents/codebase-retrieval"
+	LeaderboardTopN     = 10
 	LeaderboardTimezone       = "Asia/Shanghai"
 
 	HealthCheckInterval = 2 * time.Minute
@@ -80,7 +84,8 @@ func loadConfig() {
 	lceMCPURL = getEnv("LCE_MCP_URL", "http://127.0.0.1:3000/mcp")
 	// LCE 的存活探针：不建 session、不占并发额度，因此可以高频探测。
 	// 它只说明进程活着，功能性判断仍由 tools/list 负责。
-	lceHealthURL = lceMCPURL + "/health"
+	// TrimRight 防止 LCE_MCP_URL 带尾斜杠时拼出 "…//health"。
+	lceHealthURL = strings.TrimRight(lceMCPURL, "/") + "/health"
 	// 与 LCE 共享的租户断言密钥。未配置时不附带断言：LCE 在 loopback 且未配密钥时
 	// 不强制校验，本地开发照旧；LCE 一旦配上密钥，未带断言的租户调用会被拒绝。
 	signer, err := newTenantAssertionSigner(os.Getenv("LCE_TENANT_ASSERTION_SECRET"))
@@ -218,12 +223,20 @@ func (m *mcpClient) ensureSession(ctx context.Context) (string, error) {
 	return m.initSession(ctx)
 }
 
+// initSessionTimeout 限制 initSession 持写锁期间两次网络调用的总时长。
+// 这里所有并发请求的 ensureSession 都会阻塞在写锁上，不能让调用方自带的
+// 120s 超时决定锁的持有时间。
+const initSessionTimeout = 10 * time.Second
+
 func (m *mcpClient) initSession(ctx context.Context) (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.sessionID != "" {
 		return m.sessionID, nil
 	}
+
+	ctx, cancel := context.WithTimeout(ctx, initSessionTimeout)
+	defer cancel()
 
 	initBody, _ := json.Marshal(map[string]interface{}{
 		"jsonrpc": "2.0",
@@ -268,6 +281,9 @@ func (m *mcpClient) initSession(ctx context.Context) (string, error) {
 	nReq.Header.Set("Mcp-Session-Id", sid)
 	nResp, err := m.http.Do(nReq)
 	if err != nil {
+		// LCE 侧的 session 已经建立：通知失败时必须归还名额，否则每次
+		// 失败重试都会泄漏一个 LCE session，最终把自己挡在 503 外面。
+		go m.deleteRemoteSession(sid)
 		return "", fmt.Errorf("MCP initialized notification: %w", err)
 	}
 	io.ReadAll(nResp.Body)
@@ -280,8 +296,34 @@ func (m *mcpClient) initSession(ctx context.Context) (string, error) {
 
 func (m *mcpClient) invalidateSession() {
 	m.mu.Lock()
+	sid := m.sessionID
 	m.sessionID = ""
 	m.mu.Unlock()
+	if sid != "" {
+		go m.deleteRemoteSession(sid)
+	}
+}
+
+// deleteRemoteSession best-effort 释放 LCE 侧的 session 名额（LCE 的 /mcp 支持
+// DELETE + Mcp-Session-Id）。失败只打日志：名额最终由 LCE 的 TTL 回收。
+func (m *mcpClient) deleteRemoteSession(sid string) {
+	if sid == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), initSessionTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, lceMCPURL, nil)
+	if err != nil {
+		return
+	}
+	req.Header.Set("Mcp-Session-Id", sid)
+	resp, err := m.http.Do(req)
+	if err != nil {
+		log.Printf("[MCP] session delete failed (sid=%s): %v", sid, err)
+		return
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
 }
 
 type mcpToolResult struct {
@@ -541,9 +583,12 @@ func initDB() error {
 		);
 		CREATE INDEX IF NOT EXISTS idx_leaderboard_date ON leaderboard(date_str);
 
-		CREATE INDEX IF NOT EXISTS idx_request_logs_codebase_retrieval
+		-- 旧谓词指向早已不存在的 '/agents/codebase-retrieval'，排行榜查询只能全表扫描。
+		-- 谓词必须与 updateLeaderboard 的双路径口径保持一致。
+		DROP INDEX IF EXISTS idx_request_logs_codebase_retrieval;
+		CREATE INDEX IF NOT EXISTS idx_request_logs_codebase_retrieval_v2
 			ON request_logs(user_id, request_timestamp)
-			WHERE request_path = '/agents/codebase-retrieval';
+			WHERE request_path IN ('/mcp/tools/call/codebase-retrieval', '/relay/agents/codebase-retrieval');
 	`)
 	if err != nil {
 		return fmt.Errorf("failed to migrate leaderboard table: %w", err)
@@ -663,6 +708,13 @@ func authMiddleware() gin.HandlerFunc {
 
 		trustedConsole := isTrustedConsoleRequest(c)
 		if !trustedConsole {
+			// 设备校验在前：被 enforce 拒掉的请求不应烧掉当日请求配额。
+			deviceID, deviceOK := checkDeviceBinding(c, userID)
+			if !deviceOK {
+				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "device not authorized: this account is signed in on another device; log in again to use it here"})
+				return
+			}
+
 			if !isIndexQuotaExempt(c.Request.Method, c.Request.URL.Path) {
 				if ok, limit := checkRequestQuota(userID); !ok {
 					c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{"error": fmt.Sprintf("daily request quota exceeded (%d/day)", limit)})
@@ -670,11 +722,6 @@ func authMiddleware() gin.HandlerFunc {
 				}
 			}
 
-			deviceID, deviceOK := checkDeviceBinding(c, userID)
-			if !deviceOK {
-				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "device not authorized: this account is signed in on another device; log in again to use it here"})
-				return
-			}
 			if deviceID != "" {
 				go recordDeviceActivity(userID, deviceID, c.ClientIP())
 			}
@@ -874,6 +921,9 @@ var (
 	toolsCache     json.RawMessage
 	toolsCacheMu   sync.RWMutex
 	toolsCacheTime time.Time
+	// toolsFetchMu 只保护"缓存过期后的回源"这一段：双检锁防止缓存击穿——
+	// 过期瞬间的并发请求只放一个去打 LCE，其余等它填好缓存后直接复用。
+	toolsFetchMu sync.Mutex
 )
 
 type jsonRPCRequest struct {
@@ -1017,14 +1067,26 @@ func startMCPSessionSweeper(ctx context.Context) {
 	}
 }
 
-func getCachedToolsList(ctx context.Context) (json.RawMessage, error) {
+func readToolsCache() (json.RawMessage, bool) {
 	toolsCacheMu.RLock()
+	defer toolsCacheMu.RUnlock()
 	if toolsCache != nil && time.Since(toolsCacheTime) < toolsCacheTTL {
-		cached := toolsCache
-		toolsCacheMu.RUnlock()
+		return toolsCache, true
+	}
+	return nil, false
+}
+
+func getCachedToolsList(ctx context.Context) (json.RawMessage, error) {
+	if cached, ok := readToolsCache(); ok {
 		return cached, nil
 	}
-	toolsCacheMu.RUnlock()
+
+	toolsFetchMu.Lock()
+	defer toolsFetchMu.Unlock()
+	// 双检：拿到回源锁时前一个请求可能已经填好缓存。
+	if cached, ok := readToolsCache(); ok {
+		return cached, nil
+	}
 
 	tools, err := lce.fetchToolsList(ctx)
 	if err != nil {
@@ -1316,7 +1378,7 @@ func handleCodebaseRetrieval(c *gin.Context) {
 
 	content := string(result.Content)
 	if len(content) > req.MaxOutputLength {
-		content = content[:req.MaxOutputLength]
+		content = truncateUTF8(content, req.MaxOutputLength)
 	}
 
 	c.JSON(http.StatusOK, gin.H{"formatted_retrieval": content})
@@ -1338,13 +1400,17 @@ func handleClearIndex(c *gin.Context) {
 		return
 	}
 
-	tx, err := beginLockedIndexUserTx(c.Request.Context(), userIDStr)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "清除索引失败: " + err.Error()})
+	// 顺序必须是"先清 relay 快照并提交，再清 LCE"：LCE 的 clear 不可回滚，
+	// 若先清 LCE 再提交 relay 事务，Commit 失败会留下"LCE 空 / relay 快照满"
+	// 的永久不一致（后续 diff 全判未变更，永远不重传）。反过来，relay 已清、
+	// LCE 清失败只会导致下一次全量重传覆盖旧数据，可自愈。
+	// 事务在调 LCE 之前就已提交并释放连接与 advisory 锁，不会占着连接池等
+	// 120s 的网络调用。
+	if err := clearUserIndexState(c.Request.Context(), userIDStr); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "清除 Relay 索引状态失败: " + err.Error()})
 		completeRequestLogAsync(getRequestLogEntry(c, http.StatusInternalServerError))
 		return
 	}
-	defer tx.Rollback()
 
 	args := map[string]interface{}{"tenant_id": userIDStr}
 	result, err := lce.callTool(c.Request.Context(), "codebase_clear_index", args)
@@ -1359,17 +1425,6 @@ func handleClearIndex(c *gin.Context) {
 
 	if result.IsError {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "清除索引失败", "detail": string(result.Content)})
-		completeRequestLogAsync(getRequestLogEntry(c, http.StatusInternalServerError))
-		return
-	}
-
-	if err := clearUserIndexStateTx(c.Request.Context(), tx, userIDStr); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "清除 Relay 索引状态失败: " + err.Error()})
-		completeRequestLogAsync(getRequestLogEntry(c, http.StatusInternalServerError))
-		return
-	}
-	if err := tx.Commit(); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "提交索引清理失败: " + err.Error()})
 		completeRequestLogAsync(getRequestLogEntry(c, http.StatusInternalServerError))
 		return
 	}
@@ -1414,14 +1469,18 @@ func handleTenantStats(c *gin.Context) {
 		return
 	}
 
-	var indexingCount int
+	// 前端把这个字段展示为「索引请求次数」（历史累计完成数），所以这里查的是
+	// completed 状态；indexingCount 这个字段名是对外契约，不能改。
+	var completedJobCount int
 	row := db.QueryRow(
 		`SELECT COUNT(*) FROM index_jobs WHERE user_id = $1 AND status = $2`,
 		userIDStr,
 		indexJobStatusCompleted,
 	)
-	_ = row.Scan(&indexingCount)
-	stats["indexingCount"] = indexingCount
+	if err := row.Scan(&completedJobCount); err != nil {
+		log.Printf("[STATS] completed index job count failed (user=%s): %v", userIDStr, err)
+	}
+	stats["indexingCount"] = completedJobCount
 
 	c.JSON(http.StatusOK, stats)
 	completeRequestLogAsync(getRequestLogEntry(c, http.StatusOK))
@@ -1456,11 +1515,35 @@ func handleMCPDelete(c *gin.Context) {
 	log.Printf("[MCP_SERVER] Session deleted: %s", sessionID)
 }
 
+// truncateUTF8 按字节上限截断字符串，并回退到最近的合法 UTF-8 边界，
+// 避免把一个多字节字符从中间切开产生非法序列。
+func truncateUTF8(s string, maxBytes int) string {
+	if maxBytes <= 0 {
+		return ""
+	}
+	if len(s) <= maxBytes {
+		return s
+	}
+	cut := maxBytes
+	for cut > 0 && cut > maxBytes-utf8.UTFMax && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut]
+}
+
+// extractSSEData 从 SSE 响应里取 JSON-RPC 载荷。流里可能有多个事件（如
+// 服务器先推 notification 再推 response），取最后一个 data: 行；同时剥掉
+// CRLF 换行残留的 \r，否则 JSON 解析会失败。
 func extractSSEData(raw []byte) []byte {
+	var last []byte
 	for _, line := range strings.Split(string(raw), "\n") {
+		line = strings.TrimRight(line, "\r")
 		if strings.HasPrefix(line, "data: ") {
-			return []byte(strings.TrimPrefix(line, "data: "))
+			last = []byte(strings.TrimPrefix(line, "data: "))
 		}
+	}
+	if last != nil {
+		return last
 	}
 	return raw
 }
@@ -1605,14 +1688,14 @@ func updateLeaderboard() error {
 	rows, err := db.Query(`
 		SELECT user_id, COUNT(*) as cnt
 		FROM request_logs
-		WHERE request_path = $1
-		  AND request_timestamp >= $2
-		  AND request_timestamp < $3
+		WHERE request_path IN ($1, $2)
+		  AND request_timestamp >= $3
+		  AND request_timestamp < $4
 		  AND status_code = 200
 		GROUP BY user_id
 		ORDER BY cnt DESC
-		LIMIT $4
-	`, LeaderboardPath, dayStart, dayEnd, LeaderboardTopN)
+		LIMIT $5
+	`, LeaderboardPath, LeaderboardRESTPath, dayStart, dayEnd, LeaderboardTopN)
 	if err != nil {
 		return fmt.Errorf("failed to query leaderboard data: %w", err)
 	}
@@ -1725,6 +1808,9 @@ func runHealthProbe() {
 
 	defer func() {
 		nextCheckAt := time.Now().Add(HealthCheckInterval)
+		// 列名是历史遗留：tcp_ping_ms 现在写的是 HTTP 存活探针耗时，
+		// codebase_retrieval_ms 写的是 tools/list 耗时。改列名需要迁移且
+		// 前端面板按旧列名取数，这里只以注释说明语义。
 		_, dbErr := db.Exec(
 			`INSERT INTO health_checks (status, tcp_ping_ms, codebase_retrieval_ms, error_message, next_check_at)
 			 VALUES ($1, $2, $3, $4, $5)`,

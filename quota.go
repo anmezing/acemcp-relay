@@ -22,6 +22,10 @@ var (
 	quotaLoc     *time.Location
 )
 
+// quotaCacheTTL 是配额上限缓存的独立 TTL。此前复用 deviceCacheTTL，调设备
+// 缓存参数会意外改变配额生效延迟。
+const quotaCacheTTL = 5 * time.Minute
+
 func quotaLocation() *time.Location {
 	quotaLocOnce.Do(func() {
 		loc, err := time.LoadLocation(LeaderboardTimezone)
@@ -70,7 +74,7 @@ func getUserDailyLimit(userID string) int {
 		return limit
 	}
 
-	redisClient.Set(ctx, cacheKey, strconv.Itoa(limit), deviceCacheTTL)
+	redisClient.Set(ctx, cacheKey, strconv.Itoa(limit), quotaCacheTTL)
 	return limit
 }
 
@@ -110,6 +114,20 @@ func chargeIndexBytes(userID string, bytes int64) (bool, int64, int64) {
 		redisClient.Expire(ctx, key, 48*time.Hour)
 	}
 	return used <= dailyIndexBytesLimit, used, dailyIndexBytesLimit
+}
+
+// refundIndexBytes 返还 chargeIndexBytes 预扣的字节。计费点在调用 LCE 之前，
+// 后续任何失败（batch 校验失败、LCE 出错、事务提交失败）都意味着这些字节
+// 没有真正产生 embedding 成本，必须退回，否则重试会双重计费直至误撞配额。
+// best-effort：Redis 故障只打日志（与扣费侧的故障放行策略一致）。
+func refundIndexBytes(userID string, bytes int64) {
+	if dailyIndexBytesLimit <= 0 || bytes <= 0 {
+		return
+	}
+	ctx := context.Background()
+	if err := redisClient.DecrBy(ctx, indexBytesKey(userID), bytes).Err(); err != nil {
+		log.Printf("[QUOTA] index byte refund failed (user=%s bytes=%d): %v", userID, bytes, err)
+	}
 }
 
 // checkRequestQuota 累加当日计数并判断是否超限。Redis 故障时放行。

@@ -167,11 +167,24 @@ func applyModelConfigChange(ctx context.Context, userID string, row *userModelCo
 	}
 	defer releaseModelConfigApplyLock(context.Background(), lockKey, lockToken)
 
+	// 与 handleClearIndex 同一原则：不能让持 advisory 锁的 DB 事务横跨 LCE
+	// 网络调用（120s 超时会占死连接池），也不能"先清 LCE 再提交 relay"——
+	// Commit 失败会留下 LCE 空/relay 快照满的永久不一致。顺序：
+	//   1) 事务A 清 relay 快照并提交（可自愈：只会引发一次全量重传）；
+	//   2) 调 LCE 清租户索引；
+	//   3) 事务B 重新加锁推进 applied_fingerprint（带指纹复查防并发改配置）。
+	// 若 2/3 失败，applied_fingerprint 保持不一致，下个请求会重试整个流程。
 	tx, err := beginLockedIndexUserTx(ctx, userID)
 	if err != nil {
 		return fmt.Errorf("model config index lock failed: %w", err)
 	}
-	defer tx.Rollback()
+	if err := clearUserIndexStateTx(ctx, tx, userID); err != nil {
+		_ = tx.Rollback()
+		return fmt.Errorf("model config relay snapshot reset failed: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("model config snapshot reset commit failed: %w", err)
+	}
 
 	result, err := lce.callTool(ctx, "codebase_clear_index", map[string]interface{}{"tenant_id": userID})
 	if err != nil || (result != nil && result.IsError) {
@@ -185,10 +198,12 @@ func applyModelConfigChange(ctx context.Context, userID string, row *userModelCo
 		return fmt.Errorf("model config index reset failed: %s", detail)
 	}
 
-	if err := clearUserIndexStateTx(ctx, tx, userID); err != nil {
-		return fmt.Errorf("model config relay snapshot reset failed: %w", err)
+	tx2, err := beginLockedIndexUserTx(ctx, userID)
+	if err != nil {
+		return fmt.Errorf("model config index lock failed: %w", err)
 	}
-	updateResult, err := tx.ExecContext(ctx,
+	defer tx2.Rollback()
+	updateResult, err := tx2.ExecContext(ctx,
 		`UPDATE user_model_configs
 		 SET applied_fingerprint = $2, updated_at = NOW()
 		 WHERE user_id = $1 AND fingerprint = $2`,
@@ -204,7 +219,7 @@ func applyModelConfigChange(ctx context.Context, userID string, row *userModelCo
 	if rows != 1 {
 		return fmt.Errorf("model config changed while applying; retry")
 	}
-	if err := tx.Commit(); err != nil {
+	if err := tx2.Commit(); err != nil {
 		return fmt.Errorf("model config apply commit failed: %w", err)
 	}
 

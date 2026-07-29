@@ -9,6 +9,7 @@ import (
 	"time"
 
 	sqlmock "github.com/DATA-DOG/go-sqlmock"
+	"github.com/lib/pq"
 )
 
 // prepareIndexBatch 的错误分类是 handleRemoteIndex 状态码的唯一依据：
@@ -16,10 +17,16 @@ import (
 //	sql.ErrNoRows        -> 404 "index job not found"
 //	其它错误             -> 409 + 错误原文
 //
-// 因此"哪些情况允许外传 sql.ErrNoRows"是一条必须守住的不变量。它内部有三处
-// 查询都可能返回 ErrNoRows，但只有第一处（job 本身）表示任务不存在；另外两处
-// 若把 ErrNoRows 原样外传，就会把"这个文件不在清单里"报成"任务丢了"，排查时
-// 指向完全错误的方向。
+// 因此"哪些情况允许外传 sql.ErrNoRows"是一条必须守住的不变量。它内部的
+// 查询里只有第一处（job 本身）允许外传 ErrNoRows；批量文件查询"查不到某个
+// 文件"表现为结果集里缺行，deletions_sent 查询的 ErrNoRows 表示 job 并发
+// 消失——这两种都必须包装成带上下文的错误，否则会把"这个文件不在清单里"
+// 报成"任务丢了"，排查时指向完全错误的方向。
+
+// jobFileColumns 是批量文件查询的列。
+func jobFileRows() *sqlmock.Rows {
+	return sqlmock.NewRows([]string{"path", "hash", "estimated_chunks", "needs_index", "indexed"})
+}
 
 const jobColumnCount = 20
 
@@ -84,10 +91,10 @@ func TestPrepareIndexBatchDoesNotDisguiseUnknownFileAsMissingJob(t *testing.T) {
 		mock.ExpectQuery("FROM index_jobs").
 			WithArgs("job-1", "user-1").
 			WillReturnRows(jobRow(indexJobStatusRunning, 0))
-		// 该文件不在这个 job 的清单里
+		// 该文件不在这个 job 的清单里：批量查询返回空结果集
 		mock.ExpectQuery("FROM index_job_files").
-			WithArgs("job-1", "ghost.go").
-			WillReturnError(sql.ErrNoRows)
+			WithArgs("job-1", pq.Array([]string{"ghost.go"})).
+			WillReturnRows(jobFileRows())
 	}, func(tx *sql.Tx) {
 		_, _, _, err := prepareIndexBatch(context.Background(), tx, "user-1", remoteIndexRequest{
 			JobID: "job-1",
@@ -116,9 +123,8 @@ func TestPrepareIndexBatchDoesNotDisguiseVanishedJobAsMissingJob(t *testing.T) {
 			WithArgs("job-1", "user-1").
 			WillReturnRows(jobRow(indexJobStatusRunning, 0))
 		mock.ExpectQuery("FROM index_job_files").
-			WithArgs("job-1", "a.go").
-			WillReturnRows(sqlmock.NewRows([]string{"hash", "estimated_chunks", "needs_index", "indexed"}).
-				AddRow("h1", 3, true, false))
+			WithArgs("job-1", pq.Array([]string{"a.go"})).
+			WillReturnRows(jobFileRows().AddRow("a.go", "h1", 3, true, false))
 		// job 在暂存过程中被并发删除
 		mock.ExpectQuery("SELECT deletions_sent FROM index_jobs").
 			WithArgs("job-1").
@@ -147,9 +153,8 @@ func TestPrepareIndexBatchStagesFilesOnHappyPath(t *testing.T) {
 			WithArgs("job-1", "user-1").
 			WillReturnRows(jobRow(indexJobStatusRunning, 0))
 		mock.ExpectQuery("FROM index_job_files").
-			WithArgs("job-1", "a.go").
-			WillReturnRows(sqlmock.NewRows([]string{"hash", "estimated_chunks", "needs_index", "indexed"}).
-				AddRow("h1", 7, true, false))
+			WithArgs("job-1", pq.Array([]string{"a.go"})).
+			WillReturnRows(jobFileRows().AddRow("a.go", "h1", 7, true, false))
 		mock.ExpectQuery("SELECT deletions_sent FROM index_jobs").
 			WithArgs("job-1").
 			WillReturnRows(sqlmock.NewRows([]string{"deletions_sent"}).AddRow(true))
@@ -184,9 +189,8 @@ func TestPrepareIndexBatchRejectsStaleFileWithoutErrNoRows(t *testing.T) {
 			WithArgs("job-1", "user-1").
 			WillReturnRows(jobRow(indexJobStatusRunning, 0))
 		mock.ExpectQuery("FROM index_job_files").
-			WithArgs("job-1", "a.go").
-			WillReturnRows(sqlmock.NewRows([]string{"hash", "estimated_chunks", "needs_index", "indexed"}).
-				AddRow("server-hash", 3, true, false))
+			WithArgs("job-1", pq.Array([]string{"a.go"})).
+			WillReturnRows(jobFileRows().AddRow("a.go", "server-hash", 3, true, false))
 	}, func(tx *sql.Tx) {
 		_, _, _, err := prepareIndexBatch(context.Background(), tx, "user-1", remoteIndexRequest{
 			JobID: "job-1",
