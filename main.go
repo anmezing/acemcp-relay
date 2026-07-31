@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"net/http/pprof"
 	"os"
@@ -336,6 +337,36 @@ type mcpToolResult struct {
 	IsError bool
 }
 
+func marshalMCPToolCallBody(id int64, name string, args map[string]interface{}) ([]byte, error) {
+	return json.Marshal(map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      id,
+		"method":  "tools/call",
+		"params": map[string]interface{}{
+			"name":      name,
+			"arguments": args,
+		},
+	})
+}
+
+// validateMCPToolCallBody measures the actual downstream wire representation.
+// Raw source-byte limits alone cannot protect LCE because JSON escaping and the
+// request envelope add bytes after Relay has accepted the client request.
+func validateMCPToolCallBody(name string, args map[string]interface{}) (int, error) {
+	body, err := marshalMCPToolCallBody(math.MaxInt64, name, args)
+	if err != nil {
+		return 0, fmt.Errorf("encode MCP tools/call: %w", err)
+	}
+	if len(body) > maxLCEMCPRequestBodyBytes {
+		return len(body), fmt.Errorf(
+			"encoded LCE request exceeds the %d byte limit (%d bytes)",
+			maxLCEMCPRequestBodyBytes,
+			len(body),
+		)
+	}
+	return len(body), nil
+}
+
 func (m *mcpClient) callTool(ctx context.Context, name string, args map[string]interface{}) (*mcpToolResult, error) {
 	return m.callToolWithTimeout(ctx, name, args, defaultMCPCallTimeout)
 }
@@ -361,15 +392,17 @@ func (m *mcpClient) callToolWithTimeout(ctx context.Context, name string, args m
 }
 
 func (m *mcpClient) doCallTool(ctx context.Context, sid, name string, args map[string]interface{}) (*mcpToolResult, bool, error) {
-	body, _ := json.Marshal(map[string]interface{}{
-		"jsonrpc": "2.0",
-		"id":      m.nextID.Add(1),
-		"method":  "tools/call",
-		"params": map[string]interface{}{
-			"name":      name,
-			"arguments": args,
-		},
-	})
+	body, err := marshalMCPToolCallBody(m.nextID.Add(1), name, args)
+	if err != nil {
+		return nil, false, fmt.Errorf("encode MCP tools/call: %w", err)
+	}
+	if len(body) > maxLCEMCPRequestBodyBytes {
+		return nil, false, fmt.Errorf(
+			"encoded LCE request exceeds the %d byte limit (%d bytes)",
+			maxLCEMCPRequestBodyBytes,
+			len(body),
+		)
+	}
 
 	req, _ := http.NewRequestWithContext(ctx, "POST", lceMCPURL, bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")

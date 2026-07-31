@@ -29,13 +29,17 @@ const (
 	indexJobHeartbeatTimeout = 10 * time.Minute
 	indexJobSweepInterval    = time.Minute
 	maxIndexManifestFiles    = 100000
-	maxIndexBatchFiles       = 100
+	maxIndexBatchFiles       = 50
 	// 单个文件的内容上限。源码文件极少接近这个量级，而 embedding 本身也有
 	// token 上限——超过这个大小的"源码"要么是生成物要么是灌进来的负载。
-	maxIndexFileBytes = 1 << 20 // 1 MiB
-	// 单批内容总量上限。没有这一条时，每批 100 个文件可以各带 100MB，
-	// 单个请求就能推送上 GB 的 embedding 负载。
-	maxIndexBatchBytes = 8 << 20 // 8 MiB
+	maxIndexFileBytes = 512 << 10 // 512 KiB
+	// 单批内容总量上限。它也决定插件报告进度和失败重试的粒度。
+	maxIndexBatchBytes = 512 << 10 // 512 KiB
+	// LCE's container entry point accepts a 4 MiB complete JSON-RPC body. Raw
+	// source is capped much lower because JSON escaping can expand a byte to a
+	// six-byte \\u00xx sequence. The serialized-body check below remains the
+	// authoritative guard for paths, model config, and all other envelope data.
+	maxLCEMCPRequestBodyBytes = 4 << 20 // 4 MiB
 	// 每用户每日索引字节的默认上限。正常项目首次全量索引通常在百 MB 量级，
 	// 之后只传变更；这个默认值对真实使用足够宽松，但能挡住批量灌数据。
 	defaultDailyIndexBytes = 2 << 30 // 2 GiB
@@ -746,14 +750,6 @@ func handleRemoteIndex(c *gin.Context) {
 		finishJSON(c, http.StatusRequestEntityTooLarge, gin.H{"error": err.Error()})
 		return
 	}
-	if ok, used, limit := chargeIndexBytes(userID, batchBytes); !ok {
-		c.Header("Retry-After", quotaRetryAfterHeader(time.Now()))
-		finishJSON(c, http.StatusTooManyRequests, gin.H{
-			"error": fmt.Sprintf("daily index quota exceeded (%d/%d bytes)", used, limit),
-		})
-		return
-	}
-
 	filesArg := make([]map[string]interface{}, 0, len(staged))
 	for _, file := range staged {
 		filesArg = append(filesArg, map[string]interface{}{
@@ -767,6 +763,17 @@ func handleRemoteIndex(c *gin.Context) {
 	args["root_id"] = req.RootID
 	if modelConfig != nil {
 		args["model_config"] = modelConfig
+	}
+	if _, err := validateMCPToolCallBody("codebase_remote_index", args); err != nil {
+		finishJSON(c, http.StatusRequestEntityTooLarge, gin.H{"error": err.Error()})
+		return
+	}
+	if ok, used, limit := chargeIndexBytes(userID, batchBytes); !ok {
+		c.Header("Retry-After", quotaRetryAfterHeader(time.Now()))
+		finishJSON(c, http.StatusTooManyRequests, gin.H{
+			"error": fmt.Sprintf("daily index quota exceeded (%d/%d bytes)", used, limit),
+		})
+		return
 	}
 	result, err := lce.callToolWithTimeout(opCtx, "codebase_remote_index", args, remoteIndexMCPCallTimeout)
 	if err != nil {
@@ -844,7 +851,7 @@ func prepareIndexBatch(ctx context.Context, tx *sql.Tx, userID string, req remot
 	}
 
 	// 一次性把整批文件的服务端记录查出来再内存比对：逐文件 SELECT 会给
-	// 每批 100 个文件各来一次网络往返，全部发生在持 advisory 锁的事务里。
+	// 每批数十个文件各来一次网络往返，全部发生在持 advisory 锁的事务里。
 	type jobFileRow struct {
 		hash            string
 		size            int64

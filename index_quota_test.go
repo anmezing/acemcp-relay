@@ -22,9 +22,9 @@ import (
 // 下面三条边界共同封死这条路径：单文件上限、单批上限、每日字节配额。
 
 func TestIndexSizeCapsAreOrderedAndBounded(t *testing.T) {
-	// 单文件上限必须小于单批上限，否则一个文件就能占满整批，批上限形同虚设
-	if maxIndexFileBytes >= maxIndexBatchBytes {
-		t.Errorf("单文件上限 (%d) 应小于单批上限 (%d)", maxIndexFileBytes, maxIndexBatchBytes)
+	// 单文件可以独占一批，但不能绕过批次总量上限。
+	if maxIndexFileBytes > maxIndexBatchBytes {
+		t.Errorf("单文件上限 (%d) 不应超过单批上限 (%d)", maxIndexFileBytes, maxIndexBatchBytes)
 	}
 	// 每日配额必须显著大于单批上限，否则一批就撞墙，正常扫描无法完成
 	if defaultDailyIndexBytes <= maxIndexBatchBytes {
@@ -34,6 +34,40 @@ func TestIndexSizeCapsAreOrderedAndBounded(t *testing.T) {
 	const nginxBodyLimit = 100 << 20
 	if maxIndexBatchBytes > nginxBodyLimit {
 		t.Errorf("单批上限 (%d) 超过了 nginx 的请求体上限 (%d)", maxIndexBatchBytes, nginxBodyLimit)
+	}
+}
+
+func TestWorstCaseJSONEscapingFitsDownstreamBodyLimit(t *testing.T) {
+	content := strings.Repeat("\x00", maxIndexBatchBytes)
+	files := []indexManifestFile{{Path: "src/control-bytes.txt", Content: content}}
+	if _, err := validateIndexBatchSize(files); err != nil {
+		t.Fatalf("raw batch at the negotiated limit should pass: %v", err)
+	}
+	args := map[string]interface{}{
+		"tenant_id": "tenant-1",
+		"root_id":   "root-1",
+		"files": []map[string]interface{}{{
+			"path": "src/control-bytes.txt", "content": content, "hash": "hash-1",
+		}},
+	}
+	encoded, err := validateMCPToolCallBody("codebase_remote_index", args)
+	if err != nil {
+		t.Fatalf("worst-case escaped batch must fit the LCE body contract: %v", err)
+	}
+	if encoded <= maxIndexBatchBytes {
+		t.Fatalf("fixture did not exercise JSON expansion: encoded=%d raw=%d", encoded, maxIndexBatchBytes)
+	}
+}
+
+func TestEncodedMCPEnvelopeCannotExceedDownstreamBodyLimit(t *testing.T) {
+	_, err := validateMCPToolCallBody("codebase_remote_index", map[string]interface{}{
+		"tenant_id": strings.Repeat("x", maxLCEMCPRequestBodyBytes),
+	})
+	if err == nil {
+		t.Fatal("oversized encoded MCP envelope should be rejected before calling LCE")
+	}
+	if !strings.Contains(err.Error(), "encoded LCE request") {
+		t.Fatalf("unexpected body-limit error: %v", err)
 	}
 }
 
