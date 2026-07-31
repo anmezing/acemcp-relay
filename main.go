@@ -71,7 +71,7 @@ const (
 	LeaderboardPath     = "/mcp/tools/call/codebase-retrieval"
 	LeaderboardRESTPath = "/relay/agents/codebase-retrieval"
 	LeaderboardTopN     = 10
-	LeaderboardTimezone       = "Asia/Shanghai"
+	LeaderboardTimezone = "Asia/Shanghai"
 
 	HealthCheckInterval = 2 * time.Minute
 	HealthCheckTimeout  = 30 * time.Second
@@ -209,9 +209,10 @@ var lce = &mcpClient{
 			MaxIdleConnsPerHost: 50,
 			IdleConnTimeout:     90 * time.Second,
 		},
-		Timeout: 120 * time.Second,
 	},
 }
+
+const defaultMCPCallTimeout = 120 * time.Second
 
 func (m *mcpClient) ensureSession(ctx context.Context) (string, error) {
 	m.mu.RLock()
@@ -332,6 +333,12 @@ type mcpToolResult struct {
 }
 
 func (m *mcpClient) callTool(ctx context.Context, name string, args map[string]interface{}) (*mcpToolResult, error) {
+	return m.callToolWithTimeout(ctx, name, args, defaultMCPCallTimeout)
+}
+
+func (m *mcpClient) callToolWithTimeout(ctx context.Context, name string, args map[string]interface{}, timeout time.Duration) (*mcpToolResult, error) {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 	sid, err := m.ensureSession(ctx)
 	if err != nil {
 		return nil, err
@@ -880,13 +887,90 @@ const (
 )
 
 var chatMCPDeniedTools = map[string]struct{}{
-	"codebase_clear_index":  {},
-	"codebase_remote_index": {},
+	"codebase_clear_index":    {},
+	"codebase_remote_index":   {},
+	"codebase_git_context":    {},
+	"codebase_review_changes": {},
+	"codebase_find_missing":   {},
 }
 
 func isChatMCPToolAllowed(name string) bool {
 	_, denied := chatMCPDeniedTools[strings.TrimSpace(name)]
 	return !denied
+}
+
+var chatMCPSchemaRewrites = map[string]map[string]struct{}{
+	"codebase-retrieval": {
+		"repo_path":             {},
+		"workspace_config_path": {},
+		"tenant_id":             {},
+		"include_worktree":      {},
+		"freshness_policy":      {},
+		"shared_index_path":     {},
+		"connector_configs":     {},
+		"live_context":          {},
+		"profile":               {},
+		"bundle_budget":         {},
+		"workspace_limits":      {},
+	},
+	"codebase_symbol_graph": {
+		"repo_path": {},
+		"tenant_id": {},
+	},
+	"codebase_tenant_stats": {
+		"tenant_id": {},
+	},
+}
+
+func rewriteToolSchema(toolJSON json.RawMessage) (json.RawMessage, error) {
+	var tool map[string]interface{}
+	if err := json.Unmarshal(toolJSON, &tool); err != nil {
+		return toolJSON, nil
+	}
+
+	name, _ := tool["name"].(string)
+	fieldsToRemove, needsRewrite := chatMCPSchemaRewrites[name]
+	if !needsRewrite {
+		return toolJSON, nil
+	}
+
+	schemaRaw, ok := tool["inputSchema"]
+	if !ok {
+		return toolJSON, nil
+	}
+	schema, ok := schemaRaw.(map[string]interface{})
+	if !ok {
+		return toolJSON, nil
+	}
+
+	if props, ok := schema["properties"].(map[string]interface{}); ok {
+		for field := range fieldsToRemove {
+			delete(props, field)
+		}
+	}
+
+	if reqRaw, ok := schema["required"].([]interface{}); ok {
+		cleaned := make([]interface{}, 0, len(reqRaw))
+		for _, r := range reqRaw {
+			if s, ok := r.(string); ok {
+				if _, remove := fieldsToRemove[s]; remove {
+					continue
+				}
+			}
+			cleaned = append(cleaned, r)
+		}
+		schema["required"] = cleaned
+	}
+
+	delete(schema, "oneOf")
+
+	return json.Marshal(tool)
+}
+
+func sanitizeToolCallArgs(args map[string]interface{}) {
+	delete(args, "repo_path")
+	delete(args, "workspace_config_path")
+	delete(args, "model_config")
 }
 
 func filterChatMCPTools(raw json.RawMessage) (json.RawMessage, error) {
@@ -902,9 +986,14 @@ func filterChatMCPTools(raw json.RawMessage) (json.RawMessage, error) {
 		if err := json.Unmarshal(tool, &metadata); err != nil {
 			return nil, fmt.Errorf("parse MCP tool metadata: %w", err)
 		}
-		if isChatMCPToolAllowed(metadata.Name) {
-			filtered = append(filtered, tool)
+		if !isChatMCPToolAllowed(metadata.Name) {
+			continue
 		}
+		rewritten, err := rewriteToolSchema(tool)
+		if err != nil {
+			return nil, fmt.Errorf("rewrite MCP tool schema %q: %w", metadata.Name, err)
+		}
+		filtered = append(filtered, rewritten)
 	}
 	return json.Marshal(filtered)
 }
@@ -1241,6 +1330,7 @@ func handleMCPToolsCall(c *gin.Context, id json.RawMessage, params json.RawMessa
 	if p.Arguments == nil {
 		p.Arguments = make(map[string]interface{})
 	}
+	sanitizeToolCallArgs(p.Arguments)
 	p.Arguments["tenant_id"] = userID
 	cfg, err := resolveModelConfigArg(c.Request.Context(), userID)
 	if err != nil {

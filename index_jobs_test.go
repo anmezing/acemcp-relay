@@ -83,7 +83,10 @@ func TestFilterChatMCPToolsHidesIndexManagementTools(t *testing.T) {
 		{"name":"codebase-retrieval","description":"query"},
 		{"name":"codebase_remote_index","description":"index"},
 		{"name":"codebase_clear_index","description":"clear"},
-		{"name":"graph_query","description":"graph"}
+		{"name":"codebase_git_context","description":"git"},
+		{"name":"codebase_review_changes","description":"review"},
+		{"name":"codebase_find_missing","description":"missing"},
+		{"name":"codebase_symbol_graph","description":"graph"}
 	]`)
 	filtered, err := filterChatMCPTools(raw)
 	if err != nil {
@@ -95,21 +98,170 @@ func TestFilterChatMCPToolsHidesIndexManagementTools(t *testing.T) {
 	if err := json.Unmarshal(filtered, &tools); err != nil {
 		t.Fatal(err)
 	}
-	got := []string{tools[0].Name, tools[1].Name}
-	if !reflect.DeepEqual(got, []string{"codebase-retrieval", "graph_query"}) {
+	got := make([]string, len(tools))
+	for i, tool := range tools {
+		got[i] = tool.Name
+	}
+	if !reflect.DeepEqual(got, []string{"codebase-retrieval", "codebase_symbol_graph"}) {
 		t.Fatalf("unexpected chat MCP tools: %#v", got)
 	}
 }
 
 func TestChatMCPToolPolicyKeepsQueriesAndRejectsManagement(t *testing.T) {
-	if !isChatMCPToolAllowed("codebase-retrieval") {
-		t.Fatal("query tool must remain available")
+	for _, allowed := range []string{"codebase-retrieval", "codebase_symbol_graph", "codebase_tenant_stats"} {
+		if !isChatMCPToolAllowed(allowed) {
+			t.Fatalf("%q must remain available through chat MCP", allowed)
+		}
 	}
-	if isChatMCPToolAllowed("codebase_remote_index") {
-		t.Fatal("remote indexing must not be model-callable")
+	for _, denied := range []string{
+		"codebase_remote_index",
+		"codebase_clear_index",
+		"codebase_git_context",
+		"codebase_review_changes",
+		"codebase_find_missing",
+	} {
+		if isChatMCPToolAllowed(denied) {
+			t.Fatalf("%q must not be model-callable through chat MCP", denied)
+		}
 	}
-	if isChatMCPToolAllowed("codebase_clear_index") {
-		t.Fatal("clear index must remain an explicit user action")
+}
+
+func TestRewriteToolSchemaRemovesLocalOnlyFields(t *testing.T) {
+	tool := json.RawMessage(`{
+		"name": "codebase-retrieval",
+		"description": "search",
+		"inputSchema": {
+			"type": "object",
+			"properties": {
+				"information_request": {"type": "string"},
+				"repo_path": {"type": "string"},
+				"workspace_config_path": {"type": "string"},
+				"tenant_id": {"type": "string"},
+				"include_worktree": {"type": "boolean"},
+				"freshness_policy": {"type": "string"},
+				"technical_terms": {"type": "array"},
+				"response_format": {"type": "string"}
+			},
+			"required": ["information_request"],
+			"oneOf": [
+				{"required": ["repo_path"]},
+				{"required": ["tenant_id"]}
+			]
+		}
+	}`)
+
+	rewritten, err := rewriteToolSchema(tool)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var result map[string]interface{}
+	if err := json.Unmarshal(rewritten, &result); err != nil {
+		t.Fatal(err)
+	}
+	schema := result["inputSchema"].(map[string]interface{})
+	props := schema["properties"].(map[string]interface{})
+
+	for _, removed := range []string{"repo_path", "workspace_config_path", "tenant_id", "include_worktree", "freshness_policy"} {
+		if _, exists := props[removed]; exists {
+			t.Fatalf("property %q should have been removed", removed)
+		}
+	}
+	for _, kept := range []string{"information_request", "technical_terms", "response_format"} {
+		if _, exists := props[kept]; !exists {
+			t.Fatalf("property %q should have been kept", kept)
+		}
+	}
+	if _, exists := schema["oneOf"]; exists {
+		t.Fatal("oneOf constraint should have been removed")
+	}
+}
+
+func TestRewriteToolSchemaSymbolGraph(t *testing.T) {
+	tool := json.RawMessage(`{
+		"name": "codebase_symbol_graph",
+		"description": "graph",
+		"inputSchema": {
+			"type": "object",
+			"properties": {
+				"repo_path": {"type": "string"},
+				"tenant_id": {"type": "string"},
+				"root_id": {"type": "string"},
+				"symbol": {"type": "string"},
+				"query_type": {"type": "string"},
+				"depth": {"type": "integer"}
+			},
+			"required": ["symbol"],
+			"oneOf": [
+				{"required": ["repo_path"], "not": {"required": ["tenant_id"]}},
+				{"required": ["tenant_id"], "not": {"required": ["repo_path"]}}
+			]
+		}
+	}`)
+
+	rewritten, err := rewriteToolSchema(tool)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var result map[string]interface{}
+	if err := json.Unmarshal(rewritten, &result); err != nil {
+		t.Fatal(err)
+	}
+	schema := result["inputSchema"].(map[string]interface{})
+	props := schema["properties"].(map[string]interface{})
+
+	for _, removed := range []string{"repo_path", "tenant_id"} {
+		if _, exists := props[removed]; exists {
+			t.Fatalf("property %q should have been removed", removed)
+		}
+	}
+	for _, kept := range []string{"root_id", "symbol", "query_type", "depth"} {
+		if _, exists := props[kept]; !exists {
+			t.Fatalf("property %q should have been kept", kept)
+		}
+	}
+	if _, exists := schema["oneOf"]; exists {
+		t.Fatal("oneOf constraint should have been removed")
+	}
+	required := schema["required"].([]interface{})
+	if len(required) != 1 || required[0] != "symbol" {
+		t.Fatalf("required should contain only 'symbol', got %v", required)
+	}
+}
+
+func TestRewriteToolSchemaPassesThroughUnknownTools(t *testing.T) {
+	original := json.RawMessage(`{"name":"future_tool","inputSchema":{"type":"object","properties":{"foo":{"type":"string"}}}}`)
+	rewritten, err := rewriteToolSchema(original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var a, b map[string]interface{}
+	json.Unmarshal(original, &a)
+	json.Unmarshal(rewritten, &b)
+	if !reflect.DeepEqual(a, b) {
+		t.Fatal("unknown tools must pass through unmodified")
+	}
+}
+
+func TestSanitizeToolCallArgs(t *testing.T) {
+	args := map[string]interface{}{
+		"information_request": "find auth code",
+		"repo_path":           "/local/path",
+		"workspace_config_path": "/ws/config",
+		"model_config":        map[string]interface{}{"key": "val"},
+		"technical_terms":     []string{"auth"},
+	}
+	sanitizeToolCallArgs(args)
+	for _, removed := range []string{"repo_path", "workspace_config_path", "model_config"} {
+		if _, exists := args[removed]; exists {
+			t.Fatalf("%q should have been removed", removed)
+		}
+	}
+	for _, kept := range []string{"information_request", "technical_terms"} {
+		if _, exists := args[kept]; !exists {
+			t.Fatalf("%q should have been kept", kept)
+		}
 	}
 }
 
@@ -174,8 +326,8 @@ func TestNormalizeIndexRootID(t *testing.T) {
 	for i := range long {
 		long[i] = 'a'
 	}
-	if got := normalizeIndexRootID(string(long)); len(got) != maxIndexRootIDLen {
-		t.Fatalf("expected rootId capped at %d, got len %d", maxIndexRootIDLen, len(got))
+	if got := normalizeIndexRootID(string(long)); len(got) != len(long) {
+		t.Fatalf("rootId normalization must not silently truncate identity, got len %d", len(got))
 	}
 }
 
