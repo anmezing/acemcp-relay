@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"net/http/pprof"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -65,12 +66,9 @@ const (
 	StatusCompleted = "completed"
 
 	LeaderboardUpdateInterval = 30 * time.Minute
-	// 检索有两个入口：MCP tools/call（记录时被归一化成下面这个路径）和 REST 端点
-	// /relay/agents/codebase-retrieval。排行榜必须双路径统计，否则 REST 用户不被计入。
-	LeaderboardPath     = "/mcp/tools/call/codebase-retrieval"
-	LeaderboardRESTPath = "/relay/agents/codebase-retrieval"
-	LeaderboardTopN     = 10
-	LeaderboardTimezone = "Asia/Shanghai"
+	LeaderboardPath           = "/mcp/tools/call/codebase-retrieval"
+	LeaderboardTopN           = 10
+	LeaderboardTimezone       = "Asia/Shanghai"
 
 	HealthCheckInterval = 2 * time.Minute
 	HealthCheckTimeout  = 30 * time.Second
@@ -280,6 +278,7 @@ func (m *mcpClient) initSession(ctx context.Context) (string, error) {
 	})
 	nReq, _ := http.NewRequestWithContext(ctx, "POST", lceMCPURL, bytes.NewReader(notifBody))
 	nReq.Header.Set("Content-Type", "application/json")
+	nReq.Header.Set("Accept", "application/json, text/event-stream")
 	nReq.Header.Set("Mcp-Session-Id", sid)
 	nResp, err := m.http.Do(nReq)
 	if err != nil {
@@ -290,6 +289,10 @@ func (m *mcpClient) initSession(ctx context.Context) (string, error) {
 	}
 	io.ReadAll(nResp.Body)
 	nResp.Body.Close()
+	if nResp.StatusCode < http.StatusOK || nResp.StatusCode >= http.StatusMultipleChoices {
+		go m.deleteRemoteSession(sid)
+		return "", fmt.Errorf("MCP initialized notification returned %d", nResp.StatusCode)
+	}
 
 	m.sessionID = sid
 	log.Printf("[MCP] Session initialized: %s", sid)
@@ -591,12 +594,12 @@ func initDB() error {
 		);
 		CREATE INDEX IF NOT EXISTS idx_leaderboard_date ON leaderboard(date_str);
 
-		-- 旧谓词指向早已不存在的 '/agents/codebase-retrieval'，排行榜查询只能全表扫描。
-		-- 谓词必须与 updateLeaderboard 的双路径口径保持一致。
+		-- 检索只通过 MCP 暴露；索引谓词与 updateLeaderboard 的口径保持一致。
 		DROP INDEX IF EXISTS idx_request_logs_codebase_retrieval;
-		CREATE INDEX IF NOT EXISTS idx_request_logs_codebase_retrieval_v2
+		DROP INDEX IF EXISTS idx_request_logs_codebase_retrieval_v2;
+		CREATE INDEX IF NOT EXISTS idx_request_logs_codebase_retrieval_v3
 			ON request_logs(user_id, request_timestamp)
-			WHERE request_path IN ('/mcp/tools/call/codebase-retrieval', '/relay/agents/codebase-retrieval');
+			WHERE request_path = '/mcp/tools/call/codebase-retrieval';
 	`)
 	if err != nil {
 		return fmt.Errorf("failed to migrate leaderboard table: %w", err)
@@ -759,6 +762,7 @@ func authMiddleware() gin.HandlerFunc {
 
 func isIndexControlPath(requestPath string) bool {
 	return requestPath == "/relay/remote-index" ||
+		requestPath == "/relay/capabilities" ||
 		requestPath == "/relay/index-jobs" ||
 		strings.HasPrefix(requestPath, "/relay/index-jobs/")
 }
@@ -880,40 +884,69 @@ const (
 	toolsCacheTTL           = 5 * time.Minute
 )
 
-var chatMCPDeniedTools = map[string]struct{}{
-	"codebase_clear_index":    {},
-	"codebase_remote_index":   {},
-	"codebase_git_context":    {},
-	"codebase_review_changes": {},
-	"codebase_find_missing":   {},
+type chatMCPToolPolicy struct {
+	description string
+	arguments   map[string]struct{}
+	required    map[string]struct{}
+}
+
+// Chat MCP is a remote tenant surface, not a transparent proxy to every tool
+// installed in LCE. Keep both tools and caller-controlled arguments explicit so
+// future local/admin capabilities cannot become remotely callable by accident.
+var chatMCPToolPolicies = map[string]chatMCPToolPolicy{
+	"codebase-retrieval": {
+		description: "Search the authenticated user's server-side LCE index. Use information_request for the semantic goal and technical_terms for exact identifier hints. Returns a tenant context pack; local worktree, Git, connectors, workflows, and context_bundle are not available through Relay.",
+		arguments: stringSet(
+			"information_request",
+			"technical_terms",
+			"response_format",
+		),
+		required: stringSet("information_request"),
+	},
+	"codebase_symbol_graph": {
+		description: "Query the authenticated user's server-side symbol graph for definitions, references, callers, callees, importers, related tests, and bounded impact. root_id is required because indexing protocol v1 never writes to the shared default root; Relay supplies the tenant identity.",
+		arguments: stringSet(
+			"root_id",
+			"symbol",
+			"query_type",
+			"depth",
+			"limit",
+			"under",
+			"include_snippets",
+			"response_format",
+		),
+		required: stringSet("root_id", "symbol"),
+	},
+	"codebase_tenant_stats": {
+		description: "Return aggregate statistics for the authenticated user's server-side LCE index. Relay supplies the tenant identity.",
+		arguments:   stringSet("response_format"),
+	},
+}
+
+func stringSet(values ...string) map[string]struct{} {
+	result := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		result[value] = struct{}{}
+	}
+	return result
+}
+
+func sortedStringSetKeys(values map[string]struct{}) []string {
+	result := make([]string, 0, len(values))
+	for value := range values {
+		result = append(result, value)
+	}
+	sort.Strings(result)
+	return result
 }
 
 func isChatMCPToolAllowed(name string) bool {
-	_, denied := chatMCPDeniedTools[strings.TrimSpace(name)]
-	return !denied
+	_, allowed := chatMCPToolPolicies[strings.TrimSpace(name)]
+	return allowed
 }
 
-var chatMCPSchemaRewrites = map[string]map[string]struct{}{
-	"codebase-retrieval": {
-		"repo_path":             {},
-		"workspace_config_path": {},
-		"tenant_id":             {},
-		"include_worktree":      {},
-		"freshness_policy":      {},
-		"shared_index_path":     {},
-		"connector_configs":     {},
-		"live_context":          {},
-		"profile":               {},
-		"bundle_budget":         {},
-		"workspace_limits":      {},
-	},
-	"codebase_symbol_graph": {
-		"repo_path": {},
-		"tenant_id": {},
-	},
-	"codebase_tenant_stats": {
-		"tenant_id": {},
-	},
+func chatMCPToolUsesModelConfig(name string) bool {
+	return name == "codebase-retrieval"
 }
 
 func rewriteToolSchema(toolJSON json.RawMessage) (json.RawMessage, error) {
@@ -923,49 +956,71 @@ func rewriteToolSchema(toolJSON json.RawMessage) (json.RawMessage, error) {
 	}
 
 	name, _ := tool["name"].(string)
-	fieldsToRemove, needsRewrite := chatMCPSchemaRewrites[name]
+	name = strings.TrimSpace(name)
+	policy, needsRewrite := chatMCPToolPolicies[name]
 	if !needsRewrite {
 		return toolJSON, nil
 	}
+	tool["name"] = name
+	tool["description"] = policy.description
 
 	schemaRaw, ok := tool["inputSchema"]
 	if !ok {
-		return toolJSON, nil
+		return nil, fmt.Errorf("allowed tool %q has no inputSchema", name)
 	}
 	schema, ok := schemaRaw.(map[string]interface{})
 	if !ok {
-		return toolJSON, nil
+		return nil, fmt.Errorf("allowed tool %q has a non-object inputSchema", name)
 	}
 
-	if props, ok := schema["properties"].(map[string]interface{}); ok {
-		for field := range fieldsToRemove {
+	props, ok := schema["properties"].(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("allowed tool %q has no object properties schema", name)
+	}
+	for field := range props {
+		if _, allowed := policy.arguments[field]; !allowed {
 			delete(props, field)
 		}
 	}
-
-	if reqRaw, ok := schema["required"].([]interface{}); ok {
-		cleaned := make([]interface{}, 0, len(reqRaw))
-		for _, r := range reqRaw {
-			if s, ok := r.(string); ok {
-				if _, remove := fieldsToRemove[s]; remove {
-					continue
-				}
-			}
-			cleaned = append(cleaned, r)
+	for _, field := range sortedStringSetKeys(policy.required) {
+		if _, present := props[field]; !present {
+			return nil, fmt.Errorf("allowed tool %q is missing required property %q", name, field)
 		}
-		schema["required"] = cleaned
 	}
+
+	schema["required"] = sortedStringSetKeys(policy.required)
+	schema["additionalProperties"] = false
 
 	delete(schema, "oneOf")
 
 	return json.Marshal(tool)
 }
 
-func sanitizeToolCallArgs(toolName string, args map[string]interface{}) {
-	for field := range chatMCPSchemaRewrites[toolName] {
-		delete(args, field)
+func validateChatMCPToolArgs(toolName string, args map[string]interface{}) error {
+	policy, ok := chatMCPToolPolicies[toolName]
+	if !ok {
+		return fmt.Errorf("tool is not available")
 	}
-	delete(args, "model_config")
+	unsupported := make([]string, 0)
+	for field := range args {
+		if _, allowed := policy.arguments[field]; !allowed {
+			unsupported = append(unsupported, field)
+		}
+	}
+	if len(unsupported) > 0 {
+		sort.Strings(unsupported)
+		return fmt.Errorf("unsupported arguments for %s: %s", toolName, strings.Join(unsupported, ", "))
+	}
+	for _, field := range sortedStringSetKeys(policy.required) {
+		value, exists := args[field]
+		if !exists || value == nil {
+			return fmt.Errorf("missing required argument: %s", field)
+		}
+		if text, ok := value.(string); ok && strings.TrimSpace(text) == "" {
+			return fmt.Errorf("required argument must not be blank: %s", field)
+		}
+	}
+	return nil
 }
 
 func filterChatMCPTools(raw json.RawMessage) (json.RawMessage, error) {
@@ -973,7 +1028,8 @@ func filterChatMCPTools(raw json.RawMessage) (json.RawMessage, error) {
 	if err := json.Unmarshal(raw, &tools); err != nil {
 		return nil, fmt.Errorf("parse MCP tools: %w", err)
 	}
-	filtered := make([]json.RawMessage, 0, len(tools))
+	filtered := make([]json.RawMessage, 0, len(chatMCPToolPolicies))
+	seen := make(map[string]struct{}, len(chatMCPToolPolicies))
 	for _, tool := range tools {
 		var metadata struct {
 			Name string `json:"name"`
@@ -981,14 +1037,29 @@ func filterChatMCPTools(raw json.RawMessage) (json.RawMessage, error) {
 		if err := json.Unmarshal(tool, &metadata); err != nil {
 			return nil, fmt.Errorf("parse MCP tool metadata: %w", err)
 		}
+		metadata.Name = strings.TrimSpace(metadata.Name)
 		if !isChatMCPToolAllowed(metadata.Name) {
 			continue
+		}
+		if _, duplicate := seen[metadata.Name]; duplicate {
+			return nil, fmt.Errorf("duplicate allowed MCP tool %q", metadata.Name)
 		}
 		rewritten, err := rewriteToolSchema(tool)
 		if err != nil {
 			return nil, fmt.Errorf("rewrite MCP tool schema %q: %w", metadata.Name, err)
 		}
 		filtered = append(filtered, rewritten)
+		seen[metadata.Name] = struct{}{}
+	}
+	missing := make([]string, 0)
+	for name := range chatMCPToolPolicies {
+		if _, present := seen[name]; !present {
+			missing = append(missing, name)
+		}
+	}
+	if len(missing) > 0 {
+		sort.Strings(missing)
+		return nil, fmt.Errorf("upstream LCE is missing required Relay MCP tools: %s", strings.Join(missing, ", "))
 	}
 	return json.Marshal(filtered)
 }
@@ -1311,6 +1382,7 @@ func handleMCPToolsCall(c *gin.Context, id json.RawMessage, params json.RawMessa
 		completeRequestLogAsync(getRequestLogEntry(c, http.StatusOK))
 		return
 	}
+	p.Name = strings.TrimSpace(p.Name)
 	if !isChatMCPToolAllowed(p.Name) {
 		c.JSON(http.StatusOK, rpcError(id, -32601, "Tool not available through chat MCP: "+p.Name))
 		completeRequestLogAsync(getRequestLogEntry(c, http.StatusOK))
@@ -1325,20 +1397,36 @@ func handleMCPToolsCall(c *gin.Context, id json.RawMessage, params json.RawMessa
 	if p.Arguments == nil {
 		p.Arguments = make(map[string]interface{})
 	}
-	sanitizeToolCallArgs(p.Name, p.Arguments)
+	if err := validateChatMCPToolArgs(p.Name, p.Arguments); err != nil {
+		c.JSON(http.StatusOK, rpcError(id, -32602, err.Error()))
+		completeRequestLogAsync(getRequestLogEntry(c, http.StatusOK))
+		return
+	}
 	p.Arguments["tenant_id"] = userID
-	modelLease, cfg, err := acquireModelConfigOperation(c.Request.Context(), userID, "chat-tool")
+	var operationLease *indexOperationLease
+	var cfg map[string]interface{}
+	var err error
+	if chatMCPToolUsesModelConfig(p.Name) {
+		operationLease, cfg, err = acquireModelConfigOperation(c.Request.Context(), userID, "chat-retrieval")
+	} else {
+		operationLease, err = acquireSharedIndexOperation(
+			c.Request.Context(),
+			userID,
+			"chat-tool:"+uuid.NewString(),
+			"chat-"+p.Name,
+		)
+	}
 	if err != nil {
 		c.JSON(http.StatusOK, rpcError(id, -32000, err.Error()))
 		completeRequestLogAsync(getRequestLogEntry(c, http.StatusOK))
 		return
 	}
-	defer modelLease.Release()
+	defer operationLease.Release()
 	if cfg != nil {
 		p.Arguments["model_config"] = cfg
 	}
 
-	result, err := lce.callTool(modelLease.Context(), p.Name, p.Arguments)
+	result, err := lce.callTool(operationLease.Context(), p.Name, p.Arguments)
 	if err != nil {
 		if errors.Is(c.Request.Context().Err(), context.Canceled) {
 			completeRequestLogAsync(getRequestLogEntry(c, 499))
@@ -1405,71 +1493,6 @@ func deleteUserLogsAsync(userID string) {
 			log.Printf("[CLEAR_INDEX] Deleted %d request logs for user %s", rows, userID)
 		}
 	}()
-}
-
-func handleCodebaseRetrieval(c *gin.Context) {
-	userID, _ := c.Get(ContextKeyUserID)
-	userIDStr, _ := userID.(string)
-	if userIDStr == "" {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
-		completeRequestLogAsync(getRequestLogEntry(c, http.StatusUnauthorized))
-		return
-	}
-
-	var req struct {
-		InformationRequest string      `json:"information_request"`
-		Blobs              interface{} `json:"blobs"`
-		MaxOutputLength    int         `json:"max_output_length"`
-	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
-		completeRequestLogAsync(getRequestLogEntry(c, http.StatusBadRequest))
-		return
-	}
-
-	if req.MaxOutputLength <= 0 {
-		req.MaxOutputLength = 20000
-	}
-
-	// 字段名必须与 LCE 的 codebase-retrieval schema 一致：它必填 information_request
-	// 且是 strict 的，发 "query" 会被两头拒——缺必填字段 + 未知键。
-	args := map[string]interface{}{
-		"tenant_id":           userIDStr,
-		"information_request": req.InformationRequest,
-	}
-	modelLease, cfg, err := acquireModelConfigOperation(c.Request.Context(), userIDStr, "retrieval")
-	if err != nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
-		completeRequestLogAsync(getRequestLogEntry(c, http.StatusServiceUnavailable))
-		return
-	}
-	defer modelLease.Release()
-	if cfg != nil {
-		args["model_config"] = cfg
-	}
-	result, err := lce.callTool(modelLease.Context(), "codebase-retrieval", args)
-	if err != nil {
-		logIDStr, _ := c.Get(ContextKeyLogID)
-		logIDVal, _ := logIDStr.(string)
-		saveErrorDetailsAsync(logIDVal, "lce", err.Error(), getInsertDone(c))
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		completeRequestLogAsync(getRequestLogEntry(c, http.StatusInternalServerError))
-		return
-	}
-
-	if result.IsError {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": string(result.Content)})
-		completeRequestLogAsync(getRequestLogEntry(c, http.StatusInternalServerError))
-		return
-	}
-
-	content := string(result.Content)
-	if len(content) > req.MaxOutputLength {
-		content = truncateUTF8(content, req.MaxOutputLength)
-	}
-
-	c.JSON(http.StatusOK, gin.H{"formatted_retrieval": content})
-	completeRequestLogAsync(getRequestLogEntry(c, http.StatusOK))
 }
 
 func handleClearIndex(c *gin.Context) {
@@ -1783,14 +1806,14 @@ func updateLeaderboard() error {
 	rows, err := db.Query(`
 		SELECT user_id, COUNT(*) as cnt
 		FROM request_logs
-		WHERE request_path IN ($1, $2)
-		  AND request_timestamp >= $3
-		  AND request_timestamp < $4
+		WHERE request_path = $1
+		  AND request_timestamp >= $2
+		  AND request_timestamp < $3
 		  AND status_code = 200
 		GROUP BY user_id
 		ORDER BY cnt DESC
-		LIMIT $5
-	`, LeaderboardPath, LeaderboardRESTPath, dayStart, dayEnd, LeaderboardTopN)
+		LIMIT $4
+	`, LeaderboardPath, dayStart, dayEnd, LeaderboardTopN)
 	if err != nil {
 		return fmt.Errorf("failed to query leaderboard data: %w", err)
 	}
@@ -2018,13 +2041,12 @@ func main() {
 	r.POST("/mcp/clear-index", handleClearIndex)
 	r.GET("/mcp/tenant-stats", handleTenantStats)
 
+	r.GET("/relay/capabilities", handleRelayCapabilities)
 	r.POST("/relay/index-jobs", handleCreateIndexJob)
 	r.GET("/relay/index-jobs/:id", handleGetIndexJob)
 	r.POST("/relay/index-jobs/:id/complete", handleCompleteIndexJob)
 	r.POST("/relay/index-jobs/:id/fail", handleFailIndexJob)
 	r.POST("/relay/remote-index", handleRemoteIndex)
-	r.POST("/relay/agents/codebase-retrieval", handleCodebaseRetrieval)
-
 	r.NoRoute(func(c *gin.Context) {
 		if shouldDebugCapture(c.Request.URL.Path) {
 			body, _ := io.ReadAll(c.Request.Body)

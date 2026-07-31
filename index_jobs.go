@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -38,6 +39,7 @@ const (
 	// 每用户每日索引字节的默认上限。正常项目首次全量索引通常在百 MB 量级，
 	// 之后只传变更；这个默认值对真实使用足够宽松，但能挡住批量灌数据。
 	defaultDailyIndexBytes = 2 << 30 // 2 GiB
+	indexProtocolVersion   = 1
 )
 
 type indexManifestFile struct {
@@ -49,6 +51,7 @@ type indexManifestFile struct {
 }
 
 type createIndexJobRequest struct {
+	ProtocolVersion int                 `json:"protocolVersion"`
 	WorkspaceID     string              `json:"workspaceId"`
 	WorkspaceName   string              `json:"workspaceName"`
 	Branch          string              `json:"branch"`
@@ -56,6 +59,26 @@ type createIndexJobRequest struct {
 	Files           []indexManifestFile `json:"files"`
 	UnreadableFiles []string            `json:"unreadableFiles"`
 	RootID          string              `json:"rootId"`
+}
+
+type relayIndexingCapabilities struct {
+	ProtocolVersion  int   `json:"protocolVersion"`
+	MaxManifestFiles int   `json:"maxManifestFiles"`
+	MaxBatchFiles    int   `json:"maxBatchFiles"`
+	MaxFileBytes     int64 `json:"maxFileBytes"`
+	MaxBatchBytes    int64 `json:"maxBatchBytes"`
+}
+
+func handleRelayCapabilities(c *gin.Context) {
+	finishJSON(c, http.StatusOK, gin.H{
+		"indexing": relayIndexingCapabilities{
+			ProtocolVersion:  indexProtocolVersion,
+			MaxManifestFiles: maxIndexManifestFiles,
+			MaxBatchFiles:    maxIndexBatchFiles,
+			MaxFileBytes:     maxIndexFileBytes,
+			MaxBatchBytes:    maxIndexBatchBytes,
+		},
+	})
 }
 
 type indexJobView struct {
@@ -95,11 +118,13 @@ func migrateIndexingTables() error {
 			user_id VARCHAR(255) NOT NULL,
 			workspace_id VARCHAR(128) NOT NULL,
 			workspace_name TEXT NOT NULL DEFAULT '',
+			root_id VARCHAR(128) NOT NULL DEFAULT '',
 			branch TEXT NOT NULL DEFAULT '',
 			revision TEXT NOT NULL DEFAULT '',
 			indexed_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
 			PRIMARY KEY (user_id, workspace_id)
 		);
+		ALTER TABLE index_workspaces ADD COLUMN IF NOT EXISTS root_id VARCHAR(128) NOT NULL DEFAULT '';
 
 		CREATE TABLE IF NOT EXISTS index_jobs (
 			id UUID PRIMARY KEY,
@@ -316,11 +341,70 @@ func beginLockedIndexUserTx(ctx context.Context, userID string) (*sql.Tx, error)
 	return tx, nil
 }
 
+func loadIndexedWorkspaceRoot(ctx context.Context, userID, workspaceID string) (string, bool, error) {
+	var rootID string
+	err := db.QueryRowContext(ctx, `
+		SELECT root_id FROM index_workspaces WHERE user_id = $1 AND workspace_id = $2
+	`, userID, workspaceID).Scan(&rootID)
+	if err == sql.ErrNoRows {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return normalizeIndexRootID(rootID), true, nil
+}
+
+func workspaceRootBindingChanged(exists bool, storedRootID, requestedRootID string) bool {
+	return exists && normalizeIndexRootID(storedRootID) != normalizeIndexRootID(requestedRootID)
+}
+
+// A workspace moving between roots invalidates the old root, not the whole
+// tenant. Legacy data may bind several workspaces to the default root, so
+// every Relay snapshot bound to oldRootID is invalidated together. The old
+// binding remains the durable retry marker until both LCE and Relay cleanup
+// succeed.
+func resetWorkspaceRootBinding(ctx context.Context, userID, workspaceID, oldRootID, newRootID string) error {
+	result, err := lce.callToolWithTimeout(
+		ctx,
+		"codebase_clear_index",
+		map[string]interface{}{"tenant_id": userID, "root_id": lceIndexRootID(oldRootID)},
+		remoteIndexMCPCallTimeout,
+	)
+	if err != nil {
+		return fmt.Errorf("clear old LCE root for workspace root migration: %w", err)
+	}
+	if result == nil || result.IsError {
+		detail := "empty LCE response"
+		if result != nil {
+			detail = string(result.Content)
+		}
+		return fmt.Errorf("clear old LCE root for workspace root migration: %s", detail)
+	}
+	if err := clearRootIndexState(ctx, userID, oldRootID); err != nil {
+		return fmt.Errorf("clear Relay snapshots bound to old root: %w", err)
+	}
+	log.Printf(
+		"[INDEX] Reset old root for tenant %s after workspace %s changed from %q to %q",
+		userID,
+		workspaceID,
+		oldRootID,
+		newRootID,
+	)
+	return nil
+}
+
 func handleCreateIndexJob(c *gin.Context) {
 	userID := c.GetString(ContextKeyUserID)
 	var req createIndexJobRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		finishJSON(c, http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+	if req.ProtocolVersion != indexProtocolVersion {
+		finishJSON(c, http.StatusConflict, gin.H{
+			"error": fmt.Sprintf("unsupported indexing protocol version %d (server requires %d)", req.ProtocolVersion, indexProtocolVersion),
+		})
 		return
 	}
 	req.WorkspaceID = strings.TrimSpace(req.WorkspaceID)
@@ -330,6 +414,10 @@ func handleCreateIndexJob(c *gin.Context) {
 	req.RootID = normalizeIndexRootID(req.RootID)
 	if req.WorkspaceID == "" || len(req.WorkspaceID) > 128 {
 		finishJSON(c, http.StatusBadRequest, gin.H{"error": "workspaceId is required"})
+		return
+	}
+	if req.RootID == "" {
+		finishJSON(c, http.StatusBadRequest, gin.H{"error": "rootId is required by indexing protocol v1"})
 		return
 	}
 	if len(req.RootID) > maxIndexRootIDLen {
@@ -352,6 +440,23 @@ func handleCreateIndexJob(c *gin.Context) {
 	if err != nil {
 		finishJSON(c, http.StatusServiceUnavailable, gin.H{"error": err.Error()})
 		return
+	}
+	storedRootID, workspaceExistsBeforeReset, err := loadIndexedWorkspaceRoot(opCtx, userID, req.WorkspaceID)
+	if err != nil {
+		finishIndexError(c, err)
+		return
+	}
+	if workspaceRootBindingChanged(workspaceExistsBeforeReset, storedRootID, req.RootID) {
+		if err := resetWorkspaceRootBinding(
+			opCtx,
+			userID,
+			req.WorkspaceID,
+			storedRootID,
+			req.RootID,
+		); err != nil {
+			finishJSON(c, http.StatusServiceUnavailable, gin.H{"error": err.Error()})
+			return
+		}
 	}
 
 	tx, err := beginLockedIndexUserTx(opCtx, userID)
@@ -463,7 +568,11 @@ func handleCreateIndexJob(c *gin.Context) {
 		finishIndexError(c, err)
 		return
 	}
-	finishJSON(c, http.StatusCreated, createIndexJobResponse{Job: job, PendingFiles: pending, DeletedFiles: deleted})
+	finishJSON(c, http.StatusCreated, createIndexJobResponse{
+		Job:          job,
+		PendingFiles: pending,
+		DeletedFiles: deleted,
+	})
 }
 
 func handleGetIndexJob(c *gin.Context) {
@@ -518,16 +627,25 @@ type remoteIndexRequest struct {
 	JobID string              `json:"jobId"`
 	Files []indexManifestFile `json:"files"`
 	// 仓库维度：多 root 工作区按文件夹拆分索引任务，每个 job 一个稳定 rootId。
-	// 同一 job 的所有批次应携带相同 rootId；缺省 = 单仓默认 root（向后兼容）。
+	// 同一 job 的所有批次必须携带相同且非空的 rootId。
 	RootID string `json:"rootId"`
 }
 
 const maxIndexRootIDLen = 128
+const defaultLCEIndexRootID = "default"
 
 // normalizeIndexRootID only trims. Length is validated separately so two distinct
 // identities can never be silently truncated into the same tenant root.
 func normalizeIndexRootID(value string) string {
 	return strings.TrimSpace(value)
+}
+
+func lceIndexRootID(value string) string {
+	normalized := normalizeIndexRootID(value)
+	if normalized == "" {
+		return defaultLCEIndexRootID
+	}
+	return normalized
 }
 
 // validateIndexBatchSize 校验一个批次的体积并返回其内容总字节数。
@@ -557,7 +675,8 @@ func handleRemoteIndex(c *gin.Context) {
 		return
 	}
 	req.JobID = strings.TrimSpace(req.JobID)
-	if req.JobID == "" || len(req.Files) > maxIndexBatchFiles || len(normalizeIndexRootID(req.RootID)) > maxIndexRootIDLen {
+	req.RootID = normalizeIndexRootID(req.RootID)
+	if req.JobID == "" || req.RootID == "" || len(req.Files) > maxIndexBatchFiles || len(req.RootID) > maxIndexRootIDLen {
 		finishJSON(c, http.StatusBadRequest, gin.H{"error": "invalid index batch"})
 		return
 	}
@@ -645,9 +764,7 @@ func handleRemoteIndex(c *gin.Context) {
 	if len(deleted) > 0 {
 		args["deleted_files"] = deleted
 	}
-	if rootID := normalizeIndexRootID(req.RootID); rootID != "" {
-		args["root_id"] = rootID
-	}
+	args["root_id"] = req.RootID
 	if modelConfig != nil {
 		args["model_config"] = modelConfig
 	}
@@ -730,6 +847,7 @@ func prepareIndexBatch(ctx context.Context, tx *sql.Tx, userID string, req remot
 	// 每批 100 个文件各来一次网络往返，全部发生在持 advisory 锁的事务里。
 	type jobFileRow struct {
 		hash            string
+		size            int64
 		estimatedChunks int
 		needsIndex      bool
 		indexed         bool
@@ -737,7 +855,7 @@ func prepareIndexBatch(ctx context.Context, tx *sql.Tx, userID string, req remot
 	records := make(map[string]jobFileRow, len(paths))
 	if len(paths) > 0 {
 		rows, err := tx.QueryContext(ctx, `
-			SELECT path, hash, estimated_chunks, needs_index, indexed
+			SELECT path, hash, size, estimated_chunks, needs_index, indexed
 			FROM index_job_files
 			WHERE job_id = $1 AND path = ANY($2)
 		`, req.JobID, pq.Array(paths))
@@ -747,7 +865,7 @@ func prepareIndexBatch(ctx context.Context, tx *sql.Tx, userID string, req remot
 		for rows.Next() {
 			var p string
 			var rec jobFileRow
-			if err := rows.Scan(&p, &rec.hash, &rec.estimatedChunks, &rec.needsIndex, &rec.indexed); err != nil {
+			if err := rows.Scan(&p, &rec.hash, &rec.size, &rec.estimatedChunks, &rec.needsIndex, &rec.indexed); err != nil {
 				rows.Close()
 				return job, nil, nil, err
 			}
@@ -768,6 +886,9 @@ func prepareIndexBatch(ctx context.Context, tx *sql.Tx, userID string, req remot
 		}
 		if !rec.needsIndex || rec.indexed || strings.TrimSpace(input.Hash) != rec.hash {
 			return job, nil, nil, fmt.Errorf("batch file is stale or already indexed: %s", input.Path)
+		}
+		if err := validateIndexContent(rec.hash, rec.size, input.Content); err != nil {
+			return job, nil, nil, fmt.Errorf("batch file content does not match manifest: %s: %w", input.Path, err)
 		}
 		input.Hash = rec.hash
 		input.EstimatedChunks = rec.estimatedChunks
@@ -812,6 +933,18 @@ func prepareIndexBatch(ctx context.Context, tx *sql.Tx, userID string, req remot
 		}
 	}
 	return job, staged, deleted, nil
+}
+
+func validateIndexContent(expectedHash string, expectedSize int64, content string) error {
+	contentBytes := []byte(content)
+	if int64(len(contentBytes)) != expectedSize {
+		return fmt.Errorf("size is %d bytes, expected %d", len(contentBytes), expectedSize)
+	}
+	actualHash := fmt.Sprintf("%x", sha256.Sum256(contentBytes))
+	if !strings.EqualFold(actualHash, strings.TrimSpace(expectedHash)) {
+		return fmt.Errorf("SHA-256 is %s, expected %s", actualHash, expectedHash)
+	}
+	return nil
 }
 
 func commitIndexBatch(ctx context.Context, tx *sql.Tx, userID, jobID string, files []indexManifestFile, chunks int64, fallback, sentDeletions bool) error {
@@ -985,14 +1118,15 @@ func handleCompleteIndexJob(c *gin.Context) {
 	}
 	if _, err = tx.ExecContext(opCtx, `
 		INSERT INTO index_workspaces (
-			user_id, workspace_id, workspace_name, branch, revision, indexed_at
-		) VALUES ($1, $2, $3, $4, $5, NOW())
+			user_id, workspace_id, workspace_name, root_id, branch, revision, indexed_at
+		) VALUES ($1, $2, $3, $4, $5, $6, NOW())
 		ON CONFLICT (user_id, workspace_id) DO UPDATE SET
 			workspace_name = EXCLUDED.workspace_name,
+			root_id = EXCLUDED.root_id,
 			branch = EXCLUDED.branch,
 			revision = EXCLUDED.revision,
 			indexed_at = NOW()
-	`, userID, workspaceID, workspaceName, branch, revision); err != nil {
+	`, userID, workspaceID, workspaceName, rootID, branch, revision); err != nil {
 		finishIndexError(c, err)
 		return
 	}
@@ -1103,6 +1237,46 @@ func clearUserIndexState(ctx context.Context, userID string) error {
 	}
 	defer tx.Rollback()
 	if err := clearUserIndexStateTx(ctx, tx, userID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func clearRootIndexStateTx(ctx context.Context, tx *sql.Tx, userID, rootID string) error {
+	normalizedRootID := lceIndexRootID(rootID)
+	_, err := tx.ExecContext(ctx, `
+		WITH bound_workspaces AS (
+			SELECT workspace_id
+			FROM index_workspaces
+			WHERE user_id = $1
+			  AND CASE WHEN BTRIM(root_id) = '' THEN 'default' ELSE BTRIM(root_id) END = $2
+		)
+		DELETE FROM index_jobs
+		WHERE user_id = $1 AND workspace_id IN (SELECT workspace_id FROM bound_workspaces);
+
+		WITH bound_workspaces AS (
+			SELECT workspace_id
+			FROM index_workspaces
+			WHERE user_id = $1
+			  AND CASE WHEN BTRIM(root_id) = '' THEN 'default' ELSE BTRIM(root_id) END = $2
+		)
+		DELETE FROM indexed_files
+		WHERE user_id = $1 AND workspace_id IN (SELECT workspace_id FROM bound_workspaces);
+
+		DELETE FROM index_workspaces
+		WHERE user_id = $1
+		  AND CASE WHEN BTRIM(root_id) = '' THEN 'default' ELSE BTRIM(root_id) END = $2;
+	`, userID, normalizedRootID)
+	return err
+}
+
+func clearRootIndexState(ctx context.Context, userID, rootID string) error {
+	tx, err := beginLockedIndexUserTx(ctx, userID)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := clearRootIndexStateTx(ctx, tx, userID, rootID); err != nil {
 		return err
 	}
 	return tx.Commit()

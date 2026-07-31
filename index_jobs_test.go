@@ -2,7 +2,9 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -22,6 +24,42 @@ func TestNormalizeManifest(t *testing.T) {
 	}
 	if files[1].Content != "" {
 		t.Fatal("manifest content must not be retained")
+	}
+}
+
+func TestWorkspaceRootBindingChanged(t *testing.T) {
+	tests := []struct {
+		name      string
+		exists    bool
+		stored    string
+		requested string
+		changed   bool
+	}{
+		{name: "new workspace", exists: false, requested: "repo-a", changed: false},
+		{name: "same root", exists: true, stored: "repo-a", requested: "repo-a", changed: false},
+		{name: "legacy default root", exists: true, stored: "", requested: "repo-a", changed: true},
+		{name: "renamed root", exists: true, stored: "repo-a", requested: "repo-b", changed: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := workspaceRootBindingChanged(tt.exists, tt.stored, tt.requested); got != tt.changed {
+				t.Fatalf("workspaceRootBindingChanged() = %v, want %v", got, tt.changed)
+			}
+		})
+	}
+}
+
+func TestValidateIndexContentAgainstManifest(t *testing.T) {
+	const content = "package main\n"
+	const hash = "df1d036cbbf3df46e2045071e082245ece204c7f53ecf0a4e022bff9bb228f47"
+	if err := validateIndexContent(hash, int64(len(content)), content); err != nil {
+		t.Fatalf("matching content was rejected: %v", err)
+	}
+	if err := validateIndexContent(hash, int64(len(content)+1), content); err == nil || !strings.Contains(err.Error(), "size") {
+		t.Fatalf("size mismatch was not rejected: %v", err)
+	}
+	if err := validateIndexContent(strings.Repeat("0", 64), int64(len(content)), content); err == nil || !strings.Contains(err.Error(), "SHA-256") {
+		t.Fatalf("hash mismatch was not rejected: %v", err)
 	}
 }
 
@@ -80,13 +118,15 @@ func TestExtractChunkCount(t *testing.T) {
 
 func TestFilterChatMCPToolsHidesIndexManagementTools(t *testing.T) {
 	raw := json.RawMessage(`[
-		{"name":"codebase-retrieval","description":"query"},
+		{"name":" codebase-retrieval ","description":"query","inputSchema":{"type":"object","properties":{"information_request":{"type":"string"},"technical_terms":{"type":"array"},"response_format":{"type":"string"}}}},
 		{"name":"codebase_remote_index","description":"index"},
 		{"name":"codebase_clear_index","description":"clear"},
 		{"name":"codebase_git_context","description":"git"},
 		{"name":"codebase_review_changes","description":"review"},
 		{"name":"codebase_find_missing","description":"missing"},
-		{"name":"codebase_symbol_graph","description":"graph"}
+		{"name":"codebase_symbol_graph","description":"graph","inputSchema":{"type":"object","properties":{"root_id":{"type":"string"},"symbol":{"type":"string"}}}},
+		{"name":"codebase_tenant_stats","description":"stats","inputSchema":{"type":"object","properties":{"response_format":{"type":"string"}}}},
+		{"name":"future_admin_tool","description":"must stay private"}
 	]`)
 	filtered, err := filterChatMCPTools(raw)
 	if err != nil {
@@ -102,8 +142,27 @@ func TestFilterChatMCPToolsHidesIndexManagementTools(t *testing.T) {
 	for i, tool := range tools {
 		got[i] = tool.Name
 	}
-	if !reflect.DeepEqual(got, []string{"codebase-retrieval", "codebase_symbol_graph"}) {
+	if !reflect.DeepEqual(got, []string{"codebase-retrieval", "codebase_symbol_graph", "codebase_tenant_stats"}) {
 		t.Fatalf("unexpected chat MCP tools: %#v", got)
+	}
+}
+
+func TestFilterChatMCPToolsRequiresExactRemoteContract(t *testing.T) {
+	validTool := func(name string) string {
+		return fmt.Sprintf(`{"name":%q,"inputSchema":{"type":"object","properties":{}}}`, name)
+	}
+	missing := json.RawMessage("[" + validTool("codebase-retrieval") + "]")
+	if _, err := filterChatMCPTools(missing); err == nil {
+		t.Fatal("missing required remote tools must fail the Relay contract")
+	}
+	duplicate := json.RawMessage("[" + strings.Join([]string{
+		validTool("codebase-retrieval"),
+		validTool("codebase-retrieval"),
+		validTool("codebase_symbol_graph"),
+		validTool("codebase_tenant_stats"),
+	}, ",") + "]")
+	if _, err := filterChatMCPTools(duplicate); err == nil {
+		t.Fatal("duplicate remote tools must fail the Relay contract")
 	}
 }
 
@@ -119,6 +178,7 @@ func TestChatMCPToolPolicyKeepsQueriesAndRejectsManagement(t *testing.T) {
 		"codebase_git_context",
 		"codebase_review_changes",
 		"codebase_find_missing",
+		"future_admin_tool",
 	} {
 		if isChatMCPToolAllowed(denied) {
 			t.Fatalf("%q must not be model-callable through chat MCP", denied)
@@ -140,7 +200,13 @@ func TestRewriteToolSchemaRemovesLocalOnlyFields(t *testing.T) {
 				"include_worktree": {"type": "boolean"},
 				"freshness_policy": {"type": "string"},
 				"technical_terms": {"type": "array"},
-				"response_format": {"type": "string"}
+				"response_format": {"type": "string"},
+				"output_mode": {"type": "string", "enum": ["context_pack", "context_bundle"]},
+				"workflow": {"type": "string"},
+				"direct_context": {"type": "object"},
+				"ide_signals": {"type": "object"},
+				"lineage_context": {"type": "object"},
+				"future_local_option": {"type": "boolean"}
 			},
 			"required": ["information_request"],
 			"oneOf": [
@@ -162,15 +228,16 @@ func TestRewriteToolSchemaRemovesLocalOnlyFields(t *testing.T) {
 	schema := result["inputSchema"].(map[string]interface{})
 	props := schema["properties"].(map[string]interface{})
 
-	for _, removed := range []string{"repo_path", "workspace_config_path", "tenant_id", "include_worktree", "freshness_policy"} {
-		if _, exists := props[removed]; exists {
-			t.Fatalf("property %q should have been removed", removed)
-		}
-	}
 	for _, kept := range []string{"information_request", "technical_terms", "response_format"} {
 		if _, exists := props[kept]; !exists {
 			t.Fatalf("property %q should have been kept", kept)
 		}
+	}
+	if len(props) != 3 {
+		t.Fatalf("remote retrieval must advertise only its three supported caller arguments, got %#v", props)
+	}
+	if description, _ := result["description"].(string); !strings.Contains(description, "server-side LCE index") {
+		t.Fatalf("remote retrieval description was not specialized: %q", description)
 	}
 	if _, exists := schema["oneOf"]; exists {
 		t.Fatal("oneOf constraint should have been removed")
@@ -225,8 +292,8 @@ func TestRewriteToolSchemaSymbolGraph(t *testing.T) {
 		t.Fatal("oneOf constraint should have been removed")
 	}
 	required := schema["required"].([]interface{})
-	if len(required) != 1 || required[0] != "symbol" {
-		t.Fatalf("required should contain only 'symbol', got %v", required)
+	if !reflect.DeepEqual(required, []interface{}{"root_id", "symbol"}) {
+		t.Fatalf("required should contain root_id and symbol, got %v", required)
 	}
 }
 
@@ -244,35 +311,68 @@ func TestRewriteToolSchemaPassesThroughUnknownTools(t *testing.T) {
 	}
 }
 
-func TestSanitizeToolCallArgs(t *testing.T) {
+func TestRewriteToolSchemaFailsClosedForMalformedAllowedTool(t *testing.T) {
+	for _, raw := range []json.RawMessage{
+		json.RawMessage(`{"name":"codebase-retrieval"}`),
+		json.RawMessage(`{"name":"codebase-retrieval","inputSchema":true}`),
+		json.RawMessage(`{"name":"codebase-retrieval","inputSchema":{"type":"object"}}`),
+	} {
+		if _, err := rewriteToolSchema(raw); err == nil {
+			t.Fatalf("malformed allowed schema must fail closed: %s", raw)
+		}
+	}
+}
+
+func TestValidateChatMCPToolArgsRejectsUnknownArguments(t *testing.T) {
 	args := map[string]interface{}{
 		"information_request": "find auth code",
-		"model_config":        map[string]interface{}{"key": "val"},
 		"technical_terms":     []string{"auth"},
+		"tenant_id":           "caller-controlled",
 	}
-	for field := range chatMCPSchemaRewrites["codebase-retrieval"] {
-		args[field] = "caller-controlled"
+	if err := validateChatMCPToolArgs("codebase-retrieval", args); err == nil {
+		t.Fatal("caller-controlled tenant_id must be rejected")
 	}
-	sanitizeToolCallArgs("codebase-retrieval", args)
-	for field := range chatMCPSchemaRewrites["codebase-retrieval"] {
-		if _, exists := args[field]; exists {
-			t.Fatalf("policy field %q should have been removed", field)
-		}
+	delete(args, "tenant_id")
+	args["future_local_option"] = true
+	if err := validateChatMCPToolArgs("codebase-retrieval", args); err == nil {
+		t.Fatal("unknown future arguments must be rejected until explicitly allowed")
 	}
-	for _, removed := range []string{"model_config"} {
-		if _, exists := args[removed]; exists {
-			t.Fatalf("%q should have been removed", removed)
-		}
+	delete(args, "future_local_option")
+	if err := validateChatMCPToolArgs("codebase-retrieval", args); err != nil {
+		t.Fatalf("declared retrieval arguments should pass: %v", err)
 	}
-	for _, kept := range []string{"information_request", "technical_terms"} {
-		if _, exists := args[kept]; !exists {
-			t.Fatalf("%q should have been kept", kept)
+}
+
+func TestValidateChatMCPToolArgsRequiresRemoteRoot(t *testing.T) {
+	if err := validateChatMCPToolArgs("codebase_symbol_graph", map[string]interface{}{"symbol": "Handler"}); err == nil {
+		t.Fatal("symbol graph calls without root_id must be rejected")
+	}
+	if err := validateChatMCPToolArgs("codebase_symbol_graph", map[string]interface{}{
+		"root_id": "  ", "symbol": "Handler",
+	}); err == nil {
+		t.Fatal("symbol graph calls with a blank root_id must be rejected")
+	}
+	if err := validateChatMCPToolArgs("codebase_symbol_graph", map[string]interface{}{
+		"root_id": "root-123", "symbol": "Handler",
+	}); err != nil {
+		t.Fatalf("complete symbol graph call should pass: %v", err)
+	}
+}
+
+func TestOnlyRetrievalUsesTenantModelConfig(t *testing.T) {
+	if !chatMCPToolUsesModelConfig("codebase-retrieval") {
+		t.Fatal("retrieval must receive the tenant embedding/rerank configuration")
+	}
+	for _, toolName := range []string{"codebase_symbol_graph", "codebase_tenant_stats"} {
+		if chatMCPToolUsesModelConfig(toolName) {
+			t.Fatalf("%s must not depend on embedding/rerank configuration", toolName)
 		}
 	}
 }
 
 func TestIndexControlPathsDoNotConsumeChatQuota(t *testing.T) {
 	exempt := []string{
+		"/relay/capabilities",
 		"/relay/index-jobs",
 		"/relay/index-jobs/job-id",
 		"/relay/index-jobs/job-id/complete",
@@ -285,7 +385,6 @@ func TestIndexControlPathsDoNotConsumeChatQuota(t *testing.T) {
 	}
 
 	charged := []string{
-		"/relay/agents/codebase-retrieval",
 		"/relay/index-jobs-extra",
 		"/mcp",
 	}
@@ -298,6 +397,7 @@ func TestIndexControlPathsDoNotConsumeChatQuota(t *testing.T) {
 
 func TestIndexQuotaChargesOnlyJobCreation(t *testing.T) {
 	exempt := []struct{ method, path string }{
+		{"GET", "/relay/capabilities"},
 		{"GET", "/relay/index-jobs/job-id"},
 		{"POST", "/relay/index-jobs/job-id/complete"},
 		{"POST", "/relay/index-jobs/job-id/fail"},
@@ -311,7 +411,6 @@ func TestIndexQuotaChargesOnlyJobCreation(t *testing.T) {
 
 	charged := []struct{ method, path string }{
 		{"POST", "/relay/index-jobs"},
-		{"POST", "/relay/agents/codebase-retrieval"},
 		{"POST", "/mcp"},
 	}
 	for _, request := range charged {
@@ -334,6 +433,15 @@ func TestNormalizeIndexRootID(t *testing.T) {
 	}
 	if got := normalizeIndexRootID(string(long)); len(got) != len(long) {
 		t.Fatalf("rootId normalization must not silently truncate identity, got len %d", len(got))
+	}
+}
+
+func TestLCEIndexRootIDMapsLegacyEmptyBindingToDefault(t *testing.T) {
+	if got := lceIndexRootID(""); got != defaultLCEIndexRootID {
+		t.Fatalf("legacy empty root must map to LCE default root, got %q", got)
+	}
+	if got := lceIndexRootID(" repo-a "); got != "repo-a" {
+		t.Fatalf("explicit root should be preserved after trimming, got %q", got)
 	}
 }
 

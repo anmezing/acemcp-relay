@@ -25,8 +25,10 @@ import (
 
 // jobFileColumns 是批量文件查询的列。
 func jobFileRows() *sqlmock.Rows {
-	return sqlmock.NewRows([]string{"path", "hash", "estimated_chunks", "needs_index", "indexed"})
+	return sqlmock.NewRows([]string{"path", "hash", "size", "estimated_chunks", "needs_index", "indexed"})
 }
+
+const singleByteXHash = "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881"
 
 const jobColumnCount = 22
 
@@ -86,6 +88,22 @@ func TestPrepareIndexBatchReportsMissingJobAsErrNoRows(t *testing.T) {
 	})
 }
 
+func TestClearRootIndexStateMapsLegacyDefaultAndCommitsOneScopedDelete(t *testing.T) {
+	withMockTx(t, func(mock sqlmock.Sqlmock) {
+		mock.ExpectExec("WITH bound_workspaces").
+			WithArgs("user-1", defaultLCEIndexRootID).
+			WillReturnResult(sqlmock.NewResult(0, 1))
+		mock.ExpectCommit()
+	}, func(tx *sql.Tx) {
+		if err := clearRootIndexStateTx(context.Background(), tx, "user-1", ""); err != nil {
+			t.Fatalf("clearRootIndexStateTx: %v", err)
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatalf("commit: %v", err)
+		}
+	})
+}
+
 func TestPrepareIndexBatchDoesNotDisguiseUnknownFileAsMissingJob(t *testing.T) {
 	withMockTx(t, func(mock sqlmock.Sqlmock) {
 		mock.ExpectQuery("FROM index_jobs").
@@ -124,7 +142,7 @@ func TestPrepareIndexBatchDoesNotDisguiseVanishedJobAsMissingJob(t *testing.T) {
 			WillReturnRows(jobRow(indexJobStatusRunning, 0))
 		mock.ExpectQuery("FROM index_job_files").
 			WithArgs("job-1", pq.Array([]string{"a.go"})).
-			WillReturnRows(jobFileRows().AddRow("a.go", "h1", 3, true, false))
+			WillReturnRows(jobFileRows().AddRow("a.go", singleByteXHash, 1, 3, true, false))
 		// job 在暂存过程中被并发删除
 		mock.ExpectQuery("SELECT deletions_sent FROM index_jobs").
 			WithArgs("job-1").
@@ -132,7 +150,7 @@ func TestPrepareIndexBatchDoesNotDisguiseVanishedJobAsMissingJob(t *testing.T) {
 	}, func(tx *sql.Tx) {
 		_, _, _, err := prepareIndexBatch(context.Background(), tx, "user-1", remoteIndexRequest{
 			JobID: "job-1",
-			Files: []indexManifestFile{{Path: "a.go", Content: "x", Hash: "h1"}},
+			Files: []indexManifestFile{{Path: "a.go", Content: "x", Hash: singleByteXHash}},
 		})
 		if err == nil {
 			t.Fatal("job 中途消失时应当报错")
@@ -154,14 +172,14 @@ func TestPrepareIndexBatchStagesFilesOnHappyPath(t *testing.T) {
 			WillReturnRows(jobRow(indexJobStatusRunning, 0))
 		mock.ExpectQuery("FROM index_job_files").
 			WithArgs("job-1", pq.Array([]string{"a.go"})).
-			WillReturnRows(jobFileRows().AddRow("a.go", "h1", 7, true, false))
+			WillReturnRows(jobFileRows().AddRow("a.go", singleByteXHash, 1, 7, true, false))
 		mock.ExpectQuery("SELECT deletions_sent FROM index_jobs").
 			WithArgs("job-1").
 			WillReturnRows(sqlmock.NewRows([]string{"deletions_sent"}).AddRow(true))
 	}, func(tx *sql.Tx) {
 		job, staged, deleted, err := prepareIndexBatch(context.Background(), tx, "user-1", remoteIndexRequest{
 			JobID: "job-1",
-			Files: []indexManifestFile{{Path: "a.go", Content: "x", Hash: "h1"}},
+			Files: []indexManifestFile{{Path: "a.go", Content: "x", Hash: singleByteXHash}},
 		})
 		if err != nil {
 			t.Fatalf("正常批次不应报错: %v", err)
@@ -209,7 +227,7 @@ func TestPrepareIndexBatchRejectsStaleFileWithoutErrNoRows(t *testing.T) {
 			WillReturnRows(jobRow(indexJobStatusRunning, 0))
 		mock.ExpectQuery("FROM index_job_files").
 			WithArgs("job-1", pq.Array([]string{"a.go"})).
-			WillReturnRows(jobFileRows().AddRow("a.go", "server-hash", 3, true, false))
+			WillReturnRows(jobFileRows().AddRow("a.go", "server-hash", 1, 3, true, false))
 	}, func(tx *sql.Tx) {
 		_, _, _, err := prepareIndexBatch(context.Background(), tx, "user-1", remoteIndexRequest{
 			JobID: "job-1",

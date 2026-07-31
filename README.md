@@ -22,14 +22,24 @@ Go HTTP relay 服务，用于在 LCE Coding Agent 插件与 LCE MCP 服务之间
 
 | 路径 | 说明 |
 |------|------|
-| `POST /relay/index-jobs` | 提交工作区 manifest，创建全量或增量索引任务并返回待索引、待删除文件 |
+| `GET /relay/capabilities` | 返回版本化索引协议与服务端 manifest、batch、单文件体积限制；客户端按服务端与自身上限的交集规划上传 |
+| `POST /relay/index-jobs` | 提交带 `protocolVersion: 1` 与非空 `rootId` 的工作区 manifest，创建全量或增量索引任务并返回待索引、待删除文件；检测到变化的 workspace-root 绑定时，仅清理 LCE 中的旧 root，并失效 Relay 中绑定该旧 root 的快照，其他仓库不受影响 |
 | `GET /relay/index-jobs/:id` | 查询任务阶段、文件进度、chunk 进度和状态，同时刷新任务心跳 |
 | `POST /relay/remote-index` | 上传一个任务批次并调用 LCE `codebase_remote_index` |
 | `POST /relay/index-jobs/:id/complete` | 完成任务：先让 LCE 修复并收敛该 root 的服务端符号图，再提交工作区快照并回收暂存文件 |
 | `POST /relay/index-jobs/:id/fail` | 标记任务失败并回收任务暂存文件 |
-| `POST /relay/agents/codebase-retrieval` | 调用 LCE `codebase-retrieval`，返回向量召回和精排结果 |
 
-旧 Augment `/find-missing`、`/batch-upload` 和 `/checkpoint-blobs` blob 协议不再由 relay 提供。插件仅在本地短路遗留的 `/find-missing` 调用，实际索引统一走上述 index-job 链路。
+Relay 不提供旧 Augment `/find-missing`、`/batch-upload`、`/checkpoint-blobs` 或 REST 检索协议；索引统一走版本化 index-job 链路，检索统一走 MCP。
+
+### MCP 工具边界
+
+Relay 的远程 MCP 入口只向模型暴露 3 个租户安全工具：
+
+- `codebase-retrieval`：在租户服务端索引上执行向量召回与精排；Relay 按用户注入 embedding/rerank 模型配置。
+- `codebase_symbol_graph`：查询指定 `root_id` 的服务端符号图。
+- `codebase_tenant_stats`：查询当前租户的聚合索引统计。
+
+`codebase_remote_index`、`codebase_find_missing` 和 `codebase_clear_index` 属于受保护的索引/控制面，不通过模型可调用的 MCP 入口暴露。LCE Code 插件会另外启动一个本地 stdio MCP，提供 `codebase_git_context` 与 `codebase_review_changes`；因此插件内看到的是 3 个远程工具加 2 个本地工具。Git 证据直接作为本地 MCP 的工具结果返回给调用方，不会被 Review 工具转发给 Relay；Review 只把检索请求交给 Relay，向量检索和精排仍在服务端执行。
 
 ## 技术栈
 
