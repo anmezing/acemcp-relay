@@ -53,7 +53,6 @@ services:
       DB_NAME: ${POSTGRES_DB:-acemcp_relay}
       REDIS_HOST: host.docker.internal
       REDIS_PORT: "6379"
-      API_KEY_CACHE_TTL: ${API_KEY_CACHE_TTL:-30m}
       DEVICE_BINDING_MODE: ${DEVICE_BINDING_MODE:-log}
       DEVICE_CACHE_TTL: ${DEVICE_CACHE_TTL:-5m}
       DEVICE_IP_WINDOW: ${DEVICE_IP_WINDOW:-10m}

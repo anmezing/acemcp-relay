@@ -80,6 +80,7 @@ type indexJobView struct {
 	StartedAt           time.Time  `json:"startedAt"`
 	HeartbeatAt         time.Time  `json:"heartbeatAt"`
 	CompletedAt         *time.Time `json:"completedAt,omitempty"`
+	ModelFingerprint    string     `json:"-"`
 }
 
 type createIndexJobResponse struct {
@@ -125,6 +126,7 @@ func migrateIndexingTables() error {
 			completed_at TIMESTAMP WITH TIME ZONE
 		);
 		ALTER TABLE index_jobs ADD COLUMN IF NOT EXISTS root_id VARCHAR(128) NOT NULL DEFAULT '';
+		ALTER TABLE index_jobs ADD COLUMN IF NOT EXISTS model_fingerprint VARCHAR(80) NOT NULL DEFAULT '';
 		CREATE INDEX IF NOT EXISTS idx_index_jobs_workspace
 			ON index_jobs(user_id, workspace_id, started_at DESC);
 		CREATE INDEX IF NOT EXISTS idx_index_jobs_running
@@ -155,6 +157,18 @@ func migrateIndexingTables() error {
 		);
 		CREATE INDEX IF NOT EXISTS idx_indexed_files_workspace
 			ON indexed_files(user_id, workspace_id);
+
+		CREATE TABLE IF NOT EXISTS index_operation_leases (
+			lease_token UUID PRIMARY KEY,
+			user_id VARCHAR(255) NOT NULL,
+			resource TEXT NOT NULL,
+			mode VARCHAR(16) NOT NULL CHECK (mode IN ('shared', 'exclusive')),
+			kind VARCHAR(64) NOT NULL,
+			acquired_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+			lease_expires_at TIMESTAMP WITH TIME ZONE NOT NULL
+		);
+		CREATE INDEX IF NOT EXISTS idx_index_operation_leases_user
+			ON index_operation_leases(user_id, lease_expires_at);
 	`)
 	if err != nil {
 		return fmt.Errorf("failed to migrate indexing tables: %w", err)
@@ -327,15 +341,27 @@ func handleCreateIndexJob(c *gin.Context) {
 		finishJSON(c, http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	lease, err := acquireExclusiveIndexOperation(c.Request.Context(), userID, "create-job")
+	if err != nil {
+		finishIndexError(c, err)
+		return
+	}
+	defer lease.Release()
+	opCtx := lease.Context()
+	_, modelFingerprint, err := resolveModelConfigUnderExclusiveLease(opCtx, userID)
+	if err != nil {
+		finishJSON(c, http.StatusServiceUnavailable, gin.H{"error": err.Error()})
+		return
+	}
 
-	tx, err := beginLockedIndexUserTx(c.Request.Context(), userID)
+	tx, err := beginLockedIndexUserTx(opCtx, userID)
 	if err != nil {
 		finishIndexError(c, err)
 		return
 	}
 	defer tx.Rollback()
 
-	_, err = tx.ExecContext(c.Request.Context(), `
+	_, err = tx.ExecContext(opCtx, `
 		DELETE FROM index_job_files
 		WHERE job_id IN (
 			SELECT id FROM index_jobs
@@ -346,7 +372,7 @@ func handleCreateIndexJob(c *gin.Context) {
 		finishIndexError(c, err)
 		return
 	}
-	_, err = tx.ExecContext(c.Request.Context(), `
+	_, err = tx.ExecContext(opCtx, `
 		UPDATE index_jobs
 		SET status = $1, phase = 'done', error = 'superseded by a newer workspace scan',
 			completed_at = NOW(), heartbeat_at = NOW()
@@ -357,13 +383,13 @@ func handleCreateIndexJob(c *gin.Context) {
 		return
 	}
 
-	previous, err := loadIndexedSnapshot(c.Request.Context(), tx, userID, req.WorkspaceID)
+	previous, err := loadIndexedSnapshot(opCtx, tx, userID, req.WorkspaceID)
 	if err != nil {
 		finishIndexError(c, err)
 		return
 	}
 	var workspaceExists bool
-	err = tx.QueryRowContext(c.Request.Context(), `
+	err = tx.QueryRowContext(opCtx, `
 		SELECT EXISTS(
 			SELECT 1 FROM index_workspaces WHERE user_id = $1 AND workspace_id = $2
 		)
@@ -389,13 +415,13 @@ func handleCreateIndexJob(c *gin.Context) {
 		mode = "full"
 	}
 	jobID := uuid.New().String()
-	_, err = tx.ExecContext(c.Request.Context(), `
+	_, err = tx.ExecContext(opCtx, `
 		INSERT INTO index_jobs (
 			id, user_id, workspace_id, workspace_name, root_id, branch, revision, mode,
-			workspace_files, total_files, total_chunks, deleted_count
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+			workspace_files, total_files, total_chunks, deleted_count, model_fingerprint
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 	`, jobID, userID, req.WorkspaceID, req.WorkspaceName, req.RootID, req.Branch, req.Revision, mode,
-		len(files), len(pending), estimatedChunks, len(deleted))
+		len(files), len(pending), estimatedChunks, len(deleted), modelFingerprint)
 	if err != nil {
 		finishIndexError(c, err)
 		return
@@ -403,7 +429,7 @@ func handleCreateIndexJob(c *gin.Context) {
 
 	// COPY 批量写入 manifest：10 万文件逐条 INSERT 要 10 万次网络往返，
 	// 会把创建 job 的事务拖到分钟级并一直占着 advisory 锁。
-	stmt, err := tx.PrepareContext(c.Request.Context(), pq.CopyIn(
+	stmt, err := tx.PrepareContext(opCtx, pq.CopyIn(
 		"index_job_files", "job_id", "path", "hash", "size", "estimated_chunks", "needs_index",
 	))
 	if err != nil {
@@ -411,14 +437,14 @@ func handleCreateIndexJob(c *gin.Context) {
 		return
 	}
 	for _, file := range files {
-		if _, err := stmt.ExecContext(c.Request.Context(), jobID, file.Path, file.Hash, file.Size, file.EstimatedChunks, pendingSet[file.Path]); err != nil {
+		if _, err := stmt.ExecContext(opCtx, jobID, file.Path, file.Hash, file.Size, file.EstimatedChunks, pendingSet[file.Path]); err != nil {
 			stmt.Close()
 			finishIndexError(c, err)
 			return
 		}
 	}
 	// 无参 Exec 刷出 COPY 缓冲；错误（如约束冲突）大多在这里才暴露。
-	if _, err := stmt.ExecContext(c.Request.Context()); err != nil {
+	if _, err := stmt.ExecContext(opCtx); err != nil {
 		stmt.Close()
 		finishIndexError(c, err)
 		return
@@ -473,7 +499,7 @@ func loadIndexJobFrom(ctx context.Context, queryer indexJobQueryer, userID, jobI
 	err := queryer.QueryRowContext(ctx, `
 		SELECT id::text, workspace_id, workspace_name, root_id, branch, revision, mode, phase, status,
 			workspace_files, total_files, indexed_files, failed_files, total_chunks,
-			indexed_chunks, chunk_count_fallback, deleted_count, error,
+			indexed_chunks, chunk_count_fallback, deleted_count, error, model_fingerprint,
 			started_at, heartbeat_at, completed_at
 		FROM index_jobs
 		WHERE id = $1 AND user_id = $2
@@ -481,7 +507,7 @@ func loadIndexJobFrom(ctx context.Context, queryer indexJobQueryer, userID, jobI
 		&job.ID, &job.WorkspaceID, &job.WorkspaceName, &job.RootID, &job.Branch, &job.Revision,
 		&job.Mode, &job.Phase, &job.Status, &job.WorkspaceFiles, &job.TotalFiles,
 		&job.IndexedFiles, &job.FailedFiles, &job.TotalChunks, &job.IndexedChunks,
-		&fallback, &job.DeletedCount, &job.Error, &job.StartedAt, &job.HeartbeatAt,
+		&fallback, &job.DeletedCount, &job.Error, &job.ModelFingerprint, &job.StartedAt, &job.HeartbeatAt,
 		&job.CompletedAt,
 	)
 	job.ChunkCountEstimated = fallback || job.Status != indexJobStatusCompleted
@@ -538,57 +564,74 @@ func handleRemoteIndex(c *gin.Context) {
 
 	// 体积校验放在最前：这些字节最终都会变成 embedding 调用，超限的批次不该
 	// 走到建事务、查 manifest 这些更贵的步骤。
-	batchBytes, err := validateIndexBatchSize(req.Files)
+	_, err := validateIndexBatchSize(req.Files)
 	if err != nil {
 		finishJSON(c, http.StatusRequestEntityTooLarge, gin.H{"error": err.Error()})
 		return
 	}
-	// 按实际内容量扣当日索引配额。计费点必须在调用 LCE 之前：超限的负载不能
-	// 先付出 embedding 成本再被拒绝。此后任何失败路径都必须 refund，否则客户
-	// 端重试会被双重计费。
-	if ok, used, limit := chargeIndexBytes(userID, batchBytes); !ok {
-		refundIndexBytes(userID, batchBytes)
-		finishJSON(c, http.StatusTooManyRequests, gin.H{
-			"error": fmt.Sprintf("daily index quota exceeded (%d/%d bytes)", used, limit),
-		})
-		return
-	}
-
-	modelConfig, err := resolveModelConfigArg(c.Request.Context(), userID)
+	lease, err := acquireSharedIndexOperation(
+		c.Request.Context(), userID, indexJobOperationResource(req.JobID), "upload-batch",
+	)
 	if err != nil {
-		refundIndexBytes(userID, batchBytes)
-		finishJSON(c, http.StatusServiceUnavailable, gin.H{"error": err.Error()})
-		return
-	}
-
-	// 事务A：只做校验与读取，随后立即提交释放连接和 advisory 锁。
-	// 决不能让事务横跨下面那次 LCE 调用（超时 120s）：连接池只有 25 个连接，
-	// 几十个并发 embedding 批次就会把连接占光，阻塞全站的 DB 访问。
-	tx, err := beginLockedIndexUserTx(c.Request.Context(), userID)
-	if err != nil {
-		refundIndexBytes(userID, batchBytes)
 		finishIndexError(c, err)
 		return
 	}
-	job, staged, deleted, err := prepareIndexBatch(c.Request.Context(), tx, userID, req)
+	defer lease.Release()
+	opCtx := lease.Context()
+	modelConfig, modelRow, err := loadModelConfigArg(opCtx, userID)
+	if err != nil {
+		finishJSON(c, http.StatusServiceUnavailable, gin.H{"error": err.Error()})
+		return
+	}
+	modelFingerprint := ""
+	if modelRow != nil {
+		if modelRow.Applied != modelRow.Fingerprint {
+			finishJSON(c, http.StatusConflict, gin.H{"error": "model configuration changed; start a new index job"})
+			return
+		}
+		modelFingerprint = modelRow.Fingerprint
+	}
+
+	// 事务A：只做校验与读取，随后立即提交释放连接和 advisory 锁。
+	// 决不能让事务横跨下面那次 LCE 调用：连接池只有 25 个连接，
+	// 几十个并发 embedding 批次就会把连接占光，阻塞全站的 DB 访问。
+	tx, err := beginLockedIndexUserTx(opCtx, userID)
+	if err != nil {
+		finishIndexError(c, err)
+		return
+	}
+	job, staged, deleted, err := prepareIndexBatch(opCtx, tx, userID, req)
 	// 不变量：prepareIndexBatch 只在"job 不存在或不属于该用户"这一种情况下
 	// 外传 sql.ErrNoRows；它内部的按文件、按 job 字段查询都会把各自的 ErrNoRows
 	// 包装成带上下文的错误。新增查询时请保持这条，否则 404 会指向错误的原因。
 	if err == sql.ErrNoRows {
 		_ = tx.Rollback()
-		refundIndexBytes(userID, batchBytes)
 		finishJSON(c, http.StatusNotFound, gin.H{"error": "index job not found"})
 		return
 	}
 	if err != nil {
 		_ = tx.Rollback()
-		refundIndexBytes(userID, batchBytes)
 		finishJSON(c, http.StatusConflict, gin.H{"error": err.Error()})
 		return
 	}
 	if err := tx.Commit(); err != nil {
-		refundIndexBytes(userID, batchBytes)
 		finishIndexError(c, err)
+		return
+	}
+	if job.ModelFingerprint != modelFingerprint {
+		finishJSON(c, http.StatusConflict, gin.H{"error": "index job model configuration is stale; start a new index job"})
+		return
+	}
+	batchBytes, err := validateIndexBatchSize(staged)
+	if err != nil {
+		finishJSON(c, http.StatusRequestEntityTooLarge, gin.H{"error": err.Error()})
+		return
+	}
+	if ok, used, limit := chargeIndexBytes(userID, batchBytes); !ok {
+		c.Header("Retry-After", quotaRetryAfterHeader(time.Now()))
+		finishJSON(c, http.StatusTooManyRequests, gin.H{
+			"error": fmt.Sprintf("daily index quota exceeded (%d/%d bytes)", used, limit),
+		})
 		return
 	}
 
@@ -608,14 +651,12 @@ func handleRemoteIndex(c *gin.Context) {
 	if modelConfig != nil {
 		args["model_config"] = modelConfig
 	}
-	result, err := lce.callTool(c.Request.Context(), "codebase_remote_index", args)
+	result, err := lce.callToolWithTimeout(opCtx, "codebase_remote_index", args, remoteIndexMCPCallTimeout)
 	if err != nil {
-		refundIndexBytes(userID, batchBytes)
 		finishIndexToolError(c, err)
 		return
 	}
 	if result.IsError {
-		refundIndexBytes(userID, batchBytes)
 		finishIndexToolError(c, fmt.Errorf("%s", string(result.Content)))
 		return
 	}
@@ -628,25 +669,23 @@ func handleRemoteIndex(c *gin.Context) {
 	}
 	// 事务B：重新加锁提交进度。commitIndexBatch 内部会 SELECT...FOR UPDATE
 	// 复查 job 状态、并对每个文件的 UPDATE 断言 rows==1，因此事务A提交后到
-	// 这里之间发生的 supersede/清除/重放都会被拒绝（拒绝路径同样 refund）。
-	tx2, err := beginLockedIndexUserTx(c.Request.Context(), userID)
+	// 这里之间发生的 supersede/清除/重放都会被拒绝。配额按已发起的上游
+	// embedding 工作计费，即使后续提交失败也不回退，避免重放绕过成本上限。
+	tx2, err := beginLockedIndexUserTx(opCtx, userID)
 	if err != nil {
-		refundIndexBytes(userID, batchBytes)
 		finishIndexError(c, err)
 		return
 	}
 	defer tx2.Rollback()
-	if err := commitIndexBatch(c.Request.Context(), tx2, userID, job.ID, staged, chunks, !exact, len(deleted) > 0); err != nil {
-		refundIndexBytes(userID, batchBytes)
+	if err := commitIndexBatch(opCtx, tx2, userID, job.ID, staged, chunks, !exact, len(deleted) > 0); err != nil {
 		finishIndexError(c, err)
 		return
 	}
 	if err := tx2.Commit(); err != nil {
-		refundIndexBytes(userID, batchBytes)
 		finishIndexError(c, err)
 		return
 	}
-	updated, err := loadIndexJob(c.Request.Context(), userID, job.ID)
+	updated, err := loadIndexJob(opCtx, userID, job.ID)
 	if err != nil {
 		finishIndexError(c, err)
 		return
@@ -821,6 +860,19 @@ type finishIndexJobRequest struct {
 func handleCompleteIndexJob(c *gin.Context) {
 	userID := c.GetString(ContextKeyUserID)
 	jobID := strings.TrimSpace(c.Param("id"))
+	if jobID == "" {
+		finishJSON(c, http.StatusBadRequest, gin.H{"error": "index job id is required"})
+		return
+	}
+	lease, err := acquireSharedIndexOperation(
+		c.Request.Context(), userID, indexJobOperationResource(jobID), "complete-job",
+	)
+	if err != nil {
+		finishIndexError(c, err)
+		return
+	}
+	defer lease.Release()
+	opCtx := lease.Context()
 
 	// Graph finalization can parse and rebind a large root. Validate first without holding
 	// a transaction, call LCE, then let the existing locked transaction revalidate every
@@ -828,7 +880,7 @@ func handleCompleteIndexJob(c *gin.Context) {
 	var preStatus, rootID string
 	var preTotalFiles, preIndexedFiles, preDeletedCount int
 	var preDeletionsSent bool
-	err := db.QueryRowContext(c.Request.Context(), `
+	err = db.QueryRowContext(opCtx, `
 		SELECT status, root_id, total_files, indexed_files, deleted_count, deletions_sent
 		FROM index_jobs WHERE id = $1 AND user_id = $2
 	`, jobID, userID).Scan(
@@ -863,7 +915,7 @@ func handleCompleteIndexJob(c *gin.Context) {
 	if rootID != "" {
 		args["root_id"] = rootID
 	}
-	result, err := lce.callToolWithTimeout(c.Request.Context(), "codebase_remote_index", args, 5*time.Minute)
+	result, err := lce.callToolWithTimeout(opCtx, "codebase_remote_index", args, remoteIndexMCPCallTimeout)
 	if err != nil {
 		finishIndexToolError(c, err)
 		return
@@ -873,7 +925,7 @@ func handleCompleteIndexJob(c *gin.Context) {
 		return
 	}
 
-	tx, err := beginLockedIndexUserTx(c.Request.Context(), userID)
+	tx, err := beginLockedIndexUserTx(opCtx, userID)
 	if err != nil {
 		finishIndexError(c, err)
 		return
@@ -883,7 +935,7 @@ func handleCompleteIndexJob(c *gin.Context) {
 	var workspaceID, workspaceName, branch, revision, status string
 	var totalFiles, indexedFiles, deletedCount int
 	var deletionsSent, fallback bool
-	err = tx.QueryRowContext(c.Request.Context(), `
+	err = tx.QueryRowContext(opCtx, `
 		SELECT workspace_id, workspace_name, branch, revision, status,
 			total_files, indexed_files, deleted_count, deletions_sent, chunk_count_fallback
 		FROM index_jobs
@@ -914,13 +966,13 @@ func handleCompleteIndexJob(c *gin.Context) {
 		return
 	}
 
-	if _, err = tx.ExecContext(c.Request.Context(), `
+	if _, err = tx.ExecContext(opCtx, `
 		DELETE FROM indexed_files WHERE user_id = $1 AND workspace_id = $2
 	`, userID, workspaceID); err != nil {
 		finishIndexError(c, err)
 		return
 	}
-	if _, err = tx.ExecContext(c.Request.Context(), `
+	if _, err = tx.ExecContext(opCtx, `
 		INSERT INTO indexed_files (
 			user_id, workspace_id, path, hash, size, estimated_chunks
 		)
@@ -931,7 +983,7 @@ func handleCompleteIndexJob(c *gin.Context) {
 		finishIndexError(c, err)
 		return
 	}
-	if _, err = tx.ExecContext(c.Request.Context(), `
+	if _, err = tx.ExecContext(opCtx, `
 		INSERT INTO index_workspaces (
 			user_id, workspace_id, workspace_name, branch, revision, indexed_at
 		) VALUES ($1, $2, $3, $4, $5, NOW())
@@ -948,7 +1000,7 @@ func handleCompleteIndexJob(c *gin.Context) {
 	if !fallback {
 		totalChunkExpr = "indexed_chunks"
 	}
-	if _, err = tx.ExecContext(c.Request.Context(), fmt.Sprintf(`
+	if _, err = tx.ExecContext(opCtx, fmt.Sprintf(`
 		UPDATE index_jobs
 		SET status = '%s', phase = 'done', total_chunks = %s,
 			heartbeat_at = NOW(), completed_at = NOW()
@@ -957,7 +1009,7 @@ func handleCompleteIndexJob(c *gin.Context) {
 		finishIndexError(c, err)
 		return
 	}
-	if _, err = tx.ExecContext(c.Request.Context(), `DELETE FROM index_job_files WHERE job_id = $1`, jobID); err != nil {
+	if _, err = tx.ExecContext(opCtx, `DELETE FROM index_job_files WHERE job_id = $1`, jobID); err != nil {
 		finishIndexError(c, err)
 		return
 	}
@@ -965,7 +1017,7 @@ func handleCompleteIndexJob(c *gin.Context) {
 		finishIndexError(c, err)
 		return
 	}
-	job, err := loadIndexJob(c.Request.Context(), userID, jobID)
+	job, err := loadIndexJob(opCtx, userID, jobID)
 	if err != nil {
 		finishIndexError(c, err)
 		return
@@ -976,6 +1028,10 @@ func handleCompleteIndexJob(c *gin.Context) {
 func handleFailIndexJob(c *gin.Context) {
 	userID := c.GetString(ContextKeyUserID)
 	jobID := strings.TrimSpace(c.Param("id"))
+	if jobID == "" {
+		finishJSON(c, http.StatusBadRequest, gin.H{"error": "index job id is required"})
+		return
+	}
 	var req finishIndexJobRequest
 	_ = c.ShouldBindJSON(&req)
 	req.Error = strings.TrimSpace(req.Error)
@@ -985,13 +1041,22 @@ func handleFailIndexJob(c *gin.Context) {
 	if req.Error == "" {
 		req.Error = "client reported indexing failure"
 	}
-	tx, err := beginLockedIndexUserTx(c.Request.Context(), userID)
+	lease, err := acquireSharedIndexOperation(
+		c.Request.Context(), userID, indexJobOperationResource(jobID), "fail-job",
+	)
+	if err != nil {
+		finishIndexError(c, err)
+		return
+	}
+	defer lease.Release()
+	opCtx := lease.Context()
+	tx, err := beginLockedIndexUserTx(opCtx, userID)
 	if err != nil {
 		finishIndexError(c, err)
 		return
 	}
 	defer tx.Rollback()
-	result, err := tx.ExecContext(c.Request.Context(), `
+	result, err := tx.ExecContext(opCtx, `
 		UPDATE index_jobs
 		SET status = $1, phase = 'done', failed_files = total_files - indexed_files,
 			error = $2, heartbeat_at = NOW(), completed_at = NOW()
@@ -1006,7 +1071,7 @@ func handleFailIndexJob(c *gin.Context) {
 		finishJSON(c, http.StatusConflict, gin.H{"error": "index job is not running"})
 		return
 	}
-	if _, err = tx.ExecContext(c.Request.Context(), `DELETE FROM index_job_files WHERE job_id = $1`, jobID); err != nil {
+	if _, err = tx.ExecContext(opCtx, `DELETE FROM index_job_files WHERE job_id = $1`, jobID); err != nil {
 		finishIndexError(c, err)
 		return
 	}
@@ -1014,7 +1079,7 @@ func handleFailIndexJob(c *gin.Context) {
 		finishIndexError(c, err)
 		return
 	}
-	job, err := loadIndexJob(c.Request.Context(), userID, jobID)
+	job, err := loadIndexJob(opCtx, userID, jobID)
 	if err != nil {
 		finishIndexError(c, err)
 		return

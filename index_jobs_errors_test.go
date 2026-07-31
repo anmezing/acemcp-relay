@@ -28,7 +28,7 @@ func jobFileRows() *sqlmock.Rows {
 	return sqlmock.NewRows([]string{"path", "hash", "estimated_chunks", "needs_index", "indexed"})
 }
 
-const jobColumnCount = 21
+const jobColumnCount = 22
 
 // jobRow 构造 loadIndexJobFrom 期望的那一行（列顺序必须与其 SELECT 一致）。
 func jobRow(status string, deletedCount int) *sqlmock.Rows {
@@ -36,12 +36,12 @@ func jobRow(status string, deletedCount int) *sqlmock.Rows {
 	return sqlmock.NewRows([]string{
 		"id", "workspace_id", "workspace_name", "root_id", "branch", "revision", "mode", "phase", "status",
 		"workspace_files", "total_files", "indexed_files", "failed_files", "total_chunks",
-		"indexed_chunks", "chunk_count_fallback", "deleted_count", "error",
+		"indexed_chunks", "chunk_count_fallback", "deleted_count", "error", "model_fingerprint",
 		"started_at", "heartbeat_at", "completed_at",
 	}).AddRow(
 		"job-1", "ws-1", "workspace", "", "main", "rev-1", "full", "indexing", status,
 		10, 10, 0, 0, int64(0),
-		int64(0), false, deletedCount, "",
+		int64(0), false, deletedCount, "", "",
 		now, now, nil,
 	)
 }

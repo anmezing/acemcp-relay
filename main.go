@@ -45,7 +45,6 @@ var (
 	dbName                   string
 	redisHost                string
 	redisPort                int
-	apiKeyCacheTTL           time.Duration
 	deviceBindingMode        string
 	deviceCacheTTL           time.Duration
 	deviceIPWindow           time.Duration
@@ -103,7 +102,6 @@ func loadConfig() {
 	dbName = getEnv("DB_NAME", "postgres")
 	redisHost = getEnv("REDIS_HOST", "localhost")
 	redisPort = getEnvInt("REDIS_PORT", 6379)
-	apiKeyCacheTTL = getEnvDuration("API_KEY_CACHE_TTL", 30*time.Minute)
 	deviceBindingMode = strings.ToLower(getEnv("DEVICE_BINDING_MODE", DeviceModeLog))
 	if deviceBindingMode != DeviceModeOff && deviceBindingMode != DeviceModeLog && deviceBindingMode != DeviceModeEnforce {
 		log.Printf("[CONFIG] invalid DEVICE_BINDING_MODE %q, falling back to %q", deviceBindingMode, DeviceModeLog)
@@ -212,7 +210,10 @@ var lce = &mcpClient{
 	},
 }
 
-const defaultMCPCallTimeout = 120 * time.Second
+const (
+	defaultMCPCallTimeout     = 120 * time.Second
+	remoteIndexMCPCallTimeout = 330 * time.Second
+)
 
 func (m *mcpClient) ensureSession(ctx context.Context) (string, error) {
 	m.mu.RLock()
@@ -673,20 +674,12 @@ func authenticateRequest(c *gin.Context) (string, bool) {
 	token := strings.TrimPrefix(authHeader, "Bearer ")
 	hash := md5.Sum([]byte(token))
 	tokenMD5 := hex.EncodeToString(hash[:])
-	cacheKey := "apikey:" + tokenMD5
-
-	ctx := context.Background()
-	if userID, err := redisClient.Get(ctx, cacheKey).Result(); err == nil {
-		return userID, true
-	}
-
 	var userID string
 	err := db.QueryRow("SELECT user_id FROM api_keys WHERE id = $1", tokenMD5).Scan(&userID)
 	if err != nil {
 		return "", false
 	}
 
-	redisClient.Set(ctx, cacheKey, userID, apiKeyCacheTTL)
 	return userID, true
 }
 
@@ -724,6 +717,7 @@ func authMiddleware() gin.HandlerFunc {
 
 			if !isIndexQuotaExempt(c.Request.Method, c.Request.URL.Path) {
 				if ok, limit := checkRequestQuota(userID); !ok {
+					c.Header("Retry-After", quotaRetryAfterHeader(time.Now()))
 					c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{"error": fmt.Sprintf("daily request quota exceeded (%d/day)", limit)})
 					return
 				}
@@ -967,9 +961,10 @@ func rewriteToolSchema(toolJSON json.RawMessage) (json.RawMessage, error) {
 	return json.Marshal(tool)
 }
 
-func sanitizeToolCallArgs(args map[string]interface{}) {
-	delete(args, "repo_path")
-	delete(args, "workspace_config_path")
+func sanitizeToolCallArgs(toolName string, args map[string]interface{}) {
+	for field := range chatMCPSchemaRewrites[toolName] {
+		delete(args, field)
+	}
 	delete(args, "model_config")
 }
 
@@ -1330,19 +1325,20 @@ func handleMCPToolsCall(c *gin.Context, id json.RawMessage, params json.RawMessa
 	if p.Arguments == nil {
 		p.Arguments = make(map[string]interface{})
 	}
-	sanitizeToolCallArgs(p.Arguments)
+	sanitizeToolCallArgs(p.Name, p.Arguments)
 	p.Arguments["tenant_id"] = userID
-	cfg, err := resolveModelConfigArg(c.Request.Context(), userID)
+	modelLease, cfg, err := acquireModelConfigOperation(c.Request.Context(), userID, "chat-tool")
 	if err != nil {
 		c.JSON(http.StatusOK, rpcError(id, -32000, err.Error()))
 		completeRequestLogAsync(getRequestLogEntry(c, http.StatusOK))
 		return
 	}
+	defer modelLease.Release()
 	if cfg != nil {
 		p.Arguments["model_config"] = cfg
 	}
 
-	result, err := lce.callTool(c.Request.Context(), p.Name, p.Arguments)
+	result, err := lce.callTool(modelLease.Context(), p.Name, p.Arguments)
 	if err != nil {
 		if errors.Is(c.Request.Context().Err(), context.Canceled) {
 			completeRequestLogAsync(getRequestLogEntry(c, 499))
@@ -1441,16 +1437,17 @@ func handleCodebaseRetrieval(c *gin.Context) {
 		"tenant_id":           userIDStr,
 		"information_request": req.InformationRequest,
 	}
-	cfg, err := resolveModelConfigArg(c.Request.Context(), userIDStr)
+	modelLease, cfg, err := acquireModelConfigOperation(c.Request.Context(), userIDStr, "retrieval")
 	if err != nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
 		completeRequestLogAsync(getRequestLogEntry(c, http.StatusServiceUnavailable))
 		return
 	}
+	defer modelLease.Release()
 	if cfg != nil {
 		args["model_config"] = cfg
 	}
-	result, err := lce.callTool(c.Request.Context(), "codebase-retrieval", args)
+	result, err := lce.callTool(modelLease.Context(), "codebase-retrieval", args)
 	if err != nil {
 		logIDStr, _ := c.Get(ContextKeyLogID)
 		logIDVal, _ := logIDStr.(string)
@@ -1489,21 +1486,29 @@ func handleClearIndex(c *gin.Context) {
 		completeRequestLogAsync(getRequestLogEntry(c, http.StatusTooManyRequests))
 		return
 	}
+	lease, err := acquireExclusiveIndexOperation(c.Request.Context(), userIDStr, "clear-index")
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "索引正在执行其他操作: " + err.Error()})
+		completeRequestLogAsync(getRequestLogEntry(c, http.StatusServiceUnavailable))
+		return
+	}
+	defer lease.Release()
+	opCtx := lease.Context()
 
 	// 顺序必须是"先清 relay 快照并提交，再清 LCE"：LCE 的 clear 不可回滚，
 	// 若先清 LCE 再提交 relay 事务，Commit 失败会留下"LCE 空 / relay 快照满"
 	// 的永久不一致（后续 diff 全判未变更，永远不重传）。反过来，relay 已清、
 	// LCE 清失败只会导致下一次全量重传覆盖旧数据，可自愈。
 	// 事务在调 LCE 之前就已提交并释放连接与 advisory 锁，不会占着连接池等
-	// 120s 的网络调用。
-	if err := clearUserIndexState(c.Request.Context(), userIDStr); err != nil {
+	// 长时间网络调用。
+	if err := clearUserIndexState(opCtx, userIDStr); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "清除 Relay 索引状态失败: " + err.Error()})
 		completeRequestLogAsync(getRequestLogEntry(c, http.StatusInternalServerError))
 		return
 	}
 
 	args := map[string]interface{}{"tenant_id": userIDStr}
-	result, err := lce.callTool(c.Request.Context(), "codebase_clear_index", args)
+	result, err := lce.callToolWithTimeout(opCtx, "codebase_clear_index", args, remoteIndexMCPCallTimeout)
 	if err != nil {
 		logIDStr, _ := c.Get(ContextKeyLogID)
 		logIDVal, _ := logIDStr.(string)

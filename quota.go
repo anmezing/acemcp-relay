@@ -95,6 +95,20 @@ func indexBytesKey(userID string) string {
 	return "quota:indexbytes:" + userID + ":" + day
 }
 
+func quotaRetryAfterHeader(now time.Time) string {
+	localNow := now.In(quotaLocation())
+	year, month, day := localNow.Date()
+	nextWindow := time.Date(year, month, day+1, 0, 0, 0, 0, quotaLocation())
+	seconds := int64(nextWindow.Sub(localNow) / time.Second)
+	if nextWindow.Sub(localNow)%time.Second != 0 {
+		seconds++
+	}
+	if seconds < 1 {
+		seconds = 1
+	}
+	return strconv.FormatInt(seconds, 10)
+}
+
 // chargeIndexBytes 累加当日已索引字节并判断是否超限，返回 (是否放行, 已用, 上限)。
 // 与请求数配额一致：Redis 故障时放行，避免基础设施抖动演变成全站不可索引。
 func chargeIndexBytes(userID string, bytes int64) (bool, int64, int64) {
@@ -104,30 +118,36 @@ func chargeIndexBytes(userID string, bytes int64) (bool, int64, int64) {
 
 	ctx := context.Background()
 	key := indexBytesKey(userID)
-	used, err := redisClient.IncrBy(ctx, key, bytes).Result()
+	const chargeScript = `
+		local current = tonumber(redis.call('GET', KEYS[1]) or '0')
+		local requested = tonumber(ARGV[1])
+		local limit = tonumber(ARGV[2])
+		if current + requested > limit then
+			return {0, current}
+		end
+		local used = redis.call('INCRBY', KEYS[1], requested)
+		if current == 0 then
+			redis.call('EXPIRE', KEYS[1], tonumber(ARGV[3]))
+		end
+		return {1, used}
+	`
+	value, err := redisClient.Eval(ctx, chargeScript, []string{key}, bytes, dailyIndexBytesLimit, int64((48*time.Hour)/time.Second)).Result()
 	if err != nil {
 		log.Printf("[QUOTA] index byte accounting failed (user=%s): %v", userID, err)
 		return true, 0, dailyIndexBytesLimit
 	}
-	// 首次写入才设过期：IncrBy 从 0 起算，used == bytes 即本日第一次。
-	if used == bytes {
-		redisClient.Expire(ctx, key, 48*time.Hour)
+	parts, ok := value.([]interface{})
+	if !ok || len(parts) != 2 {
+		log.Printf("[QUOTA] invalid index byte accounting response (user=%s): %#v", userID, value)
+		return true, 0, dailyIndexBytesLimit
 	}
-	return used <= dailyIndexBytesLimit, used, dailyIndexBytesLimit
-}
-
-// refundIndexBytes 返还 chargeIndexBytes 预扣的字节。计费点在调用 LCE 之前，
-// 后续任何失败（batch 校验失败、LCE 出错、事务提交失败）都意味着这些字节
-// 没有真正产生 embedding 成本，必须退回，否则重试会双重计费直至误撞配额。
-// best-effort：Redis 故障只打日志（与扣费侧的故障放行策略一致）。
-func refundIndexBytes(userID string, bytes int64) {
-	if dailyIndexBytesLimit <= 0 || bytes <= 0 {
-		return
+	allowed, allowedOK := parts[0].(int64)
+	used, usedOK := parts[1].(int64)
+	if !allowedOK || !usedOK {
+		log.Printf("[QUOTA] invalid index byte accounting values (user=%s): %#v", userID, parts)
+		return true, 0, dailyIndexBytesLimit
 	}
-	ctx := context.Background()
-	if err := redisClient.DecrBy(ctx, indexBytesKey(userID), bytes).Err(); err != nil {
-		log.Printf("[QUOTA] index byte refund failed (user=%s bytes=%d): %v", userID, bytes, err)
-	}
+	return allowed == 1, used, dailyIndexBytesLimit
 }
 
 // checkRequestQuota 累加当日计数并判断是否超限。Redis 故障时放行。

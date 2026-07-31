@@ -32,7 +32,6 @@ import (
 
 const (
 	modelConfigCacheTTL   = 5 * time.Minute
-	modelConfigApplyLock  = 5 * time.Minute
 	modelConfigNoRowValue = "0"
 )
 
@@ -72,15 +71,15 @@ type userModelConfigRow struct {
 
 // getUserModelConfigRow 带 Redis 缓存读取配置行；无配置返回 nil。
 // 前端保存配置后会删除 modelcfg:{user} 缓存使其立即可见。
-func getUserModelConfigRow(ctx context.Context, userID string) *userModelConfigRow {
+func getUserModelConfigRow(ctx context.Context, userID string) (*userModelConfigRow, error) {
 	cacheKey := "modelcfg:" + userID
 	if v, err := redisClient.Get(ctx, cacheKey).Result(); err == nil {
 		if v == modelConfigNoRowValue {
-			return nil
+			return nil, nil
 		}
 		var row userModelConfigRow
 		if json.Unmarshal([]byte(v), &row) == nil {
-			return &row
+			return &row, nil
 		}
 	}
 
@@ -93,17 +92,17 @@ func getUserModelConfigRow(ctx context.Context, userID string) *userModelConfigR
 	switch {
 	case err == sql.ErrNoRows:
 		redisClient.Set(ctx, cacheKey, modelConfigNoRowValue, modelConfigCacheTTL)
-		return nil
+		return nil, nil
 	case err != nil:
 		log.Printf("[MODELCFG] lookup failed (user=%s): %v", userID, err)
-		return nil
+		return nil, fmt.Errorf("model config lookup failed: %w", err)
 	}
 
 	row := &userModelConfigRow{Enc: enc.String, Fingerprint: fingerprint, Applied: applied.String}
 	if data, err := json.Marshal(row); err == nil {
 		redisClient.Set(ctx, cacheKey, string(data), modelConfigCacheTTL)
 	}
-	return row
+	return row, nil
 }
 
 func decryptModelConfig(enc string) (map[string]interface{}, error) {
@@ -133,42 +132,12 @@ func decryptModelConfig(enc string) (map[string]interface{}, error) {
 	return cfg, nil
 }
 
-func releaseModelConfigApplyLock(ctx context.Context, lockKey, token string) {
-	const compareAndDelete = `
-		if redis.call("GET", KEYS[1]) == ARGV[1] then
-			return redis.call("DEL", KEYS[1])
-		end
-		return 0
-	`
-	if err := redisClient.Eval(ctx, compareAndDelete, []string{lockKey}, token).Err(); err != nil {
-		log.Printf("[MODELCFG] apply lock release failed (user=%s): %v", userIDFromModelConfigLockKey(lockKey), err)
-	}
-}
-
-func userIDFromModelConfigLockKey(lockKey string) string {
-	const prefix = "modelcfg:apply:"
-	if len(lockKey) >= len(prefix) && lockKey[:len(prefix)] == prefix {
-		return lockKey[len(prefix):]
-	}
-	return lockKey
-}
-
-// applyModelConfigChange clears both LCE data and relay snapshots while holding
-// the same per-user database lock used by indexing jobs.
-func applyModelConfigChange(ctx context.Context, userID string, row *userModelConfigRow) error {
-	lockKey := "modelcfg:apply:" + userID
-	lockToken := uuid.NewString()
-	ok, err := redisClient.SetNX(ctx, lockKey, lockToken, modelConfigApplyLock).Result()
-	if err != nil {
-		return fmt.Errorf("model config apply lock failed: %w", err)
-	}
-	if !ok {
-		return fmt.Errorf("model config update is already in progress; retry shortly")
-	}
-	defer releaseModelConfigApplyLock(context.Background(), lockKey, lockToken)
-
+// applyModelConfigChangeUnderLease clears both LCE data and relay snapshots.
+// The caller must hold the user's exclusive index-operation lease across this
+// function and the operation that consumes the newly applied configuration.
+func applyModelConfigChangeUnderLease(ctx context.Context, userID string, row *userModelConfigRow) error {
 	// 与 handleClearIndex 同一原则：不能让持 advisory 锁的 DB 事务横跨 LCE
-	// 网络调用（120s 超时会占死连接池），也不能"先清 LCE 再提交 relay"——
+	// 网络调用会长期等待，不能占住连接池；也不能"先清 LCE 再提交 relay"——
 	// Commit 失败会留下 LCE 空/relay 快照满的永久不一致。顺序：
 	//   1) 事务A 清 relay 快照并提交（可自愈：只会引发一次全量重传）；
 	//   2) 调 LCE 清租户索引；
@@ -186,7 +155,9 @@ func applyModelConfigChange(ctx context.Context, userID string, row *userModelCo
 		return fmt.Errorf("model config snapshot reset commit failed: %w", err)
 	}
 
-	result, err := lce.callTool(ctx, "codebase_clear_index", map[string]interface{}{"tenant_id": userID})
+	result, err := lce.callToolWithTimeout(
+		ctx, "codebase_clear_index", map[string]interface{}{"tenant_id": userID}, remoteIndexMCPCallTimeout,
+	)
 	if err != nil || (result != nil && result.IsError) {
 		detail := ""
 		if err != nil {
@@ -231,28 +202,75 @@ func applyModelConfigChange(ctx context.Context, userID string, row *userModelCo
 	return nil
 }
 
-// resolveModelConfigArg 返回要注入 LCE 工具调用的 model_config 参数
-// （nil = 使用平台默认），并在配置变化时惰性触发租户索引重建。
-func resolveModelConfigArg(ctx context.Context, userID string) (map[string]interface{}, error) {
+// loadModelConfigArg returns the current config snapshot and identity without
+// changing index state. A non-nil row with Applied != Fingerprint is pending.
+func loadModelConfigArg(ctx context.Context, userID string) (map[string]interface{}, *userModelConfigRow, error) {
 	if modelConfigKey == nil {
-		return nil, nil
+		return nil, nil, nil
 	}
-	row := getUserModelConfigRow(ctx, userID)
+	row, err := getUserModelConfigRow(ctx, userID)
+	if err != nil {
+		return nil, nil, err
+	}
 	if row == nil {
-		return nil, nil
+		return nil, nil, nil
 	}
-	if row.Applied != row.Fingerprint {
-		if err := applyModelConfigChange(ctx, userID, row); err != nil {
-			return nil, err
+	var cfg map[string]interface{}
+	if row.Enc != "" {
+		cfg, err = decryptModelConfig(row.Enc)
+		if err != nil {
+			log.Printf("[MODELCFG] decrypt failed (user=%s): %v", userID, err)
+			return nil, nil, fmt.Errorf("model config decrypt failed")
 		}
 	}
-	if row.Enc == "" {
-		return nil, nil // 已恢复平台默认
-	}
-	cfg, err := decryptModelConfig(row.Enc)
+	return cfg, row, nil
+}
+
+// resolveModelConfigUnderExclusiveLease applies a pending configuration while
+// the caller holds an exclusive lease, and returns the immutable job identity.
+func resolveModelConfigUnderExclusiveLease(ctx context.Context, userID string) (map[string]interface{}, string, error) {
+	cfg, row, err := loadModelConfigArg(ctx, userID)
 	if err != nil {
-		log.Printf("[MODELCFG] decrypt failed (user=%s): %v", userID, err)
-		return nil, fmt.Errorf("model config decrypt failed")
+		return nil, "", err
 	}
-	return cfg, nil
+	if row == nil {
+		return nil, "", nil
+	}
+	if row.Applied != row.Fingerprint {
+		if err := applyModelConfigChangeUnderLease(ctx, userID, row); err != nil {
+			return nil, "", err
+		}
+	}
+	return cfg, row.Fingerprint, nil
+}
+
+// acquireModelConfigOperation holds an index lease until the caller has
+// finished the LCE request. If a model change is pending, the shared lease is
+// upgraded by release/reacquire and the resulting exclusive lease is retained,
+// so no operation can enter between reset and first use of the new model.
+func acquireModelConfigOperation(ctx context.Context, userID, kind string) (*indexOperationLease, map[string]interface{}, error) {
+	lease, err := acquireSharedIndexOperation(ctx, userID, "model-call:"+uuid.NewString(), kind)
+	if err != nil {
+		return nil, nil, err
+	}
+	cfg, row, err := loadModelConfigArg(lease.Context(), userID)
+	if err != nil {
+		lease.Release()
+		return nil, nil, err
+	}
+	if row == nil || row.Applied == row.Fingerprint {
+		return lease, cfg, nil
+	}
+
+	lease.Release()
+	exclusive, err := acquireExclusiveIndexOperation(ctx, userID, "apply-model-config:"+kind)
+	if err != nil {
+		return nil, nil, err
+	}
+	cfg, _, err = resolveModelConfigUnderExclusiveLease(exclusive.Context(), userID)
+	if err != nil {
+		exclusive.Release()
+		return nil, nil, err
+	}
+	return exclusive, cfg, nil
 }

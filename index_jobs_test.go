@@ -247,13 +247,19 @@ func TestRewriteToolSchemaPassesThroughUnknownTools(t *testing.T) {
 func TestSanitizeToolCallArgs(t *testing.T) {
 	args := map[string]interface{}{
 		"information_request": "find auth code",
-		"repo_path":           "/local/path",
-		"workspace_config_path": "/ws/config",
 		"model_config":        map[string]interface{}{"key": "val"},
 		"technical_terms":     []string{"auth"},
 	}
-	sanitizeToolCallArgs(args)
-	for _, removed := range []string{"repo_path", "workspace_config_path", "model_config"} {
+	for field := range chatMCPSchemaRewrites["codebase-retrieval"] {
+		args[field] = "caller-controlled"
+	}
+	sanitizeToolCallArgs("codebase-retrieval", args)
+	for field := range chatMCPSchemaRewrites["codebase-retrieval"] {
+		if _, exists := args[field]; exists {
+			t.Fatalf("policy field %q should have been removed", field)
+		}
+	}
+	for _, removed := range []string{"model_config"} {
 		if _, exists := args[removed]; exists {
 			t.Fatalf("%q should have been removed", removed)
 		}

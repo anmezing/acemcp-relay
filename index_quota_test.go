@@ -2,8 +2,14 @@ package main
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
+	"time"
+
+	"github.com/alicebob/miniredis/v2"
+	"github.com/redis/go-redis/v9"
 )
 
 // 索引通道的计费不对称是这组用例要守住的东西：
@@ -110,5 +116,83 @@ func TestIndexQuotaExemptionStillCoversBatchUploads(t *testing.T) {
 	}
 	if isIndexQuotaExempt("POST", "/relay/index-jobs") {
 		t.Error("创建 job 应继续计入请求数配额")
+	}
+}
+
+func withTestIndexQuota(t *testing.T, limit int64) *miniredis.Miniredis {
+	t.Helper()
+	server := miniredis.RunT(t)
+	previousClient := redisClient
+	previousLimit := dailyIndexBytesLimit
+	redisClient = redis.NewClient(&redis.Options{Addr: server.Addr()})
+	dailyIndexBytesLimit = limit
+	t.Cleanup(func() {
+		_ = redisClient.Close()
+		redisClient = previousClient
+		dailyIndexBytesLimit = previousLimit
+	})
+	return server
+}
+
+func TestChargeIndexBytesRejectsWithoutIncreasingUsage(t *testing.T) {
+	server := withTestIndexQuota(t, 100)
+	userID := "quota-user"
+
+	allowed, used, _ := chargeIndexBytes(userID, 60)
+	if !allowed || used != 60 {
+		t.Fatalf("first charge = allowed %v, used %d; want true, 60", allowed, used)
+	}
+	allowed, used, _ = chargeIndexBytes(userID, 50)
+	if allowed || used != 60 {
+		t.Fatalf("over-limit charge = allowed %v, used %d; want false, unchanged 60", allowed, used)
+	}
+	stored, err := server.Get(indexBytesKey(userID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored != "60" {
+		t.Fatalf("rejected charge changed Redis usage to %q", stored)
+	}
+	if ttl := server.TTL(indexBytesKey(userID)); ttl <= 0 {
+		t.Fatalf("quota key must expire, ttl=%s", ttl)
+	}
+}
+
+func TestChargeIndexBytesIsAtomicUnderConcurrency(t *testing.T) {
+	server := withTestIndexQuota(t, 100)
+	userID := "concurrent-quota-user"
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	allowedCount := 0
+	for range 20 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			allowed, _, _ := chargeIndexBytes(userID, 10)
+			if allowed {
+				mu.Lock()
+				allowedCount++
+				mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+	if allowedCount != 10 {
+		t.Fatalf("allowed %d concurrent charges, want exactly 10", allowedCount)
+	}
+	stored, err := server.Get(indexBytesKey(userID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored != strconv.Itoa(100) {
+		t.Fatalf("stored usage = %q, want 100", stored)
+	}
+}
+
+func TestQuotaRetryAfterUsesShanghaiDayBoundary(t *testing.T) {
+	loc := quotaLocation()
+	now := time.Date(2026, 7, 31, 23, 59, 59, 500_000_000, loc)
+	if got := quotaRetryAfterHeader(now); got != "1" {
+		t.Fatalf("Retry-After = %s, want 1 second", got)
 	}
 }

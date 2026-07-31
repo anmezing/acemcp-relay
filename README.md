@@ -118,10 +118,6 @@ go build -o acemcp-relay .
 | 变量 | 说明 | 默认值 |
 |------|------|--------|
 | `REDIS_PORT` | Redis 端口 | `6379` |
-| `API_KEY_CACHE_TTL` | API Key 缓存过期时间（Go duration 格式） | `30m` |
-
-> `API_KEY_CACHE_TTL` 支持 Go `time.ParseDuration` 格式，例如 `30m`、`1h`、`2h30m`。
-
 ### 会话配置
 
 | 变量 | 说明 | 默认值 |
