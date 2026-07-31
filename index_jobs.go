@@ -1222,12 +1222,17 @@ func handleFailIndexJob(c *gin.Context) {
 }
 
 func clearUserIndexStateTx(ctx context.Context, tx *sql.Tx, userID string) error {
-	_, err := tx.ExecContext(ctx, `
-		DELETE FROM index_jobs WHERE user_id = $1;
-		DELETE FROM indexed_files WHERE user_id = $1;
-		DELETE FROM index_workspaces WHERE user_id = $1;
-	`, userID)
-	return err
+	statements := []string{
+		`DELETE FROM index_jobs WHERE user_id = $1`,
+		`DELETE FROM indexed_files WHERE user_id = $1`,
+		`DELETE FROM index_workspaces WHERE user_id = $1`,
+	}
+	for _, statement := range statements {
+		if _, err := tx.ExecContext(ctx, statement, userID); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func clearUserIndexState(ctx context.Context, userID string) error {
@@ -1244,30 +1249,29 @@ func clearUserIndexState(ctx context.Context, userID string) error {
 
 func clearRootIndexStateTx(ctx context.Context, tx *sql.Tx, userID, rootID string) error {
 	normalizedRootID := lceIndexRootID(rootID)
-	_, err := tx.ExecContext(ctx, `
-		WITH bound_workspaces AS (
-			SELECT workspace_id
-			FROM index_workspaces
-			WHERE user_id = $1
-			  AND CASE WHEN BTRIM(root_id) = '' THEN 'default' ELSE BTRIM(root_id) END = $2
-		)
-		DELETE FROM index_jobs
-		WHERE user_id = $1 AND workspace_id IN (SELECT workspace_id FROM bound_workspaces);
-
-		WITH bound_workspaces AS (
-			SELECT workspace_id
-			FROM index_workspaces
-			WHERE user_id = $1
-			  AND CASE WHEN BTRIM(root_id) = '' THEN 'default' ELSE BTRIM(root_id) END = $2
-		)
-		DELETE FROM indexed_files
-		WHERE user_id = $1 AND workspace_id IN (SELECT workspace_id FROM bound_workspaces);
-
-		DELETE FROM index_workspaces
-		WHERE user_id = $1
-		  AND CASE WHEN BTRIM(root_id) = '' THEN 'default' ELSE BTRIM(root_id) END = $2;
-	`, userID, normalizedRootID)
-	return err
+	statements := []string{
+		`DELETE FROM index_jobs AS jobs
+		 USING index_workspaces AS workspaces
+		 WHERE jobs.user_id = $1
+		   AND jobs.workspace_id = workspaces.workspace_id
+		   AND workspaces.user_id = $1
+		   AND CASE WHEN BTRIM(workspaces.root_id) = '' THEN 'default' ELSE BTRIM(workspaces.root_id) END = $2`,
+		`DELETE FROM indexed_files AS files
+		 USING index_workspaces AS workspaces
+		 WHERE files.user_id = $1
+		   AND files.workspace_id = workspaces.workspace_id
+		   AND workspaces.user_id = $1
+		   AND CASE WHEN BTRIM(workspaces.root_id) = '' THEN 'default' ELSE BTRIM(workspaces.root_id) END = $2`,
+		`DELETE FROM index_workspaces
+		 WHERE user_id = $1
+		   AND CASE WHEN BTRIM(root_id) = '' THEN 'default' ELSE BTRIM(root_id) END = $2`,
+	}
+	for _, statement := range statements {
+		if _, err := tx.ExecContext(ctx, statement, userID, normalizedRootID); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func clearRootIndexState(ctx context.Context, userID, rootID string) error {

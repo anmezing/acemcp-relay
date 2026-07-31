@@ -88,9 +88,37 @@ func TestPrepareIndexBatchReportsMissingJobAsErrNoRows(t *testing.T) {
 	})
 }
 
-func TestClearRootIndexStateMapsLegacyDefaultAndCommitsOneScopedDelete(t *testing.T) {
+func TestClearUserIndexStateExecutesPortableSingleStatements(t *testing.T) {
 	withMockTx(t, func(mock sqlmock.Sqlmock) {
-		mock.ExpectExec("WITH bound_workspaces").
+		mock.ExpectExec("DELETE FROM index_jobs WHERE user_id").
+			WithArgs("user-1").
+			WillReturnResult(sqlmock.NewResult(0, 1))
+		mock.ExpectExec("DELETE FROM indexed_files WHERE user_id").
+			WithArgs("user-1").
+			WillReturnResult(sqlmock.NewResult(0, 1))
+		mock.ExpectExec("DELETE FROM index_workspaces WHERE user_id").
+			WithArgs("user-1").
+			WillReturnResult(sqlmock.NewResult(0, 1))
+		mock.ExpectCommit()
+	}, func(tx *sql.Tx) {
+		if err := clearUserIndexStateTx(context.Background(), tx, "user-1"); err != nil {
+			t.Fatalf("clearUserIndexStateTx: %v", err)
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatalf("commit: %v", err)
+		}
+	})
+}
+
+func TestClearRootIndexStateMapsLegacyDefaultAndExecutesPortableSingleStatements(t *testing.T) {
+	withMockTx(t, func(mock sqlmock.Sqlmock) {
+		mock.ExpectExec("DELETE FROM index_jobs AS jobs").
+			WithArgs("user-1", defaultLCEIndexRootID).
+			WillReturnResult(sqlmock.NewResult(0, 1))
+		mock.ExpectExec("DELETE FROM indexed_files AS files").
+			WithArgs("user-1", defaultLCEIndexRootID).
+			WillReturnResult(sqlmock.NewResult(0, 1))
+		mock.ExpectExec("DELETE FROM index_workspaces").
 			WithArgs("user-1", defaultLCEIndexRootID).
 			WillReturnResult(sqlmock.NewResult(0, 1))
 		mock.ExpectCommit()
