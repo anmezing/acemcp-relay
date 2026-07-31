@@ -28,18 +28,18 @@ func jobFileRows() *sqlmock.Rows {
 	return sqlmock.NewRows([]string{"path", "hash", "estimated_chunks", "needs_index", "indexed"})
 }
 
-const jobColumnCount = 20
+const jobColumnCount = 21
 
 // jobRow 构造 loadIndexJobFrom 期望的那一行（列顺序必须与其 SELECT 一致）。
 func jobRow(status string, deletedCount int) *sqlmock.Rows {
 	now := time.Now()
 	return sqlmock.NewRows([]string{
-		"id", "workspace_id", "workspace_name", "branch", "revision", "mode", "phase", "status",
+		"id", "workspace_id", "workspace_name", "root_id", "branch", "revision", "mode", "phase", "status",
 		"workspace_files", "total_files", "indexed_files", "failed_files", "total_chunks",
 		"indexed_chunks", "chunk_count_fallback", "deleted_count", "error",
 		"started_at", "heartbeat_at", "completed_at",
 	}).AddRow(
-		"job-1", "ws-1", "workspace", "main", "rev-1", "full", "indexing", status,
+		"job-1", "ws-1", "workspace", "", "main", "rev-1", "full", "indexing", status,
 		10, 10, 0, 0, int64(0),
 		int64(0), false, deletedCount, "",
 		now, now, nil,
@@ -178,6 +178,25 @@ func TestPrepareIndexBatchStagesFilesOnHappyPath(t *testing.T) {
 		}
 		if len(deleted) != 0 {
 			t.Errorf("deletions_sent=true 时不应再下发删除列表, 实际: %v", deleted)
+		}
+	})
+}
+
+func TestPrepareIndexBatchRejectsRootMismatch(t *testing.T) {
+	withMockTx(t, func(mock sqlmock.Sqlmock) {
+		row := jobRow(indexJobStatusRunning, 0)
+		// jobRow uses the default root; the request below tries to switch roots mid-job.
+		mock.ExpectQuery("FROM index_jobs").
+			WithArgs("job-1", "user-1").
+			WillReturnRows(row)
+	}, func(tx *sql.Tx) {
+		_, _, _, err := prepareIndexBatch(context.Background(), tx, "user-1", remoteIndexRequest{
+			JobID:  "job-1",
+			RootID: "another-root",
+			Files:  []indexManifestFile{{Path: "a.go", Content: "x", Hash: "h1"}},
+		})
+		if err == nil || !strings.Contains(err.Error(), "rootId does not match") {
+			t.Fatalf("expected root mismatch error, got %v", err)
 		}
 	})
 }

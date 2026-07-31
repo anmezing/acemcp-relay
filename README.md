@@ -25,7 +25,7 @@ Go HTTP relay 服务，用于在 LCE Coding Agent 插件与 LCE MCP 服务之间
 | `POST /relay/index-jobs` | 提交工作区 manifest，创建全量或增量索引任务并返回待索引、待删除文件 |
 | `GET /relay/index-jobs/:id` | 查询任务阶段、文件进度、chunk 进度和状态，同时刷新任务心跳 |
 | `POST /relay/remote-index` | 上传一个任务批次并调用 LCE `codebase_remote_index` |
-| `POST /relay/index-jobs/:id/complete` | 完成任务，提交服务端工作区快照并回收任务暂存文件 |
+| `POST /relay/index-jobs/:id/complete` | 完成任务：先让 LCE 修复并收敛该 root 的服务端符号图，再提交工作区快照并回收暂存文件 |
 | `POST /relay/index-jobs/:id/fail` | 标记任务失败并回收任务暂存文件 |
 | `POST /relay/agents/codebase-retrieval` | 调用 LCE `codebase-retrieval`，返回向量召回和精排结果 |
 
@@ -174,7 +174,7 @@ GROUP BY user_id ORDER BY evictions DESC LIMIT 20;
 - **`leaderboard`**：每日用户请求量排行榜
 - **`health_checks`**：LCE MCP 健康检查历史，记录状态、延迟、错误信息及下次检查时间
 - **`index_workspaces`**：用户工作区最近一次完成索引的分支、revision 和时间
-- **`index_jobs`**：索引任务状态、阶段、文件/chunk 进度、心跳和错误
+- **`index_jobs`**：索引任务状态、固定 `root_id`、阶段、文件/chunk 进度、心跳和错误；完成状态只在符号图收敛成功后提交
 - **`index_job_files`**：运行中任务的 manifest 和批次提交状态，任务完成、失败或超时后回收
 - **`indexed_files`**：服务端已完成索引的工作区文件快照，用于后续增量比较和删除检测
 

@@ -55,12 +55,14 @@ type createIndexJobRequest struct {
 	Revision        string              `json:"revision"`
 	Files           []indexManifestFile `json:"files"`
 	UnreadableFiles []string            `json:"unreadableFiles"`
+	RootID          string              `json:"rootId"`
 }
 
 type indexJobView struct {
 	ID                  string     `json:"id"`
 	WorkspaceID         string     `json:"workspaceId"`
 	WorkspaceName       string     `json:"workspaceName"`
+	RootID              string     `json:"rootId"`
 	Branch              string     `json:"branch"`
 	Revision            string     `json:"revision"`
 	Mode                string     `json:"mode"`
@@ -122,6 +124,7 @@ func migrateIndexingTables() error {
 			heartbeat_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
 			completed_at TIMESTAMP WITH TIME ZONE
 		);
+		ALTER TABLE index_jobs ADD COLUMN IF NOT EXISTS root_id VARCHAR(128) NOT NULL DEFAULT '';
 		CREATE INDEX IF NOT EXISTS idx_index_jobs_workspace
 			ON index_jobs(user_id, workspace_id, started_at DESC);
 		CREATE INDEX IF NOT EXISTS idx_index_jobs_running
@@ -310,8 +313,13 @@ func handleCreateIndexJob(c *gin.Context) {
 	req.WorkspaceName = strings.TrimSpace(req.WorkspaceName)
 	req.Branch = strings.TrimSpace(req.Branch)
 	req.Revision = strings.TrimSpace(req.Revision)
+	req.RootID = normalizeIndexRootID(req.RootID)
 	if req.WorkspaceID == "" || len(req.WorkspaceID) > 128 {
 		finishJSON(c, http.StatusBadRequest, gin.H{"error": "workspaceId is required"})
+		return
+	}
+	if len(req.RootID) > maxIndexRootIDLen {
+		finishJSON(c, http.StatusBadRequest, gin.H{"error": fmt.Sprintf("rootId exceeds %d bytes", maxIndexRootIDLen)})
 		return
 	}
 	files, err := normalizeManifest(req.Files)
@@ -383,10 +391,10 @@ func handleCreateIndexJob(c *gin.Context) {
 	jobID := uuid.New().String()
 	_, err = tx.ExecContext(c.Request.Context(), `
 		INSERT INTO index_jobs (
-			id, user_id, workspace_id, workspace_name, branch, revision, mode,
+			id, user_id, workspace_id, workspace_name, root_id, branch, revision, mode,
 			workspace_files, total_files, total_chunks, deleted_count
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-	`, jobID, userID, req.WorkspaceID, req.WorkspaceName, req.Branch, req.Revision, mode,
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+	`, jobID, userID, req.WorkspaceID, req.WorkspaceName, req.RootID, req.Branch, req.Revision, mode,
 		len(files), len(pending), estimatedChunks, len(deleted))
 	if err != nil {
 		finishIndexError(c, err)
@@ -463,14 +471,14 @@ func loadIndexJobFrom(ctx context.Context, queryer indexJobQueryer, userID, jobI
 	var job indexJobView
 	var fallback bool
 	err := queryer.QueryRowContext(ctx, `
-		SELECT id::text, workspace_id, workspace_name, branch, revision, mode, phase, status,
+		SELECT id::text, workspace_id, workspace_name, root_id, branch, revision, mode, phase, status,
 			workspace_files, total_files, indexed_files, failed_files, total_chunks,
 			indexed_chunks, chunk_count_fallback, deleted_count, error,
 			started_at, heartbeat_at, completed_at
 		FROM index_jobs
 		WHERE id = $1 AND user_id = $2
 	`, jobID, userID).Scan(
-		&job.ID, &job.WorkspaceID, &job.WorkspaceName, &job.Branch, &job.Revision,
+		&job.ID, &job.WorkspaceID, &job.WorkspaceName, &job.RootID, &job.Branch, &job.Revision,
 		&job.Mode, &job.Phase, &job.Status, &job.WorkspaceFiles, &job.TotalFiles,
 		&job.IndexedFiles, &job.FailedFiles, &job.TotalChunks, &job.IndexedChunks,
 		&fallback, &job.DeletedCount, &job.Error, &job.StartedAt, &job.HeartbeatAt,
@@ -490,14 +498,10 @@ type remoteIndexRequest struct {
 
 const maxIndexRootIDLen = 128
 
-// normalizeIndexRootID 清洗客户端上报的仓库标识：去空白、限长；空则返回 ""，
-// 由 LCE 侧落默认 root。
+// normalizeIndexRootID only trims. Length is validated separately so two distinct
+// identities can never be silently truncated into the same tenant root.
 func normalizeIndexRootID(value string) string {
-	v := strings.TrimSpace(value)
-	if len(v) > maxIndexRootIDLen {
-		v = v[:maxIndexRootIDLen]
-	}
-	return v
+	return strings.TrimSpace(value)
 }
 
 // validateIndexBatchSize 校验一个批次的体积并返回其内容总字节数。
@@ -527,7 +531,7 @@ func handleRemoteIndex(c *gin.Context) {
 		return
 	}
 	req.JobID = strings.TrimSpace(req.JobID)
-	if req.JobID == "" || len(req.Files) > maxIndexBatchFiles {
+	if req.JobID == "" || len(req.Files) > maxIndexBatchFiles || len(normalizeIndexRootID(req.RootID)) > maxIndexRootIDLen {
 		finishJSON(c, http.StatusBadRequest, gin.H{"error": "invalid index batch"})
 		return
 	}
@@ -661,6 +665,9 @@ func prepareIndexBatch(ctx context.Context, tx *sql.Tx, userID string, req remot
 	}
 	if job.Status != indexJobStatusRunning {
 		return job, nil, nil, fmt.Errorf("index job is %s", job.Status)
+	}
+	if normalizeIndexRootID(req.RootID) != job.RootID {
+		return job, nil, nil, fmt.Errorf("index batch rootId does not match the job")
 	}
 	if len(req.Files) == 0 && job.DeletedCount == 0 {
 		return job, nil, nil, fmt.Errorf("empty index batch")
@@ -814,6 +821,58 @@ type finishIndexJobRequest struct {
 func handleCompleteIndexJob(c *gin.Context) {
 	userID := c.GetString(ContextKeyUserID)
 	jobID := strings.TrimSpace(c.Param("id"))
+
+	// Graph finalization can parse and rebind a large root. Validate first without holding
+	// a transaction, call LCE, then let the existing locked transaction revalidate every
+	// completion invariant before committing the manifest snapshot.
+	var preStatus, rootID string
+	var preTotalFiles, preIndexedFiles, preDeletedCount int
+	var preDeletionsSent bool
+	err := db.QueryRowContext(c.Request.Context(), `
+		SELECT status, root_id, total_files, indexed_files, deleted_count, deletions_sent
+		FROM index_jobs WHERE id = $1 AND user_id = $2
+	`, jobID, userID).Scan(
+		&preStatus, &rootID, &preTotalFiles, &preIndexedFiles, &preDeletedCount, &preDeletionsSent,
+	)
+	if err == sql.ErrNoRows {
+		finishJSON(c, http.StatusNotFound, gin.H{"error": "index job not found"})
+		return
+	}
+	if err != nil {
+		finishIndexError(c, err)
+		return
+	}
+	if preStatus != indexJobStatusRunning {
+		finishJSON(c, http.StatusConflict, gin.H{"error": "index job is " + preStatus})
+		return
+	}
+	if preIndexedFiles != preTotalFiles {
+		finishJSON(c, http.StatusConflict, gin.H{"error": "index job still has pending files"})
+		return
+	}
+	if preDeletedCount > 0 && !preDeletionsSent {
+		finishJSON(c, http.StatusConflict, gin.H{"error": "index job still has pending deletions"})
+		return
+	}
+	args := map[string]interface{}{
+		"tenant_id":     userID,
+		"files":         []interface{}{},
+		"deleted_files": []interface{}{},
+		"finalize":      true,
+	}
+	if rootID != "" {
+		args["root_id"] = rootID
+	}
+	result, err := lce.callToolWithTimeout(c.Request.Context(), "codebase_remote_index", args, 5*time.Minute)
+	if err != nil {
+		finishIndexToolError(c, err)
+		return
+	}
+	if result.IsError {
+		finishIndexToolError(c, fmt.Errorf("%s", string(result.Content)))
+		return
+	}
+
 	tx, err := beginLockedIndexUserTx(c.Request.Context(), userID)
 	if err != nil {
 		finishIndexError(c, err)
