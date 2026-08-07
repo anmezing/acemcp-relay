@@ -17,12 +17,12 @@ import (
 
 // ── 设备绑定（防账号共用）──────────────────────────────────────────────────
 //
-// 前端 /api/auth/device 登录时把 (user_id, device_id) 写入 devices 表（含
-// 每用户设备数上限与 LRU 淘汰）；插件端每个请求带 X-Client-Id 头。
+// 前端 /api/mcp-device 生成 MCP 配置时把 (user_id, device_id) 写入 devices 表
+// （含每用户设备数上限与 LRU 淘汰）；MCP 客户端每个请求带 X-Client-Id 头。
 //
 // DEVICE_BINDING_MODE 三档：
 //   off     不校验（仅保留原有 token 鉴权）
-//   log     只记录告警，不拦截 —— 灰度期默认，老客户端不受影响
+//   log     只记录告警，不拦截 —— 灰度期默认，未更新配置的客户端不受影响
 //   enforce 未携带/未注册的设备一律 401
 //
 // 同一 (user, device) 在滑动窗口内出现过多来源 IP 时写 device_alerts 告警，

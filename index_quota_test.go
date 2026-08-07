@@ -12,14 +12,9 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// 索引通道的计费不对称是这组用例要守住的东西：
+// 索引通道同时受请求数和上传字节约束。请求数不能代表 embedding 成本：
 //
-// 创建一次 job 只计 1 次请求配额，随后的 /relay/remote-index 批次全部豁免
-// （它们是同一次扫描的内部步骤）。但 embedding 成本恰恰产生在那些批次上，
-// 而 manifest 上限是 10 万文件、nginx 允许每请求 100MB —— 没有体积约束时，
-// 1 次请求配额可以驱动上百 GB 的 embedding 调用。
-//
-// 下面三条边界共同封死这条路径：单文件上限、单批上限、每日字节配额。
+// 下面三条边界共同限制单次和每日成本：单文件上限、单批上限、每日字节配额。
 
 func TestIndexSizeCapsAreOrderedAndBounded(t *testing.T) {
 	// 单文件可以独占一批，但不能绕过批次总量上限。
@@ -139,17 +134,6 @@ func TestNormalBatchPassesAndReportsItsSize(t *testing.T) {
 	}
 	if total != 3000 {
 		t.Errorf("返回字节数 = %d, 期望 3000", total)
-	}
-}
-
-func TestIndexQuotaExemptionStillCoversBatchUploads(t *testing.T) {
-	// 批次上传保持请求数豁免（一次扫描上千批，按请求数计费会误伤正常用户），
-	// 它的约束改由字节配额承担。这条用例确认豁免关系没有被改动。
-	if !isIndexQuotaExempt("POST", "/relay/remote-index") {
-		t.Error("批次上传应继续豁免请求数配额，其成本由索引字节配额约束")
-	}
-	if isIndexQuotaExempt("POST", "/relay/index-jobs") {
-		t.Error("创建 job 应继续计入请求数配额")
 	}
 }
 

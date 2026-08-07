@@ -26,7 +26,7 @@ import (
 // 换模型必须重建索引：fingerprint 是配置身份的明文指纹，applied_fingerprint
 // 是 relay 已完成"清租户索引"的指纹。两者不一致时（含恢复平台默认），relay
 // 在下一个请求上惰性调用 codebase_clear_index 清空租户索引并推进
-// applied_fingerprint；插件随后的 find_missing 会看到空索引并自动全量重传。
+// applied_fingerprint；随后一次 codebase_index start 会看到空快照并返回全量待上传文件。
 //
 // MODEL_CONFIG_SECRET 未设置时整个特性关闭（不查表、不注入）。
 
@@ -132,13 +132,13 @@ func decryptModelConfig(enc string) (map[string]interface{}, error) {
 	return cfg, nil
 }
 
-// applyModelConfigChangeUnderLease clears both LCE data and relay snapshots.
+// applyModelConfigChangeUnderLease clears both LCE data and service snapshots.
 // The caller must hold the user's exclusive index-operation lease across this
 // function and the operation that consumes the newly applied configuration.
 func applyModelConfigChangeUnderLease(ctx context.Context, userID string, row *userModelConfigRow) error {
 	// 与 handleClearIndex 同一原则：不能让持 advisory 锁的 DB 事务横跨 LCE
 	// 网络调用会长期等待，不能占住连接池；也不能"先清 LCE 再提交 relay"——
-	// Commit 失败会留下 LCE 空/relay 快照满的永久不一致。顺序：
+	// Commit 失败会留下 LCE 空/服务端快照满的永久不一致。顺序：
 	//   1) 事务A 清 relay 快照并提交（可自愈：只会引发一次全量重传）；
 	//   2) 调 LCE 清租户索引；
 	//   3) 事务B 重新加锁推进 applied_fingerprint（带指纹复查防并发改配置）。
@@ -149,7 +149,7 @@ func applyModelConfigChangeUnderLease(ctx context.Context, userID string, row *u
 	}
 	if err := clearUserIndexStateTx(ctx, tx, userID); err != nil {
 		_ = tx.Rollback()
-		return fmt.Errorf("model config relay snapshot reset failed: %w", err)
+		return fmt.Errorf("model config service snapshot reset failed: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("model config snapshot reset commit failed: %w", err)

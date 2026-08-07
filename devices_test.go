@@ -42,7 +42,7 @@ func TestTrustedConsoleRequest(t *testing.T) {
 		{name: "missing token", method: http.MethodGet, path: "/mcp/tenant-stats", want: false},
 		{name: "wrong token", method: http.MethodGet, path: "/mcp/tenant-stats", token: "wrong", want: false},
 		{name: "wrong method", method: http.MethodPost, path: "/mcp/tenant-stats", token: validToken, want: false},
-		{name: "data plane path", method: http.MethodPost, path: "/relay/index-jobs", token: validToken, want: false},
+		{name: "public MCP path", method: http.MethodPost, path: "/mcp", token: validToken, want: false},
 	}
 
 	for _, test := range tests {

@@ -12,10 +12,8 @@ import (
 	"github.com/lib/pq"
 )
 
-// prepareIndexBatch 的错误分类是 handleRemoteIndex 状态码的唯一依据：
-//
-//	sql.ErrNoRows        -> 404 "index job not found"
-//	其它错误             -> 409 + 错误原文
+// prepareIndexBatch 的错误分类决定 codebase_index upload 返回给 Agent 的原因：
+// sql.ErrNoRows 只表示 "index job not found"，其它错误保留具体上下文。
 //
 // 因此"哪些情况允许外传 sql.ErrNoRows"是一条必须守住的不变量。它内部的
 // 查询里只有第一处（job 本身）允许外传 ErrNoRows；批量文件查询"查不到某个
@@ -77,7 +75,7 @@ func TestPrepareIndexBatchReportsMissingJobAsErrNoRows(t *testing.T) {
 			WithArgs("job-1", "user-1").
 			WillReturnError(sql.ErrNoRows)
 	}, func(tx *sql.Tx) {
-		_, _, _, err := prepareIndexBatch(context.Background(), tx, "user-1", remoteIndexRequest{
+		_, _, _, err := prepareIndexBatch(context.Background(), tx, "user-1", indexUploadRequest{
 			JobID: "job-1",
 			Files: []indexManifestFile{{Path: "a.go", Content: "x", Hash: "h1"}},
 		})
@@ -142,14 +140,14 @@ func TestPrepareIndexBatchDoesNotDisguiseUnknownFileAsMissingJob(t *testing.T) {
 			WithArgs("job-1", pq.Array([]string{"ghost.go"})).
 			WillReturnRows(jobFileRows())
 	}, func(tx *sql.Tx) {
-		_, _, _, err := prepareIndexBatch(context.Background(), tx, "user-1", remoteIndexRequest{
+		_, _, _, err := prepareIndexBatch(context.Background(), tx, "user-1", indexUploadRequest{
 			JobID: "job-1",
 			Files: []indexManifestFile{{Path: "ghost.go", Content: "x", Hash: "h1"}},
 		})
 		if err == nil {
 			t.Fatal("文件不在清单里时应当报错")
 		}
-		// 关键断言：不能是 ErrNoRows，否则调用方会回 404 index job not found
+		// 关键断言：不能是 ErrNoRows，否则调用方会误报 index job not found
 		if errors.Is(err, sql.ErrNoRows) {
 			t.Fatalf("文件级 ErrNoRows 不应外传，会被误判成 job 不存在: %v", err)
 		}
@@ -176,7 +174,7 @@ func TestPrepareIndexBatchDoesNotDisguiseVanishedJobAsMissingJob(t *testing.T) {
 			WithArgs("job-1").
 			WillReturnError(sql.ErrNoRows)
 	}, func(tx *sql.Tx) {
-		_, _, _, err := prepareIndexBatch(context.Background(), tx, "user-1", remoteIndexRequest{
+		_, _, _, err := prepareIndexBatch(context.Background(), tx, "user-1", indexUploadRequest{
 			JobID: "job-1",
 			Files: []indexManifestFile{{Path: "a.go", Content: "x", Hash: singleByteXHash}},
 		})
@@ -205,7 +203,7 @@ func TestPrepareIndexBatchStagesFilesOnHappyPath(t *testing.T) {
 			WithArgs("job-1").
 			WillReturnRows(sqlmock.NewRows([]string{"deletions_sent"}).AddRow(true))
 	}, func(tx *sql.Tx) {
-		job, staged, deleted, err := prepareIndexBatch(context.Background(), tx, "user-1", remoteIndexRequest{
+		job, staged, deleted, err := prepareIndexBatch(context.Background(), tx, "user-1", indexUploadRequest{
 			JobID: "job-1",
 			Files: []indexManifestFile{{Path: "a.go", Content: "x", Hash: singleByteXHash}},
 		})
@@ -236,12 +234,12 @@ func TestPrepareIndexBatchRejectsRootMismatch(t *testing.T) {
 			WithArgs("job-1", "user-1").
 			WillReturnRows(row)
 	}, func(tx *sql.Tx) {
-		_, _, _, err := prepareIndexBatch(context.Background(), tx, "user-1", remoteIndexRequest{
+		_, _, _, err := prepareIndexBatch(context.Background(), tx, "user-1", indexUploadRequest{
 			JobID:  "job-1",
 			RootID: "another-root",
 			Files:  []indexManifestFile{{Path: "a.go", Content: "x", Hash: "h1"}},
 		})
-		if err == nil || !strings.Contains(err.Error(), "rootId does not match") {
+		if err == nil || !strings.Contains(err.Error(), "root_id does not match") {
 			t.Fatalf("expected root mismatch error, got %v", err)
 		}
 	})
@@ -257,7 +255,7 @@ func TestPrepareIndexBatchRejectsStaleFileWithoutErrNoRows(t *testing.T) {
 			WithArgs("job-1", pq.Array([]string{"a.go"})).
 			WillReturnRows(jobFileRows().AddRow("a.go", "server-hash", 1, 3, true, false))
 	}, func(tx *sql.Tx) {
-		_, _, _, err := prepareIndexBatch(context.Background(), tx, "user-1", remoteIndexRequest{
+		_, _, _, err := prepareIndexBatch(context.Background(), tx, "user-1", indexUploadRequest{
 			JobID: "job-1",
 			// 客户端上报的 hash 与服务端记录不一致
 			Files: []indexManifestFile{{Path: "a.go", Content: "x", Hash: "client-hash"}},

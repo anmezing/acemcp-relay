@@ -73,6 +73,7 @@ const (
 
 	HealthCheckInterval = 2 * time.Minute
 	HealthCheckTimeout  = 30 * time.Second
+	maxClientMCPBody    = 32 << 20
 )
 
 func loadConfig() {
@@ -111,8 +112,8 @@ func loadConfig() {
 	deviceMaxIPs = getEnvInt("DEVICE_MAX_IPS", 3)
 	configureTrustedConsole(getEnv("CONSOLE_API_SECRET", ""))
 	defaultDailyRequestLimit = getEnvInt("DEFAULT_DAILY_REQUEST_LIMIT", 0)
-	// 索引通道按字节计费，与请求数配额分开：一次 job 创建只算 1 个请求，但随后
-	// 的批次上传可以推送任意多的内容，请求数配额对这条路径几乎没有约束力。
+	// 索引通道除常规请求数配额外，还按上传字节计费：同样一次 upload 可以只带
+	// 几字节，也可以携带一整批源码，请求数无法反映实际 embedding 成本。
 	dailyIndexBytesLimit = getEnvInt64("DAILY_INDEX_BYTES_LIMIT", defaultDailyIndexBytes)
 	initModelConfigKey()
 	debugCapturePaths = parsePathSet(getEnv("DEBUG_CAPTURE_PATHS", ""))
@@ -751,12 +752,10 @@ func authMiddleware() gin.HandlerFunc {
 				return
 			}
 
-			if !isIndexQuotaExempt(c.Request.Method, c.Request.URL.Path) {
-				if ok, limit := checkRequestQuota(userID); !ok {
-					c.Header("Retry-After", quotaRetryAfterHeader(time.Now()))
-					c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{"error": fmt.Sprintf("daily request quota exceeded (%d/day)", limit)})
-					return
-				}
+			if ok, limit := checkRequestQuota(userID); !ok {
+				c.Header("Retry-After", quotaRetryAfterHeader(time.Now()))
+				c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{"error": fmt.Sprintf("daily request quota exceeded (%d/day)", limit)})
+				return
 			}
 
 			if deviceID != "" {
@@ -791,23 +790,6 @@ func authMiddleware() gin.HandlerFunc {
 
 		c.Next()
 	}
-}
-
-func isIndexControlPath(requestPath string) bool {
-	return requestPath == "/relay/remote-index" ||
-		requestPath == "/relay/capabilities" ||
-		requestPath == "/relay/index-jobs" ||
-		strings.HasPrefix(requestPath, "/relay/index-jobs/")
-}
-
-// isIndexQuotaExempt 让一次索引任务只在创建时计 1 次配额：轮询、batch 上传和
-// 完成/失败上报都是同一次扫描的内部步骤，不重复计费；但创建不能豁免，否则
-// 索引通道可以零成本无限驱动 LCE embedding。
-func isIndexQuotaExempt(method, requestPath string) bool {
-	if !isIndexControlPath(requestPath) {
-		return false
-	}
-	return !(method == http.MethodPost && requestPath == "/relay/index-jobs")
 }
 
 // ── 请求日志 ──────────────────────────────────────────────────────────────
@@ -908,8 +890,8 @@ func updateRequestPathAsync(logID string, newPath string, insertDone <-chan stru
 
 const (
 	mcpProtocolVersion      = "2025-03-26"
-	mcpRelayName            = "lce-relay"
-	mcpRelayVersion         = "1.0.0"
+	mcpServerName           = "lce"
+	mcpServerVersion        = "2.0.0"
 	mcpSessionTTL           = 30 * time.Minute
 	mcpSessionSweepInterval = 60 * time.Second
 	mcpMaxSessions          = 1000
@@ -928,7 +910,7 @@ type chatMCPToolPolicy struct {
 // future local/admin capabilities cannot become remotely callable by accident.
 var chatMCPToolPolicies = map[string]chatMCPToolPolicy{
 	"codebase-retrieval": {
-		description: "Search the authenticated user's server-side LCE index. Use information_request for the semantic goal and technical_terms for exact identifier hints. Returns a tenant context pack; local worktree, Git, connectors, workflows, and context_bundle are not available through Relay.",
+		description: "Search the authenticated user's server-side LCE index. Use information_request for the semantic goal and technical_terms for exact identifier hints. Returns a tenant context pack; local worktree, Git, connectors, workflows, and context_bundle are not available through this remote service.",
 		arguments: stringSet(
 			"information_request",
 			"technical_terms",
@@ -937,7 +919,7 @@ var chatMCPToolPolicies = map[string]chatMCPToolPolicy{
 		required: stringSet("information_request"),
 	},
 	"codebase_symbol_graph": {
-		description: "Query the authenticated user's server-side symbol graph for definitions, references, callers, callees, importers, related tests, and bounded impact. root_id is required because indexing protocol v1 never writes to the shared default root; Relay supplies the tenant identity.",
+		description: "Query the authenticated user's server-side symbol graph for definitions, references, callers, callees, importers, related tests, and bounded impact. root_id is required because indexing protocol v1 never writes to the shared default root; the service supplies the tenant identity.",
 		arguments: stringSet(
 			"root_id",
 			"symbol",
@@ -951,7 +933,7 @@ var chatMCPToolPolicies = map[string]chatMCPToolPolicy{
 		required: stringSet("root_id", "symbol"),
 	},
 	"codebase_tenant_stats": {
-		description: "Return aggregate statistics for the authenticated user's server-side LCE index. Relay supplies the tenant identity.",
+		description: "Return aggregate statistics for the authenticated user's server-side LCE index. The service supplies the tenant identity.",
 		arguments:   stringSet("response_format"),
 	},
 }
@@ -974,6 +956,9 @@ func sortedStringSetKeys(values map[string]struct{}) []string {
 }
 
 func isChatMCPToolAllowed(name string) bool {
+	if strings.TrimSpace(name) == codebaseIndexToolName {
+		return true
+	}
 	_, allowed := chatMCPToolPolicies[strings.TrimSpace(name)]
 	return allowed
 }
@@ -1071,7 +1056,7 @@ func filterChatMCPTools(raw json.RawMessage) (json.RawMessage, error) {
 			return nil, fmt.Errorf("parse MCP tool metadata: %w", err)
 		}
 		metadata.Name = strings.TrimSpace(metadata.Name)
-		if !isChatMCPToolAllowed(metadata.Name) {
+		if _, allowed := chatMCPToolPolicies[metadata.Name]; !allowed {
 			continue
 		}
 		if _, duplicate := seen[metadata.Name]; duplicate {
@@ -1092,7 +1077,7 @@ func filterChatMCPTools(raw json.RawMessage) (json.RawMessage, error) {
 	}
 	if len(missing) > 0 {
 		sort.Strings(missing)
-		return nil, fmt.Errorf("upstream LCE is missing required Relay MCP tools: %s", strings.Join(missing, ", "))
+		return nil, fmt.Errorf("upstream LCE is missing required public MCP tools: %s", strings.Join(missing, ", "))
 	}
 	return json.Marshal(filtered)
 }
@@ -1284,6 +1269,10 @@ func getCachedToolsList(ctx context.Context) (json.RawMessage, error) {
 	if err != nil {
 		return nil, err
 	}
+	tools, err = appendCodebaseIndexTool(tools)
+	if err != nil {
+		return nil, err
+	}
 
 	toolsCacheMu.Lock()
 	toolsCache = tools
@@ -1296,10 +1285,15 @@ func getCachedToolsList(ctx context.Context) (json.RawMessage, error) {
 func handleMCPPost(c *gin.Context) {
 	userID := c.GetString(ContextKeyUserID)
 
-	body, err := io.ReadAll(c.Request.Body)
+	body, err := io.ReadAll(io.LimitReader(c.Request.Body, maxClientMCPBody+1))
 	if err != nil {
 		c.JSON(http.StatusBadRequest, rpcError(nil, -32700, "failed to read request body"))
 		completeRequestLogAsync(getRequestLogEntry(c, http.StatusBadRequest))
+		return
+	}
+	if len(body) > maxClientMCPBody {
+		c.JSON(http.StatusRequestEntityTooLarge, rpcError(nil, -32600, "MCP request body exceeds 32 MiB"))
+		completeRequestLogAsync(getRequestLogEntry(c, http.StatusRequestEntityTooLarge))
 		return
 	}
 
@@ -1352,7 +1346,7 @@ func handleMCPPost(c *gin.Context) {
 		c.JSON(http.StatusOK, rpcResult(rpc.ID, map[string]interface{}{
 			"protocolVersion": mcpProtocolVersion,
 			"capabilities":    map[string]interface{}{"tools": map[string]interface{}{}},
-			"serverInfo":      map[string]interface{}{"name": mcpRelayName, "version": mcpRelayVersion},
+			"serverInfo":      map[string]interface{}{"name": mcpServerName, "version": mcpServerVersion},
 		}))
 		completeRequestLogAsync(getRequestLogEntry(c, http.StatusOK))
 		log.Printf("[MCP_SERVER] Session created: %s for user %s", newSID, userID)
@@ -1429,6 +1423,54 @@ func handleMCPToolsCall(c *gin.Context, id json.RawMessage, params json.RawMessa
 
 	if p.Arguments == nil {
 		p.Arguments = make(map[string]interface{})
+	}
+	if p.Name == codebaseIndexToolName {
+		payload, err := handleCodebaseIndex(c.Request.Context(), userID, p.Arguments)
+		if err != nil {
+			if errors.Is(c.Request.Context().Err(), context.Canceled) {
+				completeRequestLogAsync(getRequestLogEntry(c, 499))
+				return
+			}
+			errorSource := "relay"
+			var upstreamErr *indexUpstreamError
+			if errors.As(err, &upstreamErr) {
+				errorSource = "lce"
+			}
+			saveErrorDetailsAsync(logIDVal, errorSource, err.Error(), getInsertDone(c))
+			encoded, _ := json.Marshal(map[string]interface{}{
+				"schemaVersion":  "1.0",
+				"toolName":       codebaseIndexToolName,
+				"ok":             false,
+				"tool":           codebaseIndexToolName,
+				"responseFormat": "json",
+				"error":          map[string]interface{}{"message": err.Error()},
+			})
+			c.JSON(http.StatusOK, rpcResult(id, map[string]interface{}{
+				"content": []map[string]interface{}{{"type": "text", "text": string(encoded)}},
+				"isError": true,
+			}))
+			completeRequestLogAsync(getRequestLogEntry(c, http.StatusOK))
+			return
+		}
+		encoded, err := json.Marshal(map[string]interface{}{
+			"schemaVersion":  "1.0",
+			"toolName":       codebaseIndexToolName,
+			"ok":             true,
+			"tool":           codebaseIndexToolName,
+			"responseFormat": "json",
+			"payload":        payload,
+		})
+		if err != nil {
+			c.JSON(http.StatusOK, rpcError(id, -32000, "encode index response: "+err.Error()))
+			completeRequestLogAsync(getRequestLogEntry(c, http.StatusOK))
+			return
+		}
+		c.JSON(http.StatusOK, rpcResult(id, map[string]interface{}{
+			"content": []map[string]interface{}{{"type": "text", "text": string(encoded)}},
+			"isError": false,
+		}))
+		completeRequestLogAsync(getRequestLogEntry(c, http.StatusOK))
+		return
 	}
 	if err := validateChatMCPToolArgs(p.Name, p.Arguments); err != nil {
 		c.JSON(http.StatusOK, rpcError(id, -32602, err.Error()))
@@ -2074,12 +2116,6 @@ func main() {
 	r.POST("/mcp/clear-index", handleClearIndex)
 	r.GET("/mcp/tenant-stats", handleTenantStats)
 
-	r.GET("/relay/capabilities", handleRelayCapabilities)
-	r.POST("/relay/index-jobs", handleCreateIndexJob)
-	r.GET("/relay/index-jobs/:id", handleGetIndexJob)
-	r.POST("/relay/index-jobs/:id/complete", handleCompleteIndexJob)
-	r.POST("/relay/index-jobs/:id/fail", handleFailIndexJob)
-	r.POST("/relay/remote-index", handleRemoteIndex)
 	r.NoRoute(func(c *gin.Context) {
 		if shouldDebugCapture(c.Request.URL.Path) {
 			body, _ := io.ReadAll(c.Request.Body)

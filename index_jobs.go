@@ -7,14 +7,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"net/http"
 	"path"
 	"regexp"
 	"sort"
 	"strings"
 	"time"
 
-	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/lib/pq"
 )
@@ -33,7 +31,7 @@ const (
 	// 单个文件的内容上限。源码文件极少接近这个量级，而 embedding 本身也有
 	// token 上限——超过这个大小的"源码"要么是生成物要么是灌进来的负载。
 	maxIndexFileBytes = 512 << 10 // 512 KiB
-	// 单批内容总量上限。它也决定插件报告进度和失败重试的粒度。
+	// 单批内容总量上限。它也决定 Agent 报告进度和失败重试的粒度。
 	maxIndexBatchBytes = 512 << 10 // 512 KiB
 	// LCE's container entry point accepts a 4 MiB complete JSON-RPC body. Raw
 	// source is capped much lower because JSON escaping can expand a byte to a
@@ -46,74 +44,65 @@ const (
 	indexProtocolVersion   = 1
 )
 
+type indexUpstreamError struct {
+	err error
+}
+
+func (e *indexUpstreamError) Error() string { return e.err.Error() }
+func (e *indexUpstreamError) Unwrap() error { return e.err }
+
+func newIndexUpstreamError(format string, args ...interface{}) error {
+	return &indexUpstreamError{err: fmt.Errorf(format, args...)}
+}
+
 type indexManifestFile struct {
 	Path            string `json:"path"`
 	Hash            string `json:"hash"`
 	Size            int64  `json:"size"`
-	EstimatedChunks int    `json:"estimatedChunks"`
+	EstimatedChunks int    `json:"estimated_chunks"`
 	Content         string `json:"content,omitempty"`
 }
 
-type createIndexJobRequest struct {
-	ProtocolVersion int                 `json:"protocolVersion"`
-	WorkspaceID     string              `json:"workspaceId"`
-	WorkspaceName   string              `json:"workspaceName"`
-	Branch          string              `json:"branch"`
-	Revision        string              `json:"revision"`
-	Files           []indexManifestFile `json:"files"`
-	UnreadableFiles []string            `json:"unreadableFiles"`
-	RootID          string              `json:"rootId"`
-}
-
-type relayIndexingCapabilities struct {
-	ProtocolVersion  int   `json:"protocolVersion"`
-	MaxManifestFiles int   `json:"maxManifestFiles"`
-	MaxBatchFiles    int   `json:"maxBatchFiles"`
-	MaxFileBytes     int64 `json:"maxFileBytes"`
-	MaxBatchBytes    int64 `json:"maxBatchBytes"`
-}
-
-func handleRelayCapabilities(c *gin.Context) {
-	finishJSON(c, http.StatusOK, gin.H{
-		"indexing": relayIndexingCapabilities{
-			ProtocolVersion:  indexProtocolVersion,
-			MaxManifestFiles: maxIndexManifestFiles,
-			MaxBatchFiles:    maxIndexBatchFiles,
-			MaxFileBytes:     maxIndexFileBytes,
-			MaxBatchBytes:    maxIndexBatchBytes,
-		},
-	})
+type indexStartRequest struct {
+	ProtocolVersion int
+	WorkspaceID     string
+	WorkspaceName   string
+	Branch          string
+	Revision        string
+	Files           []indexManifestFile
+	UnreadableFiles []string
+	RootID          string
 }
 
 type indexJobView struct {
 	ID                  string     `json:"id"`
-	WorkspaceID         string     `json:"workspaceId"`
-	WorkspaceName       string     `json:"workspaceName"`
-	RootID              string     `json:"rootId"`
+	WorkspaceID         string     `json:"workspace_id"`
+	WorkspaceName       string     `json:"workspace_name"`
+	RootID              string     `json:"root_id"`
 	Branch              string     `json:"branch"`
 	Revision            string     `json:"revision"`
 	Mode                string     `json:"mode"`
 	Phase               string     `json:"phase"`
 	Status              string     `json:"status"`
-	WorkspaceFiles      int        `json:"workspaceFiles"`
-	TotalFiles          int        `json:"totalFiles"`
-	IndexedFiles        int        `json:"indexedFiles"`
-	FailedFiles         int        `json:"failedFiles"`
-	TotalChunks         int64      `json:"totalChunks"`
-	IndexedChunks       int64      `json:"indexedChunks"`
-	ChunkCountEstimated bool       `json:"chunkCountEstimated"`
-	DeletedCount        int        `json:"deletedCount"`
+	WorkspaceFiles      int        `json:"workspace_files"`
+	TotalFiles          int        `json:"total_files"`
+	IndexedFiles        int        `json:"indexed_files"`
+	FailedFiles         int        `json:"failed_files"`
+	TotalChunks         int64      `json:"total_chunks"`
+	IndexedChunks       int64      `json:"indexed_chunks"`
+	ChunkCountEstimated bool       `json:"chunk_count_estimated"`
+	DeletedCount        int        `json:"deleted_count"`
 	Error               string     `json:"error,omitempty"`
-	StartedAt           time.Time  `json:"startedAt"`
-	HeartbeatAt         time.Time  `json:"heartbeatAt"`
-	CompletedAt         *time.Time `json:"completedAt,omitempty"`
+	StartedAt           time.Time  `json:"started_at"`
+	HeartbeatAt         time.Time  `json:"heartbeat_at"`
+	CompletedAt         *time.Time `json:"completed_at,omitempty"`
 	ModelFingerprint    string     `json:"-"`
 }
 
 type createIndexJobResponse struct {
 	Job          indexJobView `json:"job"`
-	PendingFiles []string     `json:"pendingFiles"`
-	DeletedFiles []string     `json:"deletedFiles"`
+	PendingFiles []string     `json:"pending_files"`
+	DeletedFiles []string     `json:"deleted_files"`
 }
 
 func migrateIndexingTables() error {
@@ -365,8 +354,8 @@ func workspaceRootBindingChanged(exists bool, storedRootID, requestedRootID stri
 
 // A workspace moving between roots invalidates the old root, not the whole
 // tenant. Legacy data may bind several workspaces to the default root, so
-// every Relay snapshot bound to oldRootID is invalidated together. The old
-// binding remains the durable retry marker until both LCE and Relay cleanup
+// every service snapshot bound to oldRootID is invalidated together. The old
+// binding remains the durable retry marker until both LCE and service cleanup
 // succeed.
 func resetWorkspaceRootBinding(ctx context.Context, userID, workspaceID, oldRootID, newRootID string) error {
 	result, err := lce.callToolWithTimeout(
@@ -376,17 +365,17 @@ func resetWorkspaceRootBinding(ctx context.Context, userID, workspaceID, oldRoot
 		remoteIndexMCPCallTimeout,
 	)
 	if err != nil {
-		return fmt.Errorf("clear old LCE root for workspace root migration: %w", err)
+		return newIndexUpstreamError("clear old LCE root for workspace root migration: %w", err)
 	}
 	if result == nil || result.IsError {
 		detail := "empty LCE response"
 		if result != nil {
 			detail = string(result.Content)
 		}
-		return fmt.Errorf("clear old LCE root for workspace root migration: %s", detail)
+		return newIndexUpstreamError("clear old LCE root for workspace root migration: %s", detail)
 	}
 	if err := clearRootIndexState(ctx, userID, oldRootID); err != nil {
-		return fmt.Errorf("clear Relay snapshots bound to old root: %w", err)
+		return fmt.Errorf("clear service snapshots bound to old root: %w", err)
 	}
 	log.Printf(
 		"[INDEX] Reset old root for tenant %s after workspace %s changed from %q to %q",
@@ -398,18 +387,13 @@ func resetWorkspaceRootBinding(ctx context.Context, userID, workspaceID, oldRoot
 	return nil
 }
 
-func handleCreateIndexJob(c *gin.Context) {
-	userID := c.GetString(ContextKeyUserID)
-	var req createIndexJobRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		finishJSON(c, http.StatusBadRequest, gin.H{"error": "invalid request body"})
-		return
-	}
+func createIndexJob(ctx context.Context, userID string, req indexStartRequest) (createIndexJobResponse, error) {
 	if req.ProtocolVersion != indexProtocolVersion {
-		finishJSON(c, http.StatusConflict, gin.H{
-			"error": fmt.Sprintf("unsupported indexing protocol version %d (server requires %d)", req.ProtocolVersion, indexProtocolVersion),
-		})
-		return
+		return createIndexJobResponse{}, fmt.Errorf(
+			"unsupported indexing protocol version %d (server requires %d)",
+			req.ProtocolVersion,
+			indexProtocolVersion,
+		)
 	}
 	req.WorkspaceID = strings.TrimSpace(req.WorkspaceID)
 	req.WorkspaceName = strings.TrimSpace(req.WorkspaceName)
@@ -417,38 +401,31 @@ func handleCreateIndexJob(c *gin.Context) {
 	req.Revision = strings.TrimSpace(req.Revision)
 	req.RootID = normalizeIndexRootID(req.RootID)
 	if req.WorkspaceID == "" || len(req.WorkspaceID) > 128 {
-		finishJSON(c, http.StatusBadRequest, gin.H{"error": "workspaceId is required"})
-		return
+		return createIndexJobResponse{}, fmt.Errorf("workspace_id is required and must not exceed 128 bytes")
 	}
 	if req.RootID == "" {
-		finishJSON(c, http.StatusBadRequest, gin.H{"error": "rootId is required by indexing protocol v1"})
-		return
+		return createIndexJobResponse{}, fmt.Errorf("root_id is required by indexing protocol v1")
 	}
 	if len(req.RootID) > maxIndexRootIDLen {
-		finishJSON(c, http.StatusBadRequest, gin.H{"error": fmt.Sprintf("rootId exceeds %d bytes", maxIndexRootIDLen)})
-		return
+		return createIndexJobResponse{}, fmt.Errorf("root_id exceeds %d bytes", maxIndexRootIDLen)
 	}
 	files, err := normalizeManifest(req.Files)
 	if err != nil {
-		finishJSON(c, http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
+		return createIndexJobResponse{}, err
 	}
-	lease, err := acquireExclusiveIndexOperation(c.Request.Context(), userID, "create-job")
+	lease, err := acquireExclusiveIndexOperation(ctx, userID, "create-job")
 	if err != nil {
-		finishIndexError(c, err)
-		return
+		return createIndexJobResponse{}, err
 	}
 	defer lease.Release()
 	opCtx := lease.Context()
 	_, modelFingerprint, err := resolveModelConfigUnderExclusiveLease(opCtx, userID)
 	if err != nil {
-		finishJSON(c, http.StatusServiceUnavailable, gin.H{"error": err.Error()})
-		return
+		return createIndexJobResponse{}, err
 	}
 	storedRootID, workspaceExistsBeforeReset, err := loadIndexedWorkspaceRoot(opCtx, userID, req.WorkspaceID)
 	if err != nil {
-		finishIndexError(c, err)
-		return
+		return createIndexJobResponse{}, err
 	}
 	if workspaceRootBindingChanged(workspaceExistsBeforeReset, storedRootID, req.RootID) {
 		if err := resetWorkspaceRootBinding(
@@ -458,15 +435,13 @@ func handleCreateIndexJob(c *gin.Context) {
 			storedRootID,
 			req.RootID,
 		); err != nil {
-			finishJSON(c, http.StatusServiceUnavailable, gin.H{"error": err.Error()})
-			return
+			return createIndexJobResponse{}, err
 		}
 	}
 
 	tx, err := beginLockedIndexUserTx(opCtx, userID)
 	if err != nil {
-		finishIndexError(c, err)
-		return
+		return createIndexJobResponse{}, err
 	}
 	defer tx.Rollback()
 
@@ -478,8 +453,7 @@ func handleCreateIndexJob(c *gin.Context) {
 		)
 	`, userID, req.WorkspaceID, indexJobStatusRunning)
 	if err != nil {
-		finishIndexError(c, err)
-		return
+		return createIndexJobResponse{}, err
 	}
 	_, err = tx.ExecContext(opCtx, `
 		UPDATE index_jobs
@@ -488,14 +462,12 @@ func handleCreateIndexJob(c *gin.Context) {
 		WHERE user_id = $2 AND workspace_id = $3 AND status = $4
 	`, indexJobStatusSuperseded, userID, req.WorkspaceID, indexJobStatusRunning)
 	if err != nil {
-		finishIndexError(c, err)
-		return
+		return createIndexJobResponse{}, err
 	}
 
 	previous, err := loadIndexedSnapshot(opCtx, tx, userID, req.WorkspaceID)
 	if err != nil {
-		finishIndexError(c, err)
-		return
+		return createIndexJobResponse{}, err
 	}
 	var workspaceExists bool
 	err = tx.QueryRowContext(opCtx, `
@@ -504,14 +476,12 @@ func handleCreateIndexJob(c *gin.Context) {
 		)
 	`, userID, req.WorkspaceID).Scan(&workspaceExists)
 	if err != nil {
-		finishIndexError(c, err)
-		return
+		return createIndexJobResponse{}, err
 	}
 
 	files, err = graftUnreadablePaths(previous, files, req.UnreadableFiles)
 	if err != nil {
-		finishJSON(c, http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
+		return createIndexJobResponse{}, err
 	}
 
 	pending, deleted, estimatedChunks := diffManifest(previous, files)
@@ -532,8 +502,7 @@ func handleCreateIndexJob(c *gin.Context) {
 	`, jobID, userID, req.WorkspaceID, req.WorkspaceName, req.RootID, req.Branch, req.Revision, mode,
 		len(files), len(pending), estimatedChunks, len(deleted), modelFingerprint)
 	if err != nil {
-		finishIndexError(c, err)
-		return
+		return createIndexJobResponse{}, err
 	}
 
 	// COPY 批量写入 manifest：10 万文件逐条 INSERT 要 10 万次网络往返，
@@ -542,60 +511,54 @@ func handleCreateIndexJob(c *gin.Context) {
 		"index_job_files", "job_id", "path", "hash", "size", "estimated_chunks", "needs_index",
 	))
 	if err != nil {
-		finishIndexError(c, err)
-		return
+		return createIndexJobResponse{}, err
 	}
 	for _, file := range files {
 		if _, err := stmt.ExecContext(opCtx, jobID, file.Path, file.Hash, file.Size, file.EstimatedChunks, pendingSet[file.Path]); err != nil {
-			stmt.Close()
-			finishIndexError(c, err)
-			return
+			_ = stmt.Close()
+			return createIndexJobResponse{}, err
 		}
 	}
 	// 无参 Exec 刷出 COPY 缓冲；错误（如约束冲突）大多在这里才暴露。
 	if _, err := stmt.ExecContext(opCtx); err != nil {
-		stmt.Close()
-		finishIndexError(c, err)
-		return
+		_ = stmt.Close()
+		return createIndexJobResponse{}, err
 	}
 	if err := stmt.Close(); err != nil {
-		finishIndexError(c, err)
-		return
+		return createIndexJobResponse{}, err
 	}
 
 	if err := tx.Commit(); err != nil {
-		finishIndexError(c, err)
-		return
+		return createIndexJobResponse{}, err
 	}
-	job, err := loadIndexJob(c.Request.Context(), userID, jobID)
+	job, err := loadIndexJob(opCtx, userID, jobID)
 	if err != nil {
-		finishIndexError(c, err)
-		return
+		return createIndexJobResponse{}, err
 	}
-	finishJSON(c, http.StatusCreated, createIndexJobResponse{
+	return createIndexJobResponse{
 		Job:          job,
 		PendingFiles: pending,
 		DeletedFiles: deleted,
-	})
+	}, nil
 }
 
-func handleGetIndexJob(c *gin.Context) {
-	userID := c.GetString(ContextKeyUserID)
-	jobID := strings.TrimSpace(c.Param("id"))
-	_, _ = db.ExecContext(c.Request.Context(), `
+func getIndexJob(ctx context.Context, userID, jobID string) (indexJobView, error) {
+	jobID = strings.TrimSpace(jobID)
+	if jobID == "" {
+		return indexJobView{}, fmt.Errorf("index job id is required")
+	}
+	_, _ = db.ExecContext(ctx, `
 		UPDATE index_jobs SET heartbeat_at = NOW()
 		WHERE id = $1 AND user_id = $2 AND status = $3
 	`, jobID, userID, indexJobStatusRunning)
-	job, err := loadIndexJob(c.Request.Context(), userID, jobID)
+	job, err := loadIndexJob(ctx, userID, jobID)
 	if err == sql.ErrNoRows {
-		finishJSON(c, http.StatusNotFound, gin.H{"error": "index job not found"})
-		return
+		return indexJobView{}, fmt.Errorf("index job not found")
 	}
 	if err != nil {
-		finishIndexError(c, err)
-		return
+		return indexJobView{}, err
 	}
-	finishJSON(c, http.StatusOK, gin.H{"job": job})
+	return job, nil
 }
 
 func loadIndexJob(ctx context.Context, userID, jobID string) (indexJobView, error) {
@@ -627,12 +590,17 @@ func loadIndexJobFrom(ctx context.Context, queryer indexJobQueryer, userID, jobI
 	return job, err
 }
 
-type remoteIndexRequest struct {
-	JobID string              `json:"jobId"`
-	Files []indexManifestFile `json:"files"`
-	// 仓库维度：多 root 工作区按文件夹拆分索引任务，每个 job 一个稳定 rootId。
-	// 同一 job 的所有批次必须携带相同且非空的 rootId。
-	RootID string `json:"rootId"`
+type indexUploadRequest struct {
+	JobID string
+	Files []indexManifestFile
+	// 仓库维度：多 root 工作区按文件夹拆分索引任务，每个 job 一个稳定 root_id。
+	// 同一 job 的所有批次必须携带相同且非空的 root_id。
+	RootID string
+}
+
+type indexBatchResponse struct {
+	Job indexJobView `json:"job"`
+	LCE interface{}  `json:"lce"`
 }
 
 const maxIndexRootIDLen = 128
@@ -671,46 +639,35 @@ func validateIndexBatchSize(files []indexManifestFile) (int64, error) {
 	return total, nil
 }
 
-func handleRemoteIndex(c *gin.Context) {
-	userID := c.GetString(ContextKeyUserID)
-	var req remoteIndexRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		finishJSON(c, http.StatusBadRequest, gin.H{"error": "invalid request body"})
-		return
-	}
+func uploadIndexBatch(ctx context.Context, userID string, req indexUploadRequest) (indexBatchResponse, error) {
 	req.JobID = strings.TrimSpace(req.JobID)
 	req.RootID = normalizeIndexRootID(req.RootID)
 	if req.JobID == "" || req.RootID == "" || len(req.Files) > maxIndexBatchFiles || len(req.RootID) > maxIndexRootIDLen {
-		finishJSON(c, http.StatusBadRequest, gin.H{"error": "invalid index batch"})
-		return
+		return indexBatchResponse{}, fmt.Errorf("invalid index batch")
 	}
 
 	// 体积校验放在最前：这些字节最终都会变成 embedding 调用，超限的批次不该
 	// 走到建事务、查 manifest 这些更贵的步骤。
 	_, err := validateIndexBatchSize(req.Files)
 	if err != nil {
-		finishJSON(c, http.StatusRequestEntityTooLarge, gin.H{"error": err.Error()})
-		return
+		return indexBatchResponse{}, err
 	}
 	lease, err := acquireSharedIndexOperation(
-		c.Request.Context(), userID, indexJobOperationResource(req.JobID), "upload-batch",
+		ctx, userID, indexJobOperationResource(req.JobID), "upload-batch",
 	)
 	if err != nil {
-		finishIndexError(c, err)
-		return
+		return indexBatchResponse{}, err
 	}
 	defer lease.Release()
 	opCtx := lease.Context()
 	modelConfig, modelRow, err := loadModelConfigArg(opCtx, userID)
 	if err != nil {
-		finishJSON(c, http.StatusServiceUnavailable, gin.H{"error": err.Error()})
-		return
+		return indexBatchResponse{}, err
 	}
 	modelFingerprint := ""
 	if modelRow != nil {
 		if modelRow.Applied != modelRow.Fingerprint {
-			finishJSON(c, http.StatusConflict, gin.H{"error": "model configuration changed; start a new index job"})
-			return
+			return indexBatchResponse{}, fmt.Errorf("model configuration changed; start a new index job")
 		}
 		modelFingerprint = modelRow.Fingerprint
 	}
@@ -720,35 +677,29 @@ func handleRemoteIndex(c *gin.Context) {
 	// 几十个并发 embedding 批次就会把连接占光，阻塞全站的 DB 访问。
 	tx, err := beginLockedIndexUserTx(opCtx, userID)
 	if err != nil {
-		finishIndexError(c, err)
-		return
+		return indexBatchResponse{}, err
 	}
 	job, staged, deleted, err := prepareIndexBatch(opCtx, tx, userID, req)
 	// 不变量：prepareIndexBatch 只在"job 不存在或不属于该用户"这一种情况下
 	// 外传 sql.ErrNoRows；它内部的按文件、按 job 字段查询都会把各自的 ErrNoRows
-	// 包装成带上下文的错误。新增查询时请保持这条，否则 404 会指向错误的原因。
+	// 包装成带上下文的错误。新增查询时请保持这条，否则会被误报为 job 不存在。
 	if err == sql.ErrNoRows {
 		_ = tx.Rollback()
-		finishJSON(c, http.StatusNotFound, gin.H{"error": "index job not found"})
-		return
+		return indexBatchResponse{}, fmt.Errorf("index job not found")
 	}
 	if err != nil {
 		_ = tx.Rollback()
-		finishJSON(c, http.StatusConflict, gin.H{"error": err.Error()})
-		return
+		return indexBatchResponse{}, err
 	}
 	if err := tx.Commit(); err != nil {
-		finishIndexError(c, err)
-		return
+		return indexBatchResponse{}, err
 	}
 	if job.ModelFingerprint != modelFingerprint {
-		finishJSON(c, http.StatusConflict, gin.H{"error": "index job model configuration is stale; start a new index job"})
-		return
+		return indexBatchResponse{}, fmt.Errorf("index job model configuration is stale; start a new index job")
 	}
 	batchBytes, err := validateIndexBatchSize(staged)
 	if err != nil {
-		finishJSON(c, http.StatusRequestEntityTooLarge, gin.H{"error": err.Error()})
-		return
+		return indexBatchResponse{}, err
 	}
 	filesArg := make([]map[string]interface{}, 0, len(staged))
 	for _, file := range staged {
@@ -765,24 +716,22 @@ func handleRemoteIndex(c *gin.Context) {
 		args["model_config"] = modelConfig
 	}
 	if _, err := validateMCPToolCallBody("codebase_remote_index", args); err != nil {
-		finishJSON(c, http.StatusRequestEntityTooLarge, gin.H{"error": err.Error()})
-		return
+		return indexBatchResponse{}, err
 	}
 	if ok, used, limit := chargeIndexBytes(userID, batchBytes); !ok {
-		c.Header("Retry-After", quotaRetryAfterHeader(time.Now()))
-		finishJSON(c, http.StatusTooManyRequests, gin.H{
-			"error": fmt.Sprintf("daily index quota exceeded (%d/%d bytes)", used, limit),
-		})
-		return
+		return indexBatchResponse{}, fmt.Errorf(
+			"daily index quota exceeded (%d/%d bytes); retry after %s seconds",
+			used,
+			limit,
+			quotaRetryAfterHeader(time.Now()),
+		)
 	}
 	result, err := lce.callToolWithTimeout(opCtx, "codebase_remote_index", args, remoteIndexMCPCallTimeout)
 	if err != nil {
-		finishIndexToolError(c, err)
-		return
+		return indexBatchResponse{}, newIndexUpstreamError("LCE index call failed: %w", err)
 	}
 	if result.IsError {
-		finishIndexToolError(c, fmt.Errorf("%s", string(result.Content)))
-		return
+		return indexBatchResponse{}, newIndexUpstreamError("LCE index call failed: %s", string(result.Content))
 	}
 
 	chunks, exact := extractChunkCount(result.Content)
@@ -797,31 +746,27 @@ func handleRemoteIndex(c *gin.Context) {
 	// embedding 工作计费，即使后续提交失败也不回退，避免重放绕过成本上限。
 	tx2, err := beginLockedIndexUserTx(opCtx, userID)
 	if err != nil {
-		finishIndexError(c, err)
-		return
+		return indexBatchResponse{}, err
 	}
 	defer tx2.Rollback()
 	if err := commitIndexBatch(opCtx, tx2, userID, job.ID, staged, chunks, !exact, len(deleted) > 0); err != nil {
-		finishIndexError(c, err)
-		return
+		return indexBatchResponse{}, err
 	}
 	if err := tx2.Commit(); err != nil {
-		finishIndexError(c, err)
-		return
+		return indexBatchResponse{}, err
 	}
 	updated, err := loadIndexJob(opCtx, userID, job.ID)
 	if err != nil {
-		finishIndexError(c, err)
-		return
+		return indexBatchResponse{}, err
 	}
 	var lceResponse interface{}
 	if err := json.Unmarshal(result.Content, &lceResponse); err != nil {
 		lceResponse = string(result.Content)
 	}
-	finishJSON(c, http.StatusOK, gin.H{"job": updated, "lce": lceResponse})
+	return indexBatchResponse{Job: updated, LCE: lceResponse}, nil
 }
 
-func prepareIndexBatch(ctx context.Context, tx *sql.Tx, userID string, req remoteIndexRequest) (indexJobView, []indexManifestFile, []string, error) {
+func prepareIndexBatch(ctx context.Context, tx *sql.Tx, userID string, req indexUploadRequest) (indexJobView, []indexManifestFile, []string, error) {
 	job, err := loadIndexJobFrom(ctx, tx, userID, req.JobID)
 	if err != nil {
 		return job, nil, nil, err
@@ -830,7 +775,7 @@ func prepareIndexBatch(ctx context.Context, tx *sql.Tx, userID string, req remot
 		return job, nil, nil, fmt.Errorf("index job is %s", job.Status)
 	}
 	if normalizeIndexRootID(req.RootID) != job.RootID {
-		return job, nil, nil, fmt.Errorf("index batch rootId does not match the job")
+		return job, nil, nil, fmt.Errorf("index batch root_id does not match the job")
 	}
 	if len(req.Files) == 0 && job.DeletedCount == 0 {
 		return job, nil, nil, fmt.Errorf("empty index batch")
@@ -885,8 +830,8 @@ func prepareIndexBatch(ctx context.Context, tx *sql.Tx, userID string, req remot
 	}
 	for _, input := range inputs {
 		// "查不到"表示这个文件不在该 job 的清单里，不是"job 不存在"。
-		// 若表现为 sql.ErrNoRows 会被 handleRemoteIndex 判成 404 index job
-		// not found，把一个客户端批次错误报成任务丢失，排查时指向错误方向。
+		// 若表现为 sql.ErrNoRows 会被 codebase_index upload 判成 index job not
+		// found，把一个批次错误报成任务丢失，排查时指向错误方向。
 		rec, ok := records[input.Path]
 		if !ok {
 			return job, nil, nil, fmt.Errorf("batch file is not part of this job: %s", input.Path)
@@ -905,7 +850,7 @@ func prepareIndexBatch(ctx context.Context, tx *sql.Tx, userID string, req remot
 	var deletionsSent bool
 	err = tx.QueryRowContext(ctx, `SELECT deletions_sent FROM index_jobs WHERE id = $1`, req.JobID).Scan(&deletionsSent)
 	// job 在本事务开头已确认存在，这里的 ErrNoRows 只可能是并发删除；同样不能
-	// 让它伪装成上面那次 job 查询的 404。
+	// 让它伪装成上面那次 job 不存在错误。
 	if err == sql.ErrNoRows {
 		return job, nil, nil, fmt.Errorf("index job disappeared while staging the batch")
 	}
@@ -993,23 +938,16 @@ func commitIndexBatch(ctx context.Context, tx *sql.Tx, userID, jobID string, fil
 	return nil
 }
 
-type finishIndexJobRequest struct {
-	Error string `json:"error"`
-}
-
-func handleCompleteIndexJob(c *gin.Context) {
-	userID := c.GetString(ContextKeyUserID)
-	jobID := strings.TrimSpace(c.Param("id"))
+func completeIndexJob(ctx context.Context, userID, jobID string) (indexJobView, error) {
+	jobID = strings.TrimSpace(jobID)
 	if jobID == "" {
-		finishJSON(c, http.StatusBadRequest, gin.H{"error": "index job id is required"})
-		return
+		return indexJobView{}, fmt.Errorf("index job id is required")
 	}
 	lease, err := acquireSharedIndexOperation(
-		c.Request.Context(), userID, indexJobOperationResource(jobID), "complete-job",
+		ctx, userID, indexJobOperationResource(jobID), "complete-job",
 	)
 	if err != nil {
-		finishIndexError(c, err)
-		return
+		return indexJobView{}, err
 	}
 	defer lease.Release()
 	opCtx := lease.Context()
@@ -1027,24 +965,19 @@ func handleCompleteIndexJob(c *gin.Context) {
 		&preStatus, &rootID, &preTotalFiles, &preIndexedFiles, &preDeletedCount, &preDeletionsSent,
 	)
 	if err == sql.ErrNoRows {
-		finishJSON(c, http.StatusNotFound, gin.H{"error": "index job not found"})
-		return
+		return indexJobView{}, fmt.Errorf("index job not found")
 	}
 	if err != nil {
-		finishIndexError(c, err)
-		return
+		return indexJobView{}, err
 	}
 	if preStatus != indexJobStatusRunning {
-		finishJSON(c, http.StatusConflict, gin.H{"error": "index job is " + preStatus})
-		return
+		return indexJobView{}, fmt.Errorf("index job is %s", preStatus)
 	}
 	if preIndexedFiles != preTotalFiles {
-		finishJSON(c, http.StatusConflict, gin.H{"error": "index job still has pending files"})
-		return
+		return indexJobView{}, fmt.Errorf("index job still has pending files")
 	}
 	if preDeletedCount > 0 && !preDeletionsSent {
-		finishJSON(c, http.StatusConflict, gin.H{"error": "index job still has pending deletions"})
-		return
+		return indexJobView{}, fmt.Errorf("index job still has pending deletions")
 	}
 	args := map[string]interface{}{
 		"tenant_id":     userID,
@@ -1057,18 +990,15 @@ func handleCompleteIndexJob(c *gin.Context) {
 	}
 	result, err := lce.callToolWithTimeout(opCtx, "codebase_remote_index", args, remoteIndexMCPCallTimeout)
 	if err != nil {
-		finishIndexToolError(c, err)
-		return
+		return indexJobView{}, newIndexUpstreamError("LCE graph finalization failed: %w", err)
 	}
 	if result.IsError {
-		finishIndexToolError(c, fmt.Errorf("%s", string(result.Content)))
-		return
+		return indexJobView{}, newIndexUpstreamError("LCE graph finalization failed: %s", string(result.Content))
 	}
 
 	tx, err := beginLockedIndexUserTx(opCtx, userID)
 	if err != nil {
-		finishIndexError(c, err)
-		return
+		return indexJobView{}, err
 	}
 	defer tx.Rollback()
 
@@ -1086,31 +1016,25 @@ func handleCompleteIndexJob(c *gin.Context) {
 		&totalFiles, &indexedFiles, &deletedCount, &deletionsSent, &fallback,
 	)
 	if err == sql.ErrNoRows {
-		finishJSON(c, http.StatusNotFound, gin.H{"error": "index job not found"})
-		return
+		return indexJobView{}, fmt.Errorf("index job not found")
 	}
 	if err != nil {
-		finishIndexError(c, err)
-		return
+		return indexJobView{}, err
 	}
 	if status != indexJobStatusRunning {
-		finishJSON(c, http.StatusConflict, gin.H{"error": "index job is " + status})
-		return
+		return indexJobView{}, fmt.Errorf("index job is %s", status)
 	}
 	if indexedFiles != totalFiles {
-		finishJSON(c, http.StatusConflict, gin.H{"error": "index job still has pending files"})
-		return
+		return indexJobView{}, fmt.Errorf("index job still has pending files")
 	}
 	if deletedCount > 0 && !deletionsSent {
-		finishJSON(c, http.StatusConflict, gin.H{"error": "index job still has pending deletions"})
-		return
+		return indexJobView{}, fmt.Errorf("index job still has pending deletions")
 	}
 
 	if _, err = tx.ExecContext(opCtx, `
 		DELETE FROM indexed_files WHERE user_id = $1 AND workspace_id = $2
 	`, userID, workspaceID); err != nil {
-		finishIndexError(c, err)
-		return
+		return indexJobView{}, err
 	}
 	if _, err = tx.ExecContext(opCtx, `
 		INSERT INTO indexed_files (
@@ -1120,8 +1044,7 @@ func handleCompleteIndexJob(c *gin.Context) {
 		FROM index_job_files
 		WHERE job_id = $3
 	`, userID, workspaceID, jobID); err != nil {
-		finishIndexError(c, err)
-		return
+		return indexJobView{}, err
 	}
 	if _, err = tx.ExecContext(opCtx, `
 		INSERT INTO index_workspaces (
@@ -1134,8 +1057,7 @@ func handleCompleteIndexJob(c *gin.Context) {
 			revision = EXCLUDED.revision,
 			indexed_at = NOW()
 	`, userID, workspaceID, workspaceName, rootID, branch, revision); err != nil {
-		finishIndexError(c, err)
-		return
+		return indexJobView{}, err
 	}
 	totalChunkExpr := "total_chunks"
 	if !fallback {
@@ -1147,54 +1069,44 @@ func handleCompleteIndexJob(c *gin.Context) {
 			heartbeat_at = NOW(), completed_at = NOW()
 		WHERE id = $1
 	`, indexJobStatusCompleted, totalChunkExpr), jobID); err != nil {
-		finishIndexError(c, err)
-		return
+		return indexJobView{}, err
 	}
 	if _, err = tx.ExecContext(opCtx, `DELETE FROM index_job_files WHERE job_id = $1`, jobID); err != nil {
-		finishIndexError(c, err)
-		return
+		return indexJobView{}, err
 	}
 	if err = tx.Commit(); err != nil {
-		finishIndexError(c, err)
-		return
+		return indexJobView{}, err
 	}
 	job, err := loadIndexJob(opCtx, userID, jobID)
 	if err != nil {
-		finishIndexError(c, err)
-		return
+		return indexJobView{}, err
 	}
-	finishJSON(c, http.StatusOK, gin.H{"job": job})
+	return job, nil
 }
 
-func handleFailIndexJob(c *gin.Context) {
-	userID := c.GetString(ContextKeyUserID)
-	jobID := strings.TrimSpace(c.Param("id"))
+func failIndexJob(ctx context.Context, userID, jobID, failure string) (indexJobView, error) {
+	jobID = strings.TrimSpace(jobID)
 	if jobID == "" {
-		finishJSON(c, http.StatusBadRequest, gin.H{"error": "index job id is required"})
-		return
+		return indexJobView{}, fmt.Errorf("index job id is required")
 	}
-	var req finishIndexJobRequest
-	_ = c.ShouldBindJSON(&req)
-	req.Error = strings.TrimSpace(req.Error)
-	if len(req.Error) > 2000 {
-		req.Error = truncateUTF8(req.Error, 2000)
+	failure = strings.TrimSpace(failure)
+	if len(failure) > 2000 {
+		failure = truncateUTF8(failure, 2000)
 	}
-	if req.Error == "" {
-		req.Error = "client reported indexing failure"
+	if failure == "" {
+		failure = "client reported indexing failure"
 	}
 	lease, err := acquireSharedIndexOperation(
-		c.Request.Context(), userID, indexJobOperationResource(jobID), "fail-job",
+		ctx, userID, indexJobOperationResource(jobID), "fail-job",
 	)
 	if err != nil {
-		finishIndexError(c, err)
-		return
+		return indexJobView{}, err
 	}
 	defer lease.Release()
 	opCtx := lease.Context()
 	tx, err := beginLockedIndexUserTx(opCtx, userID)
 	if err != nil {
-		finishIndexError(c, err)
-		return
+		return indexJobView{}, err
 	}
 	defer tx.Rollback()
 	result, err := tx.ExecContext(opCtx, `
@@ -1202,30 +1114,25 @@ func handleFailIndexJob(c *gin.Context) {
 		SET status = $1, phase = 'done', failed_files = total_files - indexed_files,
 			error = $2, heartbeat_at = NOW(), completed_at = NOW()
 		WHERE id = $3 AND user_id = $4 AND status = $5
-	`, indexJobStatusFailed, req.Error, jobID, userID, indexJobStatusRunning)
+	`, indexJobStatusFailed, failure, jobID, userID, indexJobStatusRunning)
 	if err != nil {
-		finishIndexError(c, err)
-		return
+		return indexJobView{}, err
 	}
 	rows, _ := result.RowsAffected()
 	if rows == 0 {
-		finishJSON(c, http.StatusConflict, gin.H{"error": "index job is not running"})
-		return
+		return indexJobView{}, fmt.Errorf("index job is not running")
 	}
 	if _, err = tx.ExecContext(opCtx, `DELETE FROM index_job_files WHERE job_id = $1`, jobID); err != nil {
-		finishIndexError(c, err)
-		return
+		return indexJobView{}, err
 	}
 	if err = tx.Commit(); err != nil {
-		finishIndexError(c, err)
-		return
+		return indexJobView{}, err
 	}
 	job, err := loadIndexJob(opCtx, userID, jobID)
 	if err != nil {
-		finishIndexError(c, err)
-		return
+		return indexJobView{}, err
 	}
-	finishJSON(c, http.StatusOK, gin.H{"job": job})
+	return job, nil
 }
 
 func clearUserIndexStateTx(ctx context.Context, tx *sql.Tx, userID string) error {
@@ -1408,21 +1315,4 @@ func numberAsInt64(value interface{}) (int64, bool) {
 		return 0, false
 	}
 	return int64(number), true
-}
-
-func finishIndexToolError(c *gin.Context, err error) {
-	logID := c.GetString(ContextKeyLogID)
-	saveErrorDetailsAsync(logID, "lce", err.Error(), getInsertDone(c))
-	finishJSON(c, http.StatusBadGateway, gin.H{"error": err.Error()})
-}
-
-func finishIndexError(c *gin.Context, err error) {
-	logID := c.GetString(ContextKeyLogID)
-	saveErrorDetailsAsync(logID, "relay", err.Error(), getInsertDone(c))
-	finishJSON(c, http.StatusInternalServerError, gin.H{"error": err.Error()})
-}
-
-func finishJSON(c *gin.Context, status int, body interface{}) {
-	c.JSON(status, body)
-	completeRequestLogAsync(getRequestLogEntry(c, status))
 }

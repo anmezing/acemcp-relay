@@ -166,8 +166,8 @@ func TestFilterChatMCPToolsRequiresExactRemoteContract(t *testing.T) {
 	}
 }
 
-func TestChatMCPToolPolicyKeepsQueriesAndRejectsManagement(t *testing.T) {
-	for _, allowed := range []string{"codebase-retrieval", "codebase_symbol_graph", "codebase_tenant_stats"} {
+func TestChatMCPToolPolicyKeepsTenantToolsAndRejectsRawManagement(t *testing.T) {
+	for _, allowed := range []string{"codebase-retrieval", "codebase_symbol_graph", "codebase_tenant_stats", codebaseIndexToolName} {
 		if !isChatMCPToolAllowed(allowed) {
 			t.Fatalf("%q must remain available through chat MCP", allowed)
 		}
@@ -183,6 +183,37 @@ func TestChatMCPToolPolicyKeepsQueriesAndRejectsManagement(t *testing.T) {
 		if isChatMCPToolAllowed(denied) {
 			t.Fatalf("%q must not be model-callable through chat MCP", denied)
 		}
+	}
+}
+
+func TestAppendCodebaseIndexToolExposesExactlyFourTools(t *testing.T) {
+	raw := json.RawMessage(`[
+		{"name":"codebase-retrieval","inputSchema":{"type":"object","properties":{"information_request":{"type":"string"}}}},
+		{"name":"codebase_symbol_graph","inputSchema":{"type":"object","properties":{"root_id":{"type":"string"},"symbol":{"type":"string"}}}},
+		{"name":"codebase_tenant_stats","inputSchema":{"type":"object","properties":{}}}
+	]`)
+	filtered, err := filterChatMCPTools(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	combined, err := appendCodebaseIndexTool(filtered)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var tools []map[string]interface{}
+	if err := json.Unmarshal(combined, &tools); err != nil {
+		t.Fatal(err)
+	}
+	if len(tools) != 4 {
+		t.Fatalf("remote MCP must expose exactly four tools, got %d", len(tools))
+	}
+	if tools[3]["name"] != codebaseIndexToolName {
+		t.Fatalf("fourth tool must be %s, got %#v", codebaseIndexToolName, tools[3]["name"])
+	}
+	schema := tools[3]["inputSchema"].(map[string]interface{})
+	operations := schema["oneOf"].([]interface{})
+	if len(operations) != 5 {
+		t.Fatalf("index tool must advertise five lifecycle operations, got %d", len(operations))
 	}
 }
 
@@ -366,56 +397,6 @@ func TestOnlyRetrievalUsesTenantModelConfig(t *testing.T) {
 	for _, toolName := range []string{"codebase_symbol_graph", "codebase_tenant_stats"} {
 		if chatMCPToolUsesModelConfig(toolName) {
 			t.Fatalf("%s must not depend on embedding/rerank configuration", toolName)
-		}
-	}
-}
-
-func TestIndexControlPathsDoNotConsumeChatQuota(t *testing.T) {
-	exempt := []string{
-		"/relay/capabilities",
-		"/relay/index-jobs",
-		"/relay/index-jobs/job-id",
-		"/relay/index-jobs/job-id/complete",
-		"/relay/remote-index",
-	}
-	for _, requestPath := range exempt {
-		if !isIndexControlPath(requestPath) {
-			t.Fatalf("expected index control path to be exempt: %s", requestPath)
-		}
-	}
-
-	charged := []string{
-		"/relay/index-jobs-extra",
-		"/mcp",
-	}
-	for _, requestPath := range charged {
-		if isIndexControlPath(requestPath) {
-			t.Fatalf("unexpected quota exemption: %s", requestPath)
-		}
-	}
-}
-
-func TestIndexQuotaChargesOnlyJobCreation(t *testing.T) {
-	exempt := []struct{ method, path string }{
-		{"GET", "/relay/capabilities"},
-		{"GET", "/relay/index-jobs/job-id"},
-		{"POST", "/relay/index-jobs/job-id/complete"},
-		{"POST", "/relay/index-jobs/job-id/fail"},
-		{"POST", "/relay/remote-index"},
-	}
-	for _, request := range exempt {
-		if !isIndexQuotaExempt(request.method, request.path) {
-			t.Fatalf("expected quota exemption: %s %s", request.method, request.path)
-		}
-	}
-
-	charged := []struct{ method, path string }{
-		{"POST", "/relay/index-jobs"},
-		{"POST", "/mcp"},
-	}
-	for _, request := range charged {
-		if isIndexQuotaExempt(request.method, request.path) {
-			t.Fatalf("unexpected quota exemption: %s %s", request.method, request.path)
 		}
 	}
 }
