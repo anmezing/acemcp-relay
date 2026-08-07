@@ -116,6 +116,40 @@ func TestExtractChunkCount(t *testing.T) {
 	}
 }
 
+func TestLCEIndexJobArgsUseCloudProtocolWithoutUserEmbeddingConfig(t *testing.T) {
+	args := lceIndexJobArgs("tenant-1", "7e224a32-3423-4bb0-9213-3c55a5797c9d", "repo-a", "stage")
+	for key, expected := range map[string]string{
+		"tenant_id": "tenant-1",
+		"job_id":    "7e224a32-3423-4bb0-9213-3c55a5797c9d",
+		"root_id":   "repo-a",
+		"operation": "stage",
+	} {
+		if args[key] != expected {
+			t.Fatalf("%s: got %#v, want %q", key, args[key], expected)
+		}
+	}
+	if _, ok := args["model_config"]; ok {
+		t.Fatal("cloud indexing must use the server-controlled embedding space")
+	}
+}
+
+func TestExtractCloudRevision(t *testing.T) {
+	for _, content := range []string{
+		`{"revision":2,"rootId":"repo-a"}`,
+		`{"payload":{"revision":3}}`,
+	} {
+		revision, err := extractCloudRevision([]byte(content))
+		if err != nil || revision < 2 {
+			t.Fatalf("%s: got revision=%d err=%v", content, revision, err)
+		}
+	}
+	for _, content := range []string{`{}`, `{"revision":-1}`, `{"revision":"2"}`} {
+		if _, err := extractCloudRevision([]byte(content)); err == nil {
+			t.Fatalf("invalid publish response must fail: %s", content)
+		}
+	}
+}
+
 func TestFilterChatMCPToolsHidesIndexManagementTools(t *testing.T) {
 	raw := json.RawMessage(`[
 		{"name":" codebase-retrieval ","description":"query","inputSchema":{"type":"object","properties":{"information_request":{"type":"string"},"technical_terms":{"type":"array"},"response_format":{"type":"string"}}}},
@@ -123,7 +157,6 @@ func TestFilterChatMCPToolsHidesIndexManagementTools(t *testing.T) {
 		{"name":"codebase_clear_index","description":"clear"},
 		{"name":"codebase_git_context","description":"git"},
 		{"name":"codebase_review_changes","description":"review"},
-		{"name":"codebase_find_missing","description":"missing"},
 		{"name":"codebase_symbol_graph","description":"graph","inputSchema":{"type":"object","properties":{"root_id":{"type":"string"},"symbol":{"type":"string"}}}},
 		{"name":"codebase_tenant_stats","description":"stats","inputSchema":{"type":"object","properties":{"response_format":{"type":"string"}}}},
 		{"name":"future_admin_tool","description":"must stay private"}
@@ -177,7 +210,6 @@ func TestChatMCPToolPolicyKeepsTenantToolsAndRejectsRawManagement(t *testing.T) 
 		"codebase_clear_index",
 		"codebase_git_context",
 		"codebase_review_changes",
-		"codebase_find_missing",
 		"future_admin_tool",
 	} {
 		if isChatMCPToolAllowed(denied) {
@@ -390,13 +422,13 @@ func TestValidateChatMCPToolArgsRequiresRemoteRoot(t *testing.T) {
 	}
 }
 
-func TestOnlyRetrievalUsesTenantModelConfig(t *testing.T) {
-	if !chatMCPToolUsesModelConfig("codebase-retrieval") {
-		t.Fatal("retrieval must receive the tenant embedding/rerank configuration")
+func TestOnlyRetrievalUsesTenantRerankConfig(t *testing.T) {
+	if !chatMCPToolUsesRerankConfig("codebase-retrieval") {
+		t.Fatal("retrieval must receive the tenant rerank configuration")
 	}
 	for _, toolName := range []string{"codebase_symbol_graph", "codebase_tenant_stats"} {
-		if chatMCPToolUsesModelConfig(toolName) {
-			t.Fatalf("%s must not depend on embedding/rerank configuration", toolName)
+		if chatMCPToolUsesRerankConfig(toolName) {
+			t.Fatalf("%s must not depend on rerank configuration", toolName)
 		}
 	}
 }

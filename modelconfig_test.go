@@ -30,11 +30,11 @@ func TestLoadModelConfigFailsClosedOnDatabaseError(t *testing.T) {
 		modelConfigKey = previousKey
 	}()
 
-	mock.ExpectQuery("SELECT config_enc, fingerprint, applied_fingerprint").
+	mock.ExpectQuery("SELECT config_enc").
 		WithArgs("user-1").
 		WillReturnError(errors.New("database unavailable"))
 
-	_, _, err = loadModelConfigArg(context.Background(), "user-1")
+	_, err = loadRerankModelConfigArg(context.Background(), "user-1")
 	if err == nil {
 		t.Fatal("database failure must not be treated as platform-default model configuration")
 	}

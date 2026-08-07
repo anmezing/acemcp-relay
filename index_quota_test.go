@@ -40,9 +40,11 @@ func TestWorstCaseJSONEscapingFitsDownstreamBodyLimit(t *testing.T) {
 	}
 	args := map[string]interface{}{
 		"tenant_id": "tenant-1",
+		"job_id":    "7e224a32-3423-4bb0-9213-3c55a5797c9d",
+		"operation": "stage",
 		"root_id":   "root-1",
 		"files": []map[string]interface{}{{
-			"path": "src/control-bytes.txt", "content": content, "hash": "hash-1",
+			"path": "src/control-bytes.txt", "content": content,
 		}},
 	}
 	encoded, err := validateMCPToolCallBody("codebase_remote_index", args)

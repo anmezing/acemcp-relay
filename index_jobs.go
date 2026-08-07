@@ -96,7 +96,7 @@ type indexJobView struct {
 	StartedAt           time.Time  `json:"started_at"`
 	HeartbeatAt         time.Time  `json:"heartbeat_at"`
 	CompletedAt         *time.Time `json:"completed_at,omitempty"`
-	ModelFingerprint    string     `json:"-"`
+	CloudRevision       int64      `json:"cloud_revision,omitempty"`
 }
 
 type createIndexJobResponse struct {
@@ -114,16 +114,16 @@ func migrateIndexingTables() error {
 			root_id VARCHAR(128) NOT NULL DEFAULT '',
 			branch TEXT NOT NULL DEFAULT '',
 			revision TEXT NOT NULL DEFAULT '',
+			cloud_revision BIGINT NOT NULL DEFAULT 0,
 			indexed_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
 			PRIMARY KEY (user_id, workspace_id)
 		);
-		ALTER TABLE index_workspaces ADD COLUMN IF NOT EXISTS root_id VARCHAR(128) NOT NULL DEFAULT '';
-
 		CREATE TABLE IF NOT EXISTS index_jobs (
 			id UUID PRIMARY KEY,
 			user_id VARCHAR(255) NOT NULL,
 			workspace_id VARCHAR(128) NOT NULL,
 			workspace_name TEXT NOT NULL DEFAULT '',
+			root_id VARCHAR(128) NOT NULL DEFAULT '',
 			branch TEXT NOT NULL DEFAULT '',
 			revision TEXT NOT NULL DEFAULT '',
 			mode VARCHAR(20) NOT NULL,
@@ -139,12 +139,11 @@ func migrateIndexingTables() error {
 			deleted_count INTEGER NOT NULL DEFAULT 0,
 			deletions_sent BOOLEAN NOT NULL DEFAULT FALSE,
 			error TEXT NOT NULL DEFAULT '',
+			cloud_revision BIGINT NOT NULL DEFAULT 0,
 			started_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
 			heartbeat_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
 			completed_at TIMESTAMP WITH TIME ZONE
 		);
-		ALTER TABLE index_jobs ADD COLUMN IF NOT EXISTS root_id VARCHAR(128) NOT NULL DEFAULT '';
-		ALTER TABLE index_jobs ADD COLUMN IF NOT EXISTS model_fingerprint VARCHAR(80) NOT NULL DEFAULT '';
 		CREATE INDEX IF NOT EXISTS idx_index_jobs_workspace
 			ON index_jobs(user_id, workspace_id, started_at DESC);
 		CREATE INDEX IF NOT EXISTS idx_index_jobs_running
@@ -419,10 +418,6 @@ func createIndexJob(ctx context.Context, userID string, req indexStartRequest) (
 	}
 	defer lease.Release()
 	opCtx := lease.Context()
-	_, modelFingerprint, err := resolveModelConfigUnderExclusiveLease(opCtx, userID)
-	if err != nil {
-		return createIndexJobResponse{}, err
-	}
 	storedRootID, workspaceExistsBeforeReset, err := loadIndexedWorkspaceRoot(opCtx, userID, req.WorkspaceID)
 	if err != nil {
 		return createIndexJobResponse{}, err
@@ -444,6 +439,30 @@ func createIndexJob(ctx context.Context, userID string, req indexStartRequest) (
 		return createIndexJobResponse{}, err
 	}
 	defer tx.Rollback()
+	type supersededJob struct {
+		id     string
+		rootID string
+	}
+	var supersededJobs []supersededJob
+	rows, err := tx.QueryContext(opCtx, `
+		SELECT id::text, root_id FROM index_jobs
+		WHERE user_id = $1 AND workspace_id = $2 AND status = $3
+	`, userID, req.WorkspaceID, indexJobStatusRunning)
+	if err != nil {
+		return createIndexJobResponse{}, err
+	}
+	for rows.Next() {
+		var job supersededJob
+		if err := rows.Scan(&job.id, &job.rootID); err != nil {
+			rows.Close()
+			return createIndexJobResponse{}, err
+		}
+		supersededJobs = append(supersededJobs, job)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return createIndexJobResponse{}, err
+	}
 
 	_, err = tx.ExecContext(opCtx, `
 		DELETE FROM index_job_files
@@ -497,10 +516,10 @@ func createIndexJob(ctx context.Context, userID string, req indexStartRequest) (
 	_, err = tx.ExecContext(opCtx, `
 		INSERT INTO index_jobs (
 			id, user_id, workspace_id, workspace_name, root_id, branch, revision, mode,
-			workspace_files, total_files, total_chunks, deleted_count, model_fingerprint
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+			workspace_files, total_files, total_chunks, deleted_count
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 	`, jobID, userID, req.WorkspaceID, req.WorkspaceName, req.RootID, req.Branch, req.Revision, mode,
-		len(files), len(pending), estimatedChunks, len(deleted), modelFingerprint)
+		len(files), len(pending), estimatedChunks, len(deleted))
 	if err != nil {
 		return createIndexJobResponse{}, err
 	}
@@ -529,6 +548,23 @@ func createIndexJob(ctx context.Context, userID string, req indexStartRequest) (
 	}
 
 	if err := tx.Commit(); err != nil {
+		return createIndexJobResponse{}, err
+	}
+	for _, superseded := range supersededJobs {
+		if abortErr := abortLCEIndexJob(opCtx, userID, superseded.id, superseded.rootID); abortErr != nil {
+			log.Printf("[INDEX] cloud abort cleanup failed for superseded job %s: %v", superseded.id, abortErr)
+		}
+	}
+	if err := beginLCEIndexJob(opCtx, userID, jobID, req.RootID); err != nil {
+		if abortErr := abortLCEIndexJob(context.Background(), userID, jobID, req.RootID); abortErr != nil {
+			log.Printf("[INDEX] cloud abort cleanup failed after begin error for job %s: %v", jobID, abortErr)
+		}
+		_, _ = db.ExecContext(context.Background(), `
+			UPDATE index_jobs
+			SET status = $1, phase = 'done', error = $2, heartbeat_at = NOW(), completed_at = NOW()
+			WHERE id = $3 AND user_id = $4 AND status = $5
+		`, indexJobStatusFailed, "LCE cloud index begin failed: "+err.Error(), jobID, userID, indexJobStatusRunning)
+		_, _ = db.ExecContext(context.Background(), `DELETE FROM index_job_files WHERE job_id = $1`, jobID)
 		return createIndexJobResponse{}, err
 	}
 	job, err := loadIndexJob(opCtx, userID, jobID)
@@ -575,7 +611,7 @@ func loadIndexJobFrom(ctx context.Context, queryer indexJobQueryer, userID, jobI
 	err := queryer.QueryRowContext(ctx, `
 		SELECT id::text, workspace_id, workspace_name, root_id, branch, revision, mode, phase, status,
 			workspace_files, total_files, indexed_files, failed_files, total_chunks,
-			indexed_chunks, chunk_count_fallback, deleted_count, error, model_fingerprint,
+			indexed_chunks, chunk_count_fallback, deleted_count, error, cloud_revision,
 			started_at, heartbeat_at, completed_at
 		FROM index_jobs
 		WHERE id = $1 AND user_id = $2
@@ -583,7 +619,7 @@ func loadIndexJobFrom(ctx context.Context, queryer indexJobQueryer, userID, jobI
 		&job.ID, &job.WorkspaceID, &job.WorkspaceName, &job.RootID, &job.Branch, &job.Revision,
 		&job.Mode, &job.Phase, &job.Status, &job.WorkspaceFiles, &job.TotalFiles,
 		&job.IndexedFiles, &job.FailedFiles, &job.TotalChunks, &job.IndexedChunks,
-		&fallback, &job.DeletedCount, &job.Error, &job.ModelFingerprint, &job.StartedAt, &job.HeartbeatAt,
+		&fallback, &job.DeletedCount, &job.Error, &job.CloudRevision, &job.StartedAt, &job.HeartbeatAt,
 		&job.CompletedAt,
 	)
 	job.ChunkCountEstimated = fallback || job.Status != indexJobStatusCompleted
@@ -660,18 +696,6 @@ func uploadIndexBatch(ctx context.Context, userID string, req indexUploadRequest
 	}
 	defer lease.Release()
 	opCtx := lease.Context()
-	modelConfig, modelRow, err := loadModelConfigArg(opCtx, userID)
-	if err != nil {
-		return indexBatchResponse{}, err
-	}
-	modelFingerprint := ""
-	if modelRow != nil {
-		if modelRow.Applied != modelRow.Fingerprint {
-			return indexBatchResponse{}, fmt.Errorf("model configuration changed; start a new index job")
-		}
-		modelFingerprint = modelRow.Fingerprint
-	}
-
 	// 事务A：只做校验与读取，随后立即提交释放连接和 advisory 锁。
 	// 决不能让事务横跨下面那次 LCE 调用：连接池只有 25 个连接，
 	// 几十个并发 embedding 批次就会把连接占光，阻塞全站的 DB 访问。
@@ -694,9 +718,6 @@ func uploadIndexBatch(ctx context.Context, userID string, req indexUploadRequest
 	if err := tx.Commit(); err != nil {
 		return indexBatchResponse{}, err
 	}
-	if job.ModelFingerprint != modelFingerprint {
-		return indexBatchResponse{}, fmt.Errorf("index job model configuration is stale; start a new index job")
-	}
 	batchBytes, err := validateIndexBatchSize(staged)
 	if err != nil {
 		return indexBatchResponse{}, err
@@ -704,16 +725,13 @@ func uploadIndexBatch(ctx context.Context, userID string, req indexUploadRequest
 	filesArg := make([]map[string]interface{}, 0, len(staged))
 	for _, file := range staged {
 		filesArg = append(filesArg, map[string]interface{}{
-			"path": file.Path, "content": file.Content, "hash": file.Hash,
+			"path": file.Path, "content": file.Content,
 		})
 	}
-	args := map[string]interface{}{"tenant_id": userID, "files": filesArg}
+	args := lceIndexJobArgs(userID, job.ID, req.RootID, "stage")
+	args["files"] = filesArg
 	if len(deleted) > 0 {
 		args["deleted_files"] = deleted
-	}
-	args["root_id"] = req.RootID
-	if modelConfig != nil {
-		args["model_config"] = modelConfig
 	}
 	if _, err := validateMCPToolCallBody("codebase_remote_index", args); err != nil {
 		return indexBatchResponse{}, err
@@ -952,9 +970,8 @@ func completeIndexJob(ctx context.Context, userID, jobID string) (indexJobView, 
 	defer lease.Release()
 	opCtx := lease.Context()
 
-	// Graph finalization can parse and rebind a large root. Validate first without holding
-	// a transaction, call LCE, then let the existing locked transaction revalidate every
-	// completion invariant before committing the manifest snapshot.
+	// Validate first without holding a transaction, publish the staged PostgreSQL revision,
+	// then revalidate every completion invariant before committing Relay's manifest snapshot.
 	var preStatus, rootID string
 	var preTotalFiles, preIndexedFiles, preDeletedCount int
 	var preDeletionsSent bool
@@ -979,21 +996,20 @@ func completeIndexJob(ctx context.Context, userID, jobID string) (indexJobView, 
 	if preDeletedCount > 0 && !preDeletionsSent {
 		return indexJobView{}, fmt.Errorf("index job still has pending deletions")
 	}
-	args := map[string]interface{}{
-		"tenant_id":     userID,
-		"files":         []interface{}{},
-		"deleted_files": []interface{}{},
-		"finalize":      true,
-	}
-	if rootID != "" {
-		args["root_id"] = rootID
+	args := lceIndexJobArgs(userID, jobID, rootID, "publish")
+	if _, err := validateMCPToolCallBody("codebase_remote_index", args); err != nil {
+		return indexJobView{}, err
 	}
 	result, err := lce.callToolWithTimeout(opCtx, "codebase_remote_index", args, remoteIndexMCPCallTimeout)
 	if err != nil {
-		return indexJobView{}, newIndexUpstreamError("LCE graph finalization failed: %w", err)
+		return indexJobView{}, newIndexUpstreamError("LCE cloud index publish failed: %w", err)
 	}
 	if result.IsError {
-		return indexJobView{}, newIndexUpstreamError("LCE graph finalization failed: %s", string(result.Content))
+		return indexJobView{}, newIndexUpstreamError("LCE cloud index publish failed: %s", string(result.Content))
+	}
+	cloudRevision, err := extractCloudRevision(result.Content)
+	if err != nil {
+		return indexJobView{}, newIndexUpstreamError("LCE cloud index publish returned an invalid revision: %w", err)
 	}
 
 	tx, err := beginLockedIndexUserTx(opCtx, userID)
@@ -1006,8 +1022,8 @@ func completeIndexJob(ctx context.Context, userID, jobID string) (indexJobView, 
 	var totalFiles, indexedFiles, deletedCount int
 	var deletionsSent, fallback bool
 	err = tx.QueryRowContext(opCtx, `
-		SELECT workspace_id, workspace_name, branch, revision, status,
-			total_files, indexed_files, deleted_count, deletions_sent, chunk_count_fallback
+			SELECT workspace_id, workspace_name, branch, revision, status,
+				total_files, indexed_files, deleted_count, deletions_sent, chunk_count_fallback
 		FROM index_jobs
 		WHERE id = $1 AND user_id = $2
 		FOR UPDATE
@@ -1047,16 +1063,17 @@ func completeIndexJob(ctx context.Context, userID, jobID string) (indexJobView, 
 		return indexJobView{}, err
 	}
 	if _, err = tx.ExecContext(opCtx, `
-		INSERT INTO index_workspaces (
-			user_id, workspace_id, workspace_name, root_id, branch, revision, indexed_at
-		) VALUES ($1, $2, $3, $4, $5, $6, NOW())
+			INSERT INTO index_workspaces (
+				user_id, workspace_id, workspace_name, root_id, branch, revision, cloud_revision, indexed_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
 		ON CONFLICT (user_id, workspace_id) DO UPDATE SET
 			workspace_name = EXCLUDED.workspace_name,
 			root_id = EXCLUDED.root_id,
 			branch = EXCLUDED.branch,
-			revision = EXCLUDED.revision,
-			indexed_at = NOW()
-	`, userID, workspaceID, workspaceName, rootID, branch, revision); err != nil {
+				revision = EXCLUDED.revision,
+				cloud_revision = EXCLUDED.cloud_revision,
+				indexed_at = NOW()
+		`, userID, workspaceID, workspaceName, rootID, branch, revision, cloudRevision); err != nil {
 		return indexJobView{}, err
 	}
 	totalChunkExpr := "total_chunks"
@@ -1065,10 +1082,10 @@ func completeIndexJob(ctx context.Context, userID, jobID string) (indexJobView, 
 	}
 	if _, err = tx.ExecContext(opCtx, fmt.Sprintf(`
 		UPDATE index_jobs
-		SET status = '%s', phase = 'done', total_chunks = %s,
+		SET status = '%s', phase = 'done', total_chunks = %s, cloud_revision = $2,
 			heartbeat_at = NOW(), completed_at = NOW()
 		WHERE id = $1
-	`, indexJobStatusCompleted, totalChunkExpr), jobID); err != nil {
+	`, indexJobStatusCompleted, totalChunkExpr), jobID, cloudRevision); err != nil {
 		return indexJobView{}, err
 	}
 	if _, err = tx.ExecContext(opCtx, `DELETE FROM index_job_files WHERE job_id = $1`, jobID); err != nil {
@@ -1082,6 +1099,78 @@ func completeIndexJob(ctx context.Context, userID, jobID string) (indexJobView, 
 		return indexJobView{}, err
 	}
 	return job, nil
+}
+
+func beginLCEIndexJob(ctx context.Context, userID, jobID, rootID string) error {
+	args := lceIndexJobArgs(userID, jobID, rootID, "begin")
+	if _, err := validateMCPToolCallBody("codebase_remote_index", args); err != nil {
+		return err
+	}
+	result, err := lce.callToolWithTimeout(ctx, "codebase_remote_index", args, remoteIndexMCPCallTimeout)
+	if err != nil {
+		return newIndexUpstreamError("LCE cloud index begin failed: %w", err)
+	}
+	if result.IsError {
+		return newIndexUpstreamError("LCE cloud index begin failed: %s", string(result.Content))
+	}
+	return nil
+}
+
+func abortLCEIndexJob(ctx context.Context, userID, jobID, rootID string) error {
+	args := lceIndexJobArgs(userID, jobID, rootID, "abort")
+	if _, err := validateMCPToolCallBody("codebase_remote_index", args); err != nil {
+		return err
+	}
+	result, err := lce.callToolWithTimeout(ctx, "codebase_remote_index", args, remoteIndexMCPCallTimeout)
+	if err != nil {
+		return newIndexUpstreamError("LCE cloud index abort failed: %w", err)
+	}
+	if result.IsError {
+		return newIndexUpstreamError("LCE cloud index abort failed: %s", string(result.Content))
+	}
+	return nil
+}
+
+func lceIndexJobArgs(userID, jobID, rootID, operation string) map[string]interface{} {
+	return map[string]interface{}{
+		"tenant_id": userID,
+		"job_id":    jobID,
+		"operation": operation,
+		"root_id":   rootID,
+	}
+}
+
+func extractCloudRevision(content []byte) (int64, error) {
+	var value interface{}
+	if err := json.Unmarshal(content, &value); err != nil {
+		return 0, err
+	}
+	object, ok := value.(map[string]interface{})
+	if !ok {
+		return 0, fmt.Errorf("publish response is not an object")
+	}
+	if nested, ok := object["payload"].(map[string]interface{}); ok {
+		object = nested
+	}
+	raw, ok := object["revision"]
+	if !ok {
+		return 0, fmt.Errorf("publish response has no revision")
+	}
+	switch number := raw.(type) {
+	case float64:
+		if number < 0 || number != float64(int64(number)) {
+			return 0, fmt.Errorf("revision is not a non-negative integer")
+		}
+		return int64(number), nil
+	case json.Number:
+		value, err := number.Int64()
+		if err != nil || value < 0 {
+			return 0, fmt.Errorf("revision is not a non-negative integer")
+		}
+		return value, nil
+	default:
+		return 0, fmt.Errorf("revision has an invalid type")
+	}
 }
 
 func failIndexJob(ctx context.Context, userID, jobID, failure string) (indexJobView, error) {
@@ -1109,6 +1198,15 @@ func failIndexJob(ctx context.Context, userID, jobID, failure string) (indexJobV
 		return indexJobView{}, err
 	}
 	defer tx.Rollback()
+	var rootID string
+	if err := tx.QueryRowContext(opCtx, `
+		SELECT root_id FROM index_jobs WHERE id = $1 AND user_id = $2 FOR UPDATE
+	`, jobID, userID).Scan(&rootID); err != nil {
+		if err == sql.ErrNoRows {
+			return indexJobView{}, fmt.Errorf("index job not found")
+		}
+		return indexJobView{}, err
+	}
 	result, err := tx.ExecContext(opCtx, `
 		UPDATE index_jobs
 		SET status = $1, phase = 'done', failed_files = total_files - indexed_files,
@@ -1127,6 +1225,9 @@ func failIndexJob(ctx context.Context, userID, jobID, failure string) (indexJobV
 	}
 	if err = tx.Commit(); err != nil {
 		return indexJobView{}, err
+	}
+	if abortErr := abortLCEIndexJob(opCtx, userID, jobID, rootID); abortErr != nil {
+		log.Printf("[INDEX] cloud abort cleanup failed for job %s: %v", jobID, abortErr)
 	}
 	job, err := loadIndexJob(opCtx, userID, jobID)
 	if err != nil {
@@ -1212,32 +1313,37 @@ func sweepExpiredIndexJobs(ctx context.Context) {
 		SET status = $1, phase = 'done', failed_files = total_files - indexed_files,
 			error = 'index job heartbeat timed out', completed_at = NOW()
 		WHERE status = $2 AND heartbeat_at < $3
-		RETURNING id::text
+		RETURNING id::text, user_id, root_id
 	`, indexJobStatusTimedOut, indexJobStatusRunning, time.Now().Add(-indexJobHeartbeatTimeout))
 	if err != nil {
 		log.Printf("[INDEX] Failed to sweep timed out jobs: %v", err)
 		return
 	}
-	var ids []string
+	type expiredJob struct {
+		id     string
+		userID string
+		rootID string
+	}
+	var jobs []expiredJob
 	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
+		var job expiredJob
+		if err := rows.Scan(&job.id, &job.userID, &job.rootID); err != nil {
 			// 出错必须整体放弃：吞掉 Scan 错误会让对应 job 被标成 timed_out
 			// 却漏删 index_job_files，永久泄漏。回滚后下一轮 sweep 重来。
 			rows.Close()
 			log.Printf("[INDEX] Failed to scan timed out job id: %v", err)
 			return
 		}
-		ids = append(ids, id)
+		jobs = append(jobs, job)
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
 		log.Printf("[INDEX] Failed to iterate timed out jobs: %v", err)
 		return
 	}
-	for _, id := range ids {
-		if _, err := tx.ExecContext(ctx, `DELETE FROM index_job_files WHERE job_id = $1`, id); err != nil {
-			log.Printf("[INDEX] Failed to clean timed out job %s: %v", id, err)
+	for _, job := range jobs {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM index_job_files WHERE job_id = $1`, job.id); err != nil {
+			log.Printf("[INDEX] Failed to clean timed out job %s: %v", job.id, err)
 			return
 		}
 	}
@@ -1245,8 +1351,13 @@ func sweepExpiredIndexJobs(ctx context.Context) {
 		log.Printf("[INDEX] Failed to commit timeout sweep: %v", err)
 		return
 	}
-	if len(ids) > 0 {
-		log.Printf("[INDEX] Reclaimed %d timed out indexing jobs", len(ids))
+	for _, job := range jobs {
+		if abortErr := abortLCEIndexJob(ctx, job.userID, job.id, job.rootID); abortErr != nil {
+			log.Printf("[INDEX] cloud abort cleanup failed for timed out job %s: %v", job.id, abortErr)
+		}
+	}
+	if len(jobs) > 0 {
+		log.Printf("[INDEX] Reclaimed %d timed out indexing jobs", len(jobs))
 	}
 }
 

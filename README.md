@@ -32,12 +32,12 @@ LCE 的多租户远程 MCP 服务。IDE Agent 只需配置一个 Streamable HTTP
 
 远程 MCP 对模型只暴露 4 个租户安全工具：
 
-- `codebase-retrieval`：在租户服务端索引上执行向量召回与精排；Relay 按用户注入 embedding/rerank 模型配置。
+- `codebase-retrieval`：在租户服务端索引上执行向量召回与精排；向量空间由 LCE 固定，Relay 只按用户注入可选 rerank 配置。
 - `codebase_symbol_graph`：查询指定 `root_id` 的服务端符号图。
 - `codebase_tenant_stats`：查询当前租户的聚合索引统计。
 - `codebase_index`：不依赖 IDE 插件的索引入口。Agent 使用自身文件读取能力提交完整 manifest，再按 `pending_files` 分批上传内容，最后完成任务并收敛符号图。
 
-`codebase_index` 的操作顺序为 `start -> upload -> complete`，可用 `status` 刷新心跳和查询进度，失败时调用 `fail` 回收任务。服务端负责注入 `tenant_id` 和模型配置，并强制执行 SHA-256 内容匹配、路径过滤、manifest/批次上限、每日索引字节配额、模型指纹、root 隔离、删除检测和图谱最终收敛。原始的 `codebase_remote_index`、`codebase_find_missing` 和 `codebase_clear_index` 仍是 Relay 到 LCE 的内部控制面，不能由模型直接调用。
+`codebase_index` 的操作顺序为 `start -> upload -> complete`，可用 `status` 刷新心跳和查询进度，失败时调用 `fail` 回收任务。服务端负责注入 `tenant_id`，并强制执行 SHA-256 内容匹配、路径过滤、manifest/批次上限、每日索引字节配额、root 隔离和删除检测。Relay 使用同一个 job UUID 调用 LCE 的内部 `begin -> stage -> publish/abort` 协议；PostgreSQL 中的词法、精确、向量和符号图数据只在 publish 时原子可见。`codebase_remote_index` 和 `codebase_clear_index` 是内部控制面，不能由模型直接调用。
 
 远端服务无法读取 IDE 所在机器的文件系统或 `.git` 目录。文件扫描由 IDE Agent 的原生文件工具完成；Git 状态、历史、blame 和工作区 diff 由 Agent 的本地 Git/终端工具完成，不伪装成云端能力，也不会要求安装 LCE 插件。
 
@@ -105,11 +105,12 @@ go build -o acemcp-relay .
 | 变量 | 说明 | 默认值 |
 |------|------|--------|
 | `LCE_MCP_URL` | LCE MCP HTTP endpoint | `http://127.0.0.1:3000/mcp` |
+| `LCE_CLOUD_DATABASE_URL` | LCE cloud PostgreSQL URL; the database must have pgvector available | required for tenant indexing |
 | `LCE_TENANT_ASSERTION_SECRET` | 与 LCE 共享的租户断言密钥（≥32 字符）。relay 用它为每次带 `tenant_id` 的调用签发短时效断言，LCE 校验通过才认这个租户 | 空（不签发） |
 
 `tenant_id` 在 MCP 里只是普通工具入参，LCE 无法区分授权调用与伪造调用——不做校验时，任何能连到 LCE 端口的人都可以读、写、甚至用 `codebase_clear_index` 清空**任意**租户的索引。配置该密钥后，租户隔离不再只依赖"LCE 端口不对外暴露"这一条前提。
 
-健康探测走 LCE 的 `GET {LCE_MCP_URL}/health`：不建立 session、不占用 LCE 的请求并发额度。不要用完整的 `initialize` 当探针——每次探测都会占掉一个 session 名额，且只在空闲 TTL 后释放，稳态下会把自己挡在 503 外面。
+存活探测走 LCE 的 `GET {LCE_MCP_URL}/health`；部署编排的就绪探测走 `GET {LCE_MCP_URL}/ready`，后者还会确认 PostgreSQL/pgvector schema 与平台 embedding provider 可用。两者都不建立 MCP session。
 
 升级顺序：先部署 relay（LCE 未配密钥时会忽略该请求头），再给 LCE 配上同一个密钥。反过来会在 relay 更新前中断租户调用。
 
@@ -140,7 +141,7 @@ go build -o acemcp-relay .
 | `CONSOLE_API_SECRET` | 网页控制台调用索引统计/清除接口的内部凭据，须与前端 `BETTER_AUTH_SECRET` 相同；Compose 部署已自动传入 | （空） |
 | `DEFAULT_DAILY_REQUEST_LIMIT` | 每用户每日请求上限默认值（Asia/Shanghai 自然日），超限返回 429；`0` 不限。可在控制台「配额管理」按用户覆盖（`user_quotas` 表，改后即时生效） | `0` |
 | `DAILY_INDEX_BYTES_LIMIT` | 每用户每日索引字节上限（Asia/Shanghai 自然日），`0` 表示不限。每次 `codebase_index upload` 同时计入常规 MCP 请求配额和实际上传内容的字节配额；单文件与单批原始内容上限均为 512 KiB，完整 manifest 所在的客户端 MCP 请求体上限为 32 MiB，转发给 LCE 的单次 JSON-RPC 请求体上限为 4 MiB | `2147483648`（2 GiB） |
-| `MODEL_CONFIG_SECRET` | 按用户模型配置（BYO 模型）的加密密钥，须与前端设置相同的值；未设置时该特性关闭。用户在控制台「模型设置」配置自己的 embedding/rerank（含自己的 API key，AES-256-GCM 加密存于 `user_model_configs`），Relay 解密后按请求注入 LCE；配置变化时自动清空该租户索引，下一次 `codebase_index` 同步会全量重建 | （空） |
+| `MODEL_CONFIG_SECRET` | 按用户 rerank 配置的加密密钥，须与前端设置相同；未设置时关闭。用户密钥以 AES-256-GCM 加密存于 `user_model_configs`，Relay 解密后仅按检索请求注入 rerank。云端 embedding 和向量空间始终由 LCE 服务端控制，修改 rerank 不会清空或重建索引 | （空） |
 
 设备由前端 `/api/mcp-device` 为控制台生成的 MCP 配置登记，配置中的 `X-Client-Id` 用于远程 MCP 设备绑定。
 活跃设备数由前端 `MAX_DEVICES_PER_USER` 控制，默认 `1`，即**单设备互踢**：
@@ -173,7 +174,7 @@ GROUP BY user_id ORDER BY evictions DESC LIMIT 20;
 - **`error_details`**：错误详情，关联到 request_logs，区分代理层（proxy）和上游（upstream）错误
 - **`leaderboard`**：每日用户请求量排行榜
 - **`health_checks`**：LCE MCP 健康检查历史，记录状态、延迟、错误信息及下次检查时间
-- **`index_workspaces`**：用户工作区最近一次完成索引的分支、revision 和时间
+- **`index_workspaces`**：用户工作区最近一次完成索引的分支、代码 revision、LCE cloud revision 和时间
 - **`index_jobs`**：索引任务状态、固定 `root_id`、阶段、文件/chunk 进度、心跳和错误；完成状态只在符号图收敛成功后提交
 - **`index_job_files`**：运行中任务的 manifest 和批次提交状态，任务完成、失败或超时后回收
 - **`indexed_files`**：服务端已完成索引的工作区文件快照，用于后续增量比较和删除检测

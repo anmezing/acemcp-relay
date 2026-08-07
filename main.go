@@ -963,7 +963,7 @@ func isChatMCPToolAllowed(name string) bool {
 	return allowed
 }
 
-func chatMCPToolUsesModelConfig(name string) bool {
+func chatMCPToolUsesRerankConfig(name string) bool {
 	return name == "codebase-retrieval"
 }
 
@@ -1481,7 +1481,7 @@ func handleMCPToolsCall(c *gin.Context, id json.RawMessage, params json.RawMessa
 	var operationLease *indexOperationLease
 	var cfg map[string]interface{}
 	var err error
-	if chatMCPToolUsesModelConfig(p.Name) {
+	if chatMCPToolUsesRerankConfig(p.Name) {
 		operationLease, cfg, err = acquireModelConfigOperation(c.Request.Context(), userID, "chat-retrieval")
 	} else {
 		operationLease, err = acquireSharedIndexOperation(

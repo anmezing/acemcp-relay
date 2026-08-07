@@ -36,12 +36,12 @@ func jobRow(status string, deletedCount int) *sqlmock.Rows {
 	return sqlmock.NewRows([]string{
 		"id", "workspace_id", "workspace_name", "root_id", "branch", "revision", "mode", "phase", "status",
 		"workspace_files", "total_files", "indexed_files", "failed_files", "total_chunks",
-		"indexed_chunks", "chunk_count_fallback", "deleted_count", "error", "model_fingerprint",
+		"indexed_chunks", "chunk_count_fallback", "deleted_count", "error", "cloud_revision",
 		"started_at", "heartbeat_at", "completed_at",
 	}).AddRow(
 		"job-1", "ws-1", "workspace", "", "main", "rev-1", "full", "indexing", status,
 		10, 10, 0, 0, int64(0),
-		int64(0), false, deletedCount, "", "",
+		int64(0), false, deletedCount, "", int64(0),
 		now, now, nil,
 	)
 }
