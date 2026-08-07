@@ -133,6 +133,21 @@ func TestLCEIndexJobArgsUseCloudProtocolWithoutUserEmbeddingConfig(t *testing.T)
 	}
 }
 
+func TestLCEFullJobBeginMarksRootReplacement(t *testing.T) {
+	args := lceBeginIndexJobArgs(
+		"tenant-1", "7e224a32-3423-4bb0-9213-3c55a5797c9d", "repo-a", true,
+	)
+	if value, ok := args["replace_root"].(bool); !ok || !value {
+		t.Fatalf("replace_root: got %#v, want true", args["replace_root"])
+	}
+	incremental := lceBeginIndexJobArgs(
+		"tenant-1", "7e224a32-3423-4bb0-9213-3c55a5797c9d", "repo-a", false,
+	)
+	if _, ok := incremental["replace_root"]; ok {
+		t.Fatal("incremental begin must not request root replacement")
+	}
+}
+
 func TestExtractCloudRevision(t *testing.T) {
 	for _, content := range []string{
 		`{"revision":2,"rootId":"repo-a"}`,

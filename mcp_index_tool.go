@@ -106,7 +106,7 @@ func codebaseIndexToolDefinition() (json.RawMessage, error) {
 			"The Agent must read the workspace with its native file tools, exclude secrets/binaries/generated dependencies, and call operations in order: " +
 			"start with the complete UTF-8 file manifest and stable root_id; upload only pending_files in bounded batches; " +
 			"call upload once with an empty files array when start reports only deletions; complete after every pending file is accepted; " +
-			"call fail if the workflow cannot finish. status refreshes the job heartbeat. The server injects tenant identity and enforces " +
+			"call fail if the workflow cannot finish. status renews both Relay and cloud staging leases. The server injects tenant identity and enforces " +
 			"SHA-256 content matching, manifest and batch limits, byte quota, model fingerprint, root isolation, deletion handling, and graph finalization.",
 		"inputSchema": map[string]interface{}{
 			"type": "object",

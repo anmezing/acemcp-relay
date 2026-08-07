@@ -37,7 +37,7 @@ LCE 的多租户远程 MCP 服务。IDE Agent 只需配置一个 Streamable HTTP
 - `codebase_tenant_stats`：查询当前租户的聚合索引统计。
 - `codebase_index`：不依赖 IDE 插件的索引入口。Agent 使用自身文件读取能力提交完整 manifest，再按 `pending_files` 分批上传内容，最后完成任务并收敛符号图。
 
-`codebase_index` 的操作顺序为 `start -> upload -> complete`，可用 `status` 刷新心跳和查询进度，失败时调用 `fail` 回收任务。服务端负责注入 `tenant_id`，并强制执行 SHA-256 内容匹配、路径过滤、manifest/批次上限、每日索引字节配额、root 隔离和删除检测。Relay 使用同一个 job UUID 调用 LCE 的内部 `begin -> stage -> publish/abort` 协议；PostgreSQL 中的词法、精确、向量和符号图数据只在 publish 时原子可见。`codebase_remote_index` 和 `codebase_clear_index` 是内部控制面，不能由模型直接调用。
+`codebase_index` 的操作顺序为 `start -> upload -> complete`，可用 `status` 同步续期 Relay 与 LCE 的任务租约并查询进度，失败时调用 `fail` 回收任务。服务端负责注入 `tenant_id`，并强制执行 SHA-256 内容匹配、路径过滤、manifest/批次上限、每日索引字节配额、root 隔离和删除检测。Relay 使用同一个 job UUID 调用 LCE 的内部 `begin -> stage/renew -> publish/abort` 协议；首次 full job 以 `replace_root=true` 发布完整根快照，能够清除仅存在于云端的旧文件。PostgreSQL 中的词法、精确、向量和经编译器细化的符号图数据只在 publish 时原子可见。`codebase_remote_index` 和 `codebase_clear_index` 是内部控制面，不能由模型直接调用。
 
 远端服务无法读取 IDE 所在机器的文件系统或 `.git` 目录。文件扫描由 IDE Agent 的原生文件工具完成；Git 状态、历史、blame 和工作区 diff 由 Agent 的本地 Git/终端工具完成，不伪装成云端能力，也不会要求安装 LCE 插件。
 

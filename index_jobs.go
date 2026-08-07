@@ -26,6 +26,7 @@ const (
 
 	indexJobHeartbeatTimeout = 10 * time.Minute
 	indexJobSweepInterval    = time.Minute
+	indexJobRenewCallTimeout = 15 * time.Second
 	maxIndexManifestFiles    = 100000
 	maxIndexBatchFiles       = 50
 	// 单个文件的内容上限。源码文件极少接近这个量级，而 embedding 本身也有
@@ -555,7 +556,7 @@ func createIndexJob(ctx context.Context, userID string, req indexStartRequest) (
 			log.Printf("[INDEX] cloud abort cleanup failed for superseded job %s: %v", superseded.id, abortErr)
 		}
 	}
-	if err := beginLCEIndexJob(opCtx, userID, jobID, req.RootID); err != nil {
+	if err := beginLCEIndexJob(opCtx, userID, jobID, req.RootID, mode == "full"); err != nil {
 		if abortErr := abortLCEIndexJob(context.Background(), userID, jobID, req.RootID); abortErr != nil {
 			log.Printf("[INDEX] cloud abort cleanup failed after begin error for job %s: %v", jobID, abortErr)
 		}
@@ -583,16 +584,27 @@ func getIndexJob(ctx context.Context, userID, jobID string) (indexJobView, error
 	if jobID == "" {
 		return indexJobView{}, fmt.Errorf("index job id is required")
 	}
-	_, _ = db.ExecContext(ctx, `
-		UPDATE index_jobs SET heartbeat_at = NOW()
-		WHERE id = $1 AND user_id = $2 AND status = $3
-	`, jobID, userID, indexJobStatusRunning)
 	job, err := loadIndexJob(ctx, userID, jobID)
 	if err == sql.ErrNoRows {
 		return indexJobView{}, fmt.Errorf("index job not found")
 	}
 	if err != nil {
 		return indexJobView{}, err
+	}
+	if job.Status == indexJobStatusRunning {
+		if err := renewLCEIndexJob(ctx, userID, job.ID, job.RootID); err != nil {
+			return indexJobView{}, err
+		}
+		if _, err := db.ExecContext(ctx, `
+			UPDATE index_jobs SET heartbeat_at = NOW()
+			WHERE id = $1 AND user_id = $2 AND status = $3
+		`, jobID, userID, indexJobStatusRunning); err != nil {
+			return indexJobView{}, err
+		}
+		job, err = loadIndexJob(ctx, userID, jobID)
+		if err != nil {
+			return indexJobView{}, err
+		}
 	}
 	return job, nil
 }
@@ -1101,8 +1113,8 @@ func completeIndexJob(ctx context.Context, userID, jobID string) (indexJobView, 
 	return job, nil
 }
 
-func beginLCEIndexJob(ctx context.Context, userID, jobID, rootID string) error {
-	args := lceIndexJobArgs(userID, jobID, rootID, "begin")
+func beginLCEIndexJob(ctx context.Context, userID, jobID, rootID string, replaceRoot bool) error {
+	args := lceBeginIndexJobArgs(userID, jobID, rootID, replaceRoot)
 	if _, err := validateMCPToolCallBody("codebase_remote_index", args); err != nil {
 		return err
 	}
@@ -1112,6 +1124,29 @@ func beginLCEIndexJob(ctx context.Context, userID, jobID, rootID string) error {
 	}
 	if result.IsError {
 		return newIndexUpstreamError("LCE cloud index begin failed: %s", string(result.Content))
+	}
+	return nil
+}
+
+func lceBeginIndexJobArgs(userID, jobID, rootID string, replaceRoot bool) map[string]interface{} {
+	args := lceIndexJobArgs(userID, jobID, rootID, "begin")
+	if replaceRoot {
+		args["replace_root"] = true
+	}
+	return args
+}
+
+func renewLCEIndexJob(ctx context.Context, userID, jobID, rootID string) error {
+	args := lceIndexJobArgs(userID, jobID, rootID, "renew")
+	if _, err := validateMCPToolCallBody("codebase_remote_index", args); err != nil {
+		return err
+	}
+	result, err := lce.callToolWithTimeout(ctx, "codebase_remote_index", args, indexJobRenewCallTimeout)
+	if err != nil {
+		return newIndexUpstreamError("LCE cloud index renew failed: %w", err)
+	}
+	if result.IsError {
+		return newIndexUpstreamError("LCE cloud index renew failed: %s", string(result.Content))
 	}
 	return nil
 }

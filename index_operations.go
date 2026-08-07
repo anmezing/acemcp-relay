@@ -49,6 +49,8 @@ func (l *indexOperationLease) Release() {
 }
 
 func acquireSharedIndexOperation(ctx context.Context, userID, resource, kind string) (*indexOperationLease, error) {
+	// "shared" means shared at the user scope: different resources may run in
+	// parallel, while the SQL conflict predicate still serializes one resource.
 	return acquireIndexOperation(ctx, userID, resource, kind, indexOperationShared)
 }
 
