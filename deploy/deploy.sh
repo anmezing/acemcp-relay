@@ -13,8 +13,7 @@ git -C "$FRONTEND_DIR" pull
 
 echo "=== Building cloud client ==="
 cd "$LCE_DIR"
-pnpm install --frozen-lockfile
-pnpm build:cloud
+npx esbuild src/cloud/entry.ts --bundle --platform=node --target=node20 --format=cjs --minify --outfile=dist/lce-cloud.cjs
 cp dist/lce-cloud.cjs "$FRONTEND_DIR/public/lce-cloud.cjs"
 cp src/cloud/boot.js "$FRONTEND_DIR/public/boot.js"
 echo "  -> copied boot.js + lce-cloud.cjs to frontend/public/"
