@@ -13,12 +13,14 @@ git -C "$FRONTEND_DIR" pull
 
 echo "=== Building cloud client ==="
 BUILD_DIR=$(mktemp -d)
-cp -r "$LCE_DIR/src/cloud" "$BUILD_DIR/cloud"
+mkdir -p "$BUILD_DIR/src"
+cp -r "$LCE_DIR/src/cloud" "$BUILD_DIR/src/cloud"
+cp -r "$LCE_DIR/src/languages" "$BUILD_DIR/src/languages"
 cd "$BUILD_DIR"
 npm init -y >/dev/null 2>&1
 npm install --ignore-scripts --no-audit --no-fund \
   @modelcontextprotocol/server @modelcontextprotocol/client ignore esbuild
-npx esbuild cloud/entry.ts --bundle --platform=node --target=node20 --format=cjs --minify --outfile=lce-cloud.cjs
+npx esbuild src/cloud/entry.ts --bundle --platform=node --target=node20 --format=cjs --minify --outfile=lce-cloud.cjs
 mkdir -p "$LCE_DIR/dist"
 cp lce-cloud.cjs "$LCE_DIR/dist/"
 cp "$LCE_DIR/src/cloud/boot.js" "$FRONTEND_DIR/public/boot.js"
