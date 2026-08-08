@@ -125,8 +125,7 @@ func TestAppendCodebaseIndexToolRejectsDuplicateDefinition(t *testing.T) {
 func TestAppendCodebaseIndexToolExposesExactlyFourPublicTools(t *testing.T) {
 	upstream := json.RawMessage(`[
 		{"name":"codebase-retrieval"},
-		{"name":"codebase_symbol_graph"},
-		{"name":"codebase_tenant_stats"}
+		{"name":"codebase_symbol_graph"}
 	]`)
 	combined, err := appendCodebaseIndexTool(upstream)
 	if err != nil {
@@ -138,7 +137,7 @@ func TestAppendCodebaseIndexToolExposesExactlyFourPublicTools(t *testing.T) {
 	if err := json.Unmarshal(combined, &tools); err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"codebase-retrieval", "codebase_symbol_graph", "codebase_tenant_stats", codebaseIndexToolName}
+	want := []string{"codebase-retrieval", "codebase_symbol_graph", codebaseIndexToolName}
 	if len(tools) != len(want) {
 		t.Fatalf("public tool count = %d, want %d", len(tools), len(want))
 	}

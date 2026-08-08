@@ -30,7 +30,7 @@ import (
 const (
 	tenantAssertionVersion = "v1"
 	// 断言可被捕获者在有效期内重放（仅限该租户），因此有效期要短，链路仍应是私网或 TLS。
-	tenantAssertionTTL = 120 * time.Second
+	tenantAssertionTTL = 30 * time.Second
 	// 与 LCE 侧一致：过短的密钥不构成认证，直接拒绝而不是假装能用。
 	minTenantAssertionSecretLength = 32
 )

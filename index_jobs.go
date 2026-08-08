@@ -988,11 +988,12 @@ func completeIndexJob(ctx context.Context, userID, jobID string) (indexJobView, 
 	var preStatus, rootID string
 	var preTotalFiles, preIndexedFiles, preDeletedCount int
 	var preDeletionsSent bool
+	var preCloudRevision int64
 	err = db.QueryRowContext(opCtx, `
-		SELECT status, root_id, total_files, indexed_files, deleted_count, deletions_sent
+		SELECT status, root_id, total_files, indexed_files, deleted_count, deletions_sent, cloud_revision
 		FROM index_jobs WHERE id = $1 AND user_id = $2
 	`, jobID, userID).Scan(
-		&preStatus, &rootID, &preTotalFiles, &preIndexedFiles, &preDeletedCount, &preDeletionsSent,
+		&preStatus, &rootID, &preTotalFiles, &preIndexedFiles, &preDeletedCount, &preDeletionsSent, &preCloudRevision,
 	)
 	if err == sql.ErrNoRows {
 		return indexJobView{}, fmt.Errorf("index job not found")
@@ -1009,20 +1010,29 @@ func completeIndexJob(ctx context.Context, userID, jobID string) (indexJobView, 
 	if preDeletedCount > 0 && !preDeletionsSent {
 		return indexJobView{}, fmt.Errorf("index job still has pending deletions")
 	}
-	args := lceIndexJobArgs(userID, jobID, rootID, "publish")
-	if _, err := validateMCPToolCallBody("codebase_remote_index", args); err != nil {
-		return indexJobView{}, err
-	}
-	result, err := lce.callToolWithTimeout(opCtx, "codebase_remote_index", args, remoteIndexMCPCallTimeout)
-	if err != nil {
-		return indexJobView{}, newIndexUpstreamError("LCE cloud index publish failed: %w", err)
-	}
-	if result.IsError {
-		return indexJobView{}, newIndexUpstreamError("LCE cloud index publish failed: %s", string(result.Content))
-	}
-	cloudRevision, err := extractCloudRevision(result.Content)
-	if err != nil {
-		return indexJobView{}, newIndexUpstreamError("LCE cloud index publish returned an invalid revision: %w", err)
+	var cloudRevision int64
+	if preCloudRevision > 0 {
+		cloudRevision = preCloudRevision
+	} else {
+		args := lceIndexJobArgs(userID, jobID, rootID, "publish")
+		if _, err := validateMCPToolCallBody("codebase_remote_index", args); err != nil {
+			return indexJobView{}, err
+		}
+		result, err := lce.callToolWithTimeout(opCtx, "codebase_remote_index", args, remoteIndexMCPCallTimeout)
+		if err != nil {
+			return indexJobView{}, newIndexUpstreamError("LCE cloud index publish failed: %w", err)
+		}
+		if result.IsError {
+			return indexJobView{}, newIndexUpstreamError("LCE cloud index publish failed: %s", string(result.Content))
+		}
+		cloudRevision, err = extractCloudRevision(result.Content)
+		if err != nil {
+			return indexJobView{}, newIndexUpstreamError("LCE cloud index publish returned an invalid revision: %w", err)
+		}
+		_, _ = db.ExecContext(opCtx, `
+			UPDATE index_jobs SET cloud_revision = $1, heartbeat_at = NOW()
+			WHERE id = $2 AND user_id = $3 AND status = $4
+		`, cloudRevision, jobID, userID, indexJobStatusRunning)
 	}
 
 	tx, err := beginLockedIndexUserTx(opCtx, userID)
@@ -1342,21 +1352,22 @@ func sweepExpiredIndexJobs(ctx context.Context) {
 		SET status = $1, phase = 'done', failed_files = total_files - indexed_files,
 			error = 'index job heartbeat timed out', completed_at = NOW()
 		WHERE status = $2 AND heartbeat_at < $3
-		RETURNING id::text, user_id, root_id
+		RETURNING id::text, user_id, root_id, cloud_revision
 	`, indexJobStatusTimedOut, indexJobStatusRunning, time.Now().Add(-indexJobHeartbeatTimeout))
 	if err != nil {
 		log.Printf("[INDEX] Failed to sweep timed out jobs: %v", err)
 		return
 	}
 	type expiredJob struct {
-		id     string
-		userID string
-		rootID string
+		id            string
+		userID        string
+		rootID        string
+		cloudRevision int64
 	}
 	var jobs []expiredJob
 	for rows.Next() {
 		var job expiredJob
-		if err := rows.Scan(&job.id, &job.userID, &job.rootID); err != nil {
+		if err := rows.Scan(&job.id, &job.userID, &job.rootID, &job.cloudRevision); err != nil {
 			// 出错必须整体放弃：吞掉 Scan 错误会让对应 job 被标成 timed_out
 			// 却漏删 index_job_files，永久泄漏。回滚后下一轮 sweep 重来。
 			rows.Close()
@@ -1381,6 +1392,10 @@ func sweepExpiredIndexJobs(ctx context.Context) {
 		return
 	}
 	for _, job := range jobs {
+		if job.cloudRevision > 0 {
+			log.Printf("[INDEX] skipping cloud abort for timed out job %s: LCE publish already succeeded (revision=%d)", job.id, job.cloudRevision)
+			continue
+		}
 		if abortErr := abortLCEIndexJob(ctx, job.userID, job.id, job.rootID); abortErr != nil {
 			log.Printf("[INDEX] cloud abort cleanup failed for timed out job %s: %v", job.id, abortErr)
 		}

@@ -14,6 +14,7 @@ import (
 	"io"
 	"log"
 	"math"
+	"net"
 	"net/http"
 	"net/http/pprof"
 	"os"
@@ -93,6 +94,9 @@ func loadConfig() {
 	}
 	tenantAssertions = signer
 	if tenantAssertions == nil {
+		if !isLoopbackServerAddr(serverAddr) {
+			log.Fatalf("[CONFIG] LCE_TENANT_ASSERTION_SECRET is required when binding to a non-loopback address (%s)", serverAddr)
+		}
 		log.Println("[CONFIG] LCE_TENANT_ASSERTION_SECRET 未配置：不签发租户断言。若 LCE 已开启校验，租户调用会被拒绝")
 	}
 	dbHost = getEnv("DB_HOST", "localhost")
@@ -152,6 +156,18 @@ func previewBytesForLog(data []byte, maxBytes int) string {
 		preview += fmt.Sprintf("...[truncated %d bytes]", len(data)-limit)
 	}
 	return strconv.Quote(preview)
+}
+
+func isLoopbackServerAddr(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func getEnv(key, defaultValue string) string {
@@ -931,10 +947,6 @@ var chatMCPToolPolicies = map[string]chatMCPToolPolicy{
 			"response_format",
 		),
 		required: stringSet("root_id", "symbol"),
-	},
-	"codebase_tenant_stats": {
-		description: "Return aggregate statistics for the authenticated user's server-side LCE index. The service supplies the tenant identity.",
-		arguments:   stringSet("response_format"),
 	},
 }
 

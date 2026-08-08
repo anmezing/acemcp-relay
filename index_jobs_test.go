@@ -190,7 +190,7 @@ func TestFilterChatMCPToolsHidesIndexManagementTools(t *testing.T) {
 	for i, tool := range tools {
 		got[i] = tool.Name
 	}
-	if !reflect.DeepEqual(got, []string{"codebase-retrieval", "codebase_symbol_graph", "codebase_tenant_stats"}) {
+	if !reflect.DeepEqual(got, []string{"codebase-retrieval", "codebase_symbol_graph"}) {
 		t.Fatalf("unexpected chat MCP tools: %#v", got)
 	}
 }
@@ -207,7 +207,6 @@ func TestFilterChatMCPToolsRequiresExactRemoteContract(t *testing.T) {
 		validTool("codebase-retrieval"),
 		validTool("codebase-retrieval"),
 		validTool("codebase_symbol_graph"),
-		validTool("codebase_tenant_stats"),
 	}, ",") + "]")
 	if _, err := filterChatMCPTools(duplicate); err == nil {
 		t.Fatal("duplicate remote tools must fail the Relay contract")
@@ -215,7 +214,7 @@ func TestFilterChatMCPToolsRequiresExactRemoteContract(t *testing.T) {
 }
 
 func TestChatMCPToolPolicyKeepsTenantToolsAndRejectsRawManagement(t *testing.T) {
-	for _, allowed := range []string{"codebase-retrieval", "codebase_symbol_graph", "codebase_tenant_stats", codebaseIndexToolName} {
+	for _, allowed := range []string{"codebase-retrieval", "codebase_symbol_graph", codebaseIndexToolName} {
 		if !isChatMCPToolAllowed(allowed) {
 			t.Fatalf("%q must remain available through chat MCP", allowed)
 		}
@@ -236,8 +235,7 @@ func TestChatMCPToolPolicyKeepsTenantToolsAndRejectsRawManagement(t *testing.T) 
 func TestAppendCodebaseIndexToolExposesExactlyFourTools(t *testing.T) {
 	raw := json.RawMessage(`[
 		{"name":"codebase-retrieval","inputSchema":{"type":"object","properties":{"information_request":{"type":"string"}}}},
-		{"name":"codebase_symbol_graph","inputSchema":{"type":"object","properties":{"root_id":{"type":"string"},"symbol":{"type":"string"}}}},
-		{"name":"codebase_tenant_stats","inputSchema":{"type":"object","properties":{}}}
+		{"name":"codebase_symbol_graph","inputSchema":{"type":"object","properties":{"root_id":{"type":"string"},"symbol":{"type":"string"}}}}
 	]`)
 	filtered, err := filterChatMCPTools(raw)
 	if err != nil {
@@ -251,13 +249,13 @@ func TestAppendCodebaseIndexToolExposesExactlyFourTools(t *testing.T) {
 	if err := json.Unmarshal(combined, &tools); err != nil {
 		t.Fatal(err)
 	}
-	if len(tools) != 4 {
-		t.Fatalf("remote MCP must expose exactly four tools, got %d", len(tools))
+	if len(tools) != 3 {
+		t.Fatalf("remote MCP must expose exactly three tools, got %d", len(tools))
 	}
-	if tools[3]["name"] != codebaseIndexToolName {
-		t.Fatalf("fourth tool must be %s, got %#v", codebaseIndexToolName, tools[3]["name"])
+	if tools[2]["name"] != codebaseIndexToolName {
+		t.Fatalf("third tool must be %s, got %#v", codebaseIndexToolName, tools[2]["name"])
 	}
-	schema := tools[3]["inputSchema"].(map[string]interface{})
+	schema := tools[2]["inputSchema"].(map[string]interface{})
 	operations := schema["oneOf"].([]interface{})
 	if len(operations) != 5 {
 		t.Fatalf("index tool must advertise five lifecycle operations, got %d", len(operations))
@@ -441,7 +439,7 @@ func TestOnlyRetrievalUsesTenantRerankConfig(t *testing.T) {
 	if !chatMCPToolUsesRerankConfig("codebase-retrieval") {
 		t.Fatal("retrieval must receive the tenant rerank configuration")
 	}
-	for _, toolName := range []string{"codebase_symbol_graph", "codebase_tenant_stats"} {
+	for _, toolName := range []string{"codebase_symbol_graph"} {
 		if chatMCPToolUsesRerankConfig(toolName) {
 			t.Fatalf("%s must not depend on rerank configuration", toolName)
 		}
