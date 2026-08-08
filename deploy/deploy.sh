@@ -21,7 +21,7 @@ echo "  -> copied boot.js + lce-cloud.cjs to frontend/public/"
 
 echo "=== Rebuilding Docker containers ==="
 cd "$SCRIPT_DIR"
-docker compose up -d --build --no-deps lce relay frontend
+docker compose up -d --build --no-deps relay frontend
 
 echo "=== Done ==="
 docker compose ps
