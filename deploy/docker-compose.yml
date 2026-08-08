@@ -31,6 +31,8 @@ services:
     build: ../
     container_name: relay
     restart: unless-stopped
+    ports:
+      - "127.0.0.1:3009:3009"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
@@ -61,6 +63,8 @@ services:
     build: ../../acemcp-relay-frontend
     container_name: frontend
     restart: unless-stopped
+    ports:
+      - "127.0.0.1:3001:3001"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     environment:
