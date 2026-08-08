@@ -3,13 +3,13 @@ services:
     build: ../../lce
     container_name: lce
     restart: unless-stopped
+    volumes:
+      - lce_data:/data
     extra_hosts:
       - "host.docker.internal:host-gateway"
     environment:
+      LCE_HOME: /data
       LCE_CLOUD_DATABASE_URL: ${LCE_CLOUD_DATABASE_URL:?set a PostgreSQL URL whose server has pgvector installed}
-      # 与 relay 共享的租户断言密钥。LCE 以 --host 0.0.0.0 启动（relay 要跨容器访问），
-      # 属于"远程调用方"，不配这个密钥时 LCE 会把所有租户工具下架——因为此时它无法
-      # 验证 tenant_id 的真伪，而 tenant_id 只是一个普通工具入参。
       LCE_TENANT_ASSERTION_SECRET: ${LCE_TENANT_ASSERTION_SECRET:?set LCE_TENANT_ASSERTION_SECRET in .env (>=32 chars, shared with relay)}
       EMBEDDINGS_PROVIDER: ${EMBEDDINGS_PROVIDER:-}
       EMBEDDINGS_MODEL: ${EMBEDDINGS_MODEL:-}
@@ -21,7 +21,6 @@ services:
       RERANK_BASE_URL: ${RERANK_BASE_URL:-}
       RERANK_API_KEY: ${RERANK_API_KEY:-}
     healthcheck:
-      # 就绪端点：不建 session，且确认 PostgreSQL/pgvector schema 与 embedding provider 可用。
       test: ["CMD-SHELL", "node -e \"fetch('http://localhost:3000/mcp/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
       interval: 30s
       timeout: 10s
@@ -32,8 +31,6 @@ services:
     build: ../
     container_name: relay
     restart: unless-stopped
-    ports:
-      - "127.0.0.1:3009:3009"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
@@ -42,7 +39,6 @@ services:
     environment:
       SERVER_ADDR: "0.0.0.0:3009"
       LCE_MCP_URL: http://lce:3000/mcp
-      # 必须与 lce 服务里的值一致：relay 用它签发租户断言，LCE 用它校验。
       LCE_TENANT_ASSERTION_SECRET: ${LCE_TENANT_ASSERTION_SECRET:?set LCE_TENANT_ASSERTION_SECRET in .env (>=32 chars, shared with lce)}
       DB_HOST: host.docker.internal
       DB_PORT: "5432"
@@ -57,15 +53,14 @@ services:
       DEVICE_MAX_IPS: ${DEVICE_MAX_IPS:-3}
       CONSOLE_API_SECRET: ${BETTER_AUTH_SECRET:?set BETTER_AUTH_SECRET in .env}
       DEFAULT_DAILY_REQUEST_LIMIT: ${DEFAULT_DAILY_REQUEST_LIMIT:-0}
-      # 索引通道按字节计费，与请求数配额分开。默认 2GiB；未设置时用代码默认值。
       DAILY_INDEX_BYTES_LIMIT: ${DAILY_INDEX_BYTES_LIMIT:-2147483648}
       MODEL_CONFIG_SECRET: ${MODEL_CONFIG_SECRET:-}
+      API_KEY_CACHE_TTL: ${API_KEY_CACHE_TTL:-30m}
+
   frontend:
     build: ../../acemcp-relay-frontend
     container_name: frontend
     restart: unless-stopped
-    ports:
-      - "127.0.0.1:3001:3001"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     environment:
@@ -94,3 +89,6 @@ services:
       RERANK_MODEL: ${RERANK_MODEL:-}
       RERANK_BASE_URL: ${RERANK_BASE_URL:-}
       MODEL_CONFIG_SECRET: ${MODEL_CONFIG_SECRET:-}
+
+volumes:
+  lce_data:

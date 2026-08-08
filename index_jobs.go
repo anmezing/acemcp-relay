@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"database/sql"
@@ -552,7 +553,7 @@ func createIndexJob(ctx context.Context, userID string, req indexStartRequest) (
 		return createIndexJobResponse{}, err
 	}
 	for _, superseded := range supersededJobs {
-		if abortErr := abortLCEIndexJob(opCtx, userID, superseded.id, superseded.rootID); abortErr != nil {
+		if abortErr := abortLCEIndexJob(context.Background(), userID, superseded.id, superseded.rootID); abortErr != nil {
 			log.Printf("[INDEX] cloud abort cleanup failed for superseded job %s: %v", superseded.id, abortErr)
 		}
 	}
@@ -592,8 +593,8 @@ func getIndexJob(ctx context.Context, userID, jobID string) (indexJobView, error
 		return indexJobView{}, err
 	}
 	if job.Status == indexJobStatusRunning {
-		if err := renewLCEIndexJob(ctx, userID, job.ID, job.RootID); err != nil {
-			return indexJobView{}, err
+		if renewErr := renewLCEIndexJob(ctx, userID, job.ID, job.RootID); renewErr != nil {
+			log.Printf("[INDEX] cloud renew best-effort failed for job %s (status query continues): %v", jobID, renewErr)
 		}
 		if _, err := db.ExecContext(ctx, `
 			UPDATE index_jobs SET heartbeat_at = NOW()
@@ -1088,16 +1089,13 @@ func completeIndexJob(ctx context.Context, userID, jobID string) (indexJobView, 
 		`, userID, workspaceID, workspaceName, rootID, branch, revision, cloudRevision); err != nil {
 		return indexJobView{}, err
 	}
-	totalChunkExpr := "total_chunks"
-	if !fallback {
-		totalChunkExpr = "indexed_chunks"
-	}
-	if _, err = tx.ExecContext(opCtx, fmt.Sprintf(`
+	if _, err = tx.ExecContext(opCtx, `
 		UPDATE index_jobs
-		SET status = '%s', phase = 'done', total_chunks = %s, cloud_revision = $2,
-			heartbeat_at = NOW(), completed_at = NOW()
+		SET status = $3, phase = 'done',
+			total_chunks = CASE WHEN $4 THEN indexed_chunks ELSE total_chunks END,
+			cloud_revision = $2, heartbeat_at = NOW(), completed_at = NOW()
 		WHERE id = $1
-	`, indexJobStatusCompleted, totalChunkExpr), jobID, cloudRevision); err != nil {
+	`, jobID, cloudRevision, indexJobStatusCompleted, !fallback); err != nil {
 		return indexJobView{}, err
 	}
 	if _, err = tx.ExecContext(opCtx, `DELETE FROM index_job_files WHERE job_id = $1`, jobID); err != nil {
@@ -1176,8 +1174,10 @@ func lceIndexJobArgs(userID, jobID, rootID, operation string) map[string]interfa
 }
 
 func extractCloudRevision(content []byte) (int64, error) {
+	dec := json.NewDecoder(bytes.NewReader(content))
+	dec.UseNumber()
 	var value interface{}
-	if err := json.Unmarshal(content, &value); err != nil {
+	if err := dec.Decode(&value); err != nil {
 		return 0, err
 	}
 	object, ok := value.(map[string]interface{})
@@ -1191,21 +1191,15 @@ func extractCloudRevision(content []byte) (int64, error) {
 	if !ok {
 		return 0, fmt.Errorf("publish response has no revision")
 	}
-	switch number := raw.(type) {
-	case float64:
-		if number < 0 || number != float64(int64(number)) {
-			return 0, fmt.Errorf("revision is not a non-negative integer")
-		}
-		return int64(number), nil
-	case json.Number:
-		value, err := number.Int64()
-		if err != nil || value < 0 {
-			return 0, fmt.Errorf("revision is not a non-negative integer")
-		}
-		return value, nil
-	default:
+	number, ok := raw.(json.Number)
+	if !ok {
 		return 0, fmt.Errorf("revision has an invalid type")
 	}
+	rev, err := number.Int64()
+	if err != nil || rev < 0 {
+		return 0, fmt.Errorf("revision is not a non-negative integer")
+	}
+	return rev, nil
 }
 
 func failIndexJob(ctx context.Context, userID, jobID, failure string) (indexJobView, error) {
