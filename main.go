@@ -973,13 +973,6 @@ var chatMCPToolPolicies = map[string]chatMCPToolPolicy{
 		),
 		required: stringSet("root_id", "symbol"),
 	},
-	"codebase_tenant_stats": {
-		description: "Get index statistics for the authenticated tenant: file count, chunk count, vector-indexed count, total size, and language breakdown.",
-		arguments: stringSet(
-			"response_format",
-		),
-		required: nil,
-	},
 }
 
 func stringSet(values ...string) map[string]struct{} {
