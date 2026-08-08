@@ -11,12 +11,13 @@ git -C "$LCE_DIR" pull
 git -C "$RELAY_DIR" pull
 git -C "$FRONTEND_DIR" pull
 
-echo "=== Building cloud client (lce-cloud.js) ==="
+echo "=== Building cloud client ==="
 cd "$LCE_DIR"
 pnpm install --frozen-lockfile
 pnpm build:cloud
-cp dist/lce-cloud.js "$FRONTEND_DIR/public/lce-cloud.js"
-echo "  -> copied to frontend/public/lce-cloud.js"
+cp dist/lce-cloud.cjs "$FRONTEND_DIR/public/lce-cloud.cjs"
+cp src/cloud/boot.js "$FRONTEND_DIR/public/boot.js"
+echo "  -> copied boot.js + lce-cloud.cjs to frontend/public/"
 
 echo "=== Rebuilding Docker containers ==="
 cd "$SCRIPT_DIR"
