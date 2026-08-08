@@ -56,6 +56,7 @@ var (
 	dailyIndexBytesLimit     int64
 	debugCapturePaths        map[string]bool
 	debugCaptureMaxBytes     int
+	minClientVersion         string
 )
 
 const (
@@ -122,6 +123,7 @@ func loadConfig() {
 	initModelConfigKey()
 	debugCapturePaths = parsePathSet(getEnv("DEBUG_CAPTURE_PATHS", ""))
 	debugCaptureMaxBytes = getEnvInt("DEBUG_CAPTURE_MAX_BYTES", 4096)
+	minClientVersion = strings.TrimSpace(getEnv("MIN_CLIENT_VERSION", ""))
 }
 
 func parsePathSet(value string) map[string]bool {
@@ -141,6 +143,27 @@ func parsePathSet(value string) map[string]bool {
 
 func shouldDebugCapture(path string) bool {
 	return debugCapturePaths != nil && (debugCapturePaths["*"] || debugCapturePaths[path])
+}
+
+func compareVersions(a, b string) int {
+	aParts := strings.SplitN(a, ".", 4)
+	bParts := strings.SplitN(b, ".", 4)
+	for i := 0; i < 3; i++ {
+		var av, bv int
+		if i < len(aParts) {
+			av, _ = strconv.Atoi(aParts[i])
+		}
+		if i < len(bParts) {
+			bv, _ = strconv.Atoi(bParts[i])
+		}
+		if av < bv {
+			return -1
+		}
+		if av > bv {
+			return 1
+		}
+	}
+	return 0
 }
 
 func previewBytesForLog(data []byte, maxBytes int) string {
@@ -754,6 +777,17 @@ func authMiddleware() gin.HandlerFunc {
 
 		c.Set(ContextKeyUserID, userID)
 
+		if minClientVersion != "" {
+			clientVersion := strings.TrimSpace(c.GetHeader("X-LCE-Client-Version"))
+			if clientVersion != "" && compareVersions(clientVersion, minClientVersion) < 0 {
+				c.AbortWithStatusJSON(http.StatusUpgradeRequired, gin.H{
+					"error":       fmt.Sprintf("client version %s is below minimum %s; please update lce-cloud", clientVersion, minClientVersion),
+					"min_version": minClientVersion,
+				})
+				return
+			}
+		}
+
 		if isUserBanned(userID) {
 			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "account banned; contact the administrator"})
 			return
@@ -761,21 +795,10 @@ func authMiddleware() gin.HandlerFunc {
 
 		trustedConsole := isTrustedConsoleRequest(c)
 		if !trustedConsole {
-			// 设备校验在前：被 enforce 拒掉的请求不应烧掉当日请求配额。
-			deviceID, deviceOK := checkDeviceBinding(c, userID)
-			if !deviceOK {
-				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "device not authorized: this account is signed in on another device; log in again to use it here"})
-				return
-			}
-
 			if ok, limit := checkRequestQuota(userID); !ok {
 				c.Header("Retry-After", quotaRetryAfterHeader(time.Now()))
 				c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{"error": fmt.Sprintf("daily request quota exceeded (%d/day)", limit)})
 				return
-			}
-
-			if deviceID != "" {
-				go recordDeviceActivity(userID, deviceID, c.ClientIP())
 			}
 		}
 
