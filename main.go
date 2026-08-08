@@ -57,6 +57,7 @@ var (
 	debugCapturePaths        map[string]bool
 	debugCaptureMaxBytes     int
 	minClientVersion         string
+	latestClientVersion      string
 )
 
 const (
@@ -124,6 +125,7 @@ func loadConfig() {
 	debugCapturePaths = parsePathSet(getEnv("DEBUG_CAPTURE_PATHS", ""))
 	debugCaptureMaxBytes = getEnvInt("DEBUG_CAPTURE_MAX_BYTES", 4096)
 	minClientVersion = strings.TrimSpace(getEnv("MIN_CLIENT_VERSION", ""))
+	latestClientVersion = strings.TrimSpace(getEnv("LATEST_CLIENT_VERSION", ""))
 }
 
 func parsePathSet(value string) map[string]bool {
@@ -1434,6 +1436,14 @@ func handleMCPPost(c *gin.Context) {
 	}
 }
 
+func clientUpdateAvailable(c *gin.Context) bool {
+	if latestClientVersion == "" {
+		return false
+	}
+	v := strings.TrimSpace(c.GetHeader("X-LCE-Client-Version"))
+	return v != "" && compareVersions(v, latestClientVersion) < 0
+}
+
 func handleMCPToolsCall(c *gin.Context, id json.RawMessage, params json.RawMessage, userID string) {
 	var p struct {
 		Name      string                 `json:"name"`
@@ -1487,14 +1497,18 @@ func handleMCPToolsCall(c *gin.Context, id json.RawMessage, params json.RawMessa
 			completeRequestLogAsync(getRequestLogEntry(c, http.StatusOK))
 			return
 		}
-		encoded, err := json.Marshal(map[string]interface{}{
+		indexResult := map[string]interface{}{
 			"schemaVersion":  "1.0",
 			"toolName":       codebaseIndexToolName,
 			"ok":             true,
 			"tool":           codebaseIndexToolName,
 			"responseFormat": "json",
 			"payload":        payload,
-		})
+		}
+		if clientUpdateAvailable(c) {
+			indexResult["_client_update_available"] = true
+		}
+		encoded, err := json.Marshal(indexResult)
 		if err != nil {
 			c.JSON(http.StatusOK, rpcError(id, -32000, "encode index response: "+err.Error()))
 			completeRequestLogAsync(getRequestLogEntry(c, http.StatusOK))
@@ -1553,9 +1567,20 @@ func handleMCPToolsCall(c *gin.Context, id json.RawMessage, params json.RawMessa
 			p.Name, len(result.Content), previewBytesForLog(result.Content, debugCaptureMaxBytes))
 	}
 
+	contentText := string(result.Content)
+	if clientUpdateAvailable(c) {
+		var parsed map[string]interface{}
+		if json.Unmarshal(result.Content, &parsed) == nil {
+			parsed["_client_update_available"] = true
+			if reEncoded, err := json.Marshal(parsed); err == nil {
+				contentText = string(reEncoded)
+			}
+		}
+	}
+
 	c.JSON(http.StatusOK, rpcResult(id, map[string]interface{}{
 		"content": []map[string]interface{}{
-			{"type": "text", "text": string(result.Content)},
+			{"type": "text", "text": contentText},
 		},
 		"isError": result.IsError,
 	}))
