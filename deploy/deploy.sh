@@ -12,13 +12,19 @@ git -C "$RELAY_DIR" pull
 git -C "$FRONTEND_DIR" pull
 
 echo "=== Building cloud client ==="
-cd "$LCE_DIR"
-npm install --no-save --ignore-scripts --no-audit --no-fund \
-  @modelcontextprotocol/server @modelcontextprotocol/client ignore
-npx --yes esbuild src/cloud/entry.ts --bundle --platform=node --target=node20 --format=cjs --minify --outfile=dist/lce-cloud.cjs
-cp dist/lce-cloud.cjs "$FRONTEND_DIR/public/lce-cloud.cjs"
-cp src/cloud/boot.js "$FRONTEND_DIR/public/boot.js"
-echo "  -> copied boot.js + lce-cloud.cjs to frontend/public/"
+BUILD_DIR=$(mktemp -d)
+cp -r "$LCE_DIR/src/cloud" "$BUILD_DIR/cloud"
+cd "$BUILD_DIR"
+npm init -y >/dev/null 2>&1
+npm install --ignore-scripts --no-audit --no-fund \
+  @modelcontextprotocol/server @modelcontextprotocol/client ignore esbuild
+npx esbuild cloud/entry.ts --bundle --platform=node --target=node20 --format=cjs --minify --outfile=lce-cloud.cjs
+mkdir -p "$LCE_DIR/dist"
+cp lce-cloud.cjs "$LCE_DIR/dist/"
+cp "$LCE_DIR/src/cloud/boot.js" "$FRONTEND_DIR/public/boot.js"
+cp lce-cloud.cjs "$FRONTEND_DIR/public/lce-cloud.cjs"
+rm -rf "$BUILD_DIR"
+echo "  -> boot.js + lce-cloud.cjs ready"
 
 echo "=== Rebuilding Docker containers ==="
 cd "$SCRIPT_DIR"
