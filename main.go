@@ -48,10 +48,7 @@ var (
 	dbName                   string
 	redisHost                string
 	redisPort                int
-	deviceBindingMode        string
-	deviceCacheTTL           time.Duration
-	deviceIPWindow           time.Duration
-	deviceMaxIPs             int
+	bannedCacheTTL           time.Duration
 	defaultDailyRequestLimit int
 	dailyIndexBytesLimit     int64
 	debugCapturePaths        map[string]bool
@@ -108,14 +105,9 @@ func loadConfig() {
 	dbName = getEnv("DB_NAME", "postgres")
 	redisHost = getEnv("REDIS_HOST", "localhost")
 	redisPort = getEnvInt("REDIS_PORT", 6379)
-	deviceBindingMode = strings.ToLower(getEnv("DEVICE_BINDING_MODE", DeviceModeLog))
-	if deviceBindingMode != DeviceModeOff && deviceBindingMode != DeviceModeLog && deviceBindingMode != DeviceModeEnforce {
-		log.Printf("[CONFIG] invalid DEVICE_BINDING_MODE %q, falling back to %q", deviceBindingMode, DeviceModeLog)
-		deviceBindingMode = DeviceModeLog
-	}
-	deviceCacheTTL = getEnvDuration("DEVICE_CACHE_TTL", 5*time.Minute)
-	deviceIPWindow = getEnvDuration("DEVICE_IP_WINDOW", 10*time.Minute)
-	deviceMaxIPs = getEnvInt("DEVICE_MAX_IPS", 3)
+	// 沿用 DEVICE_CACHE_TTL 这个环境变量名：设备绑定移除后它只控制封禁
+	// 状态缓存，但改名会静默丢弃既有部署里已设置的值。
+	bannedCacheTTL = getEnvDuration("DEVICE_CACHE_TTL", 5*time.Minute)
 	configureTrustedConsole(getEnv("CONSOLE_API_SECRET", ""))
 	defaultDailyRequestLimit = getEnvInt("DEFAULT_DAILY_REQUEST_LIMIT", 0)
 	// 索引通道除常规请求数配额外，还按上传字节计费：同样一次 upload 可以只带
@@ -147,9 +139,15 @@ func shouldDebugCapture(path string) bool {
 	return debugCapturePaths != nil && (debugCapturePaths["*"] || debugCapturePaths[path])
 }
 
+// compareVersions 比较 "major.minor.patch[-prerelease]" 形式的版本号。
+// 数字段逐段比较；数字段相同时按 semver 语义，带预发布后缀的一方更低
+// （1.2.3-beta < 1.2.3）。两侧都带预发布后缀时不再细分先后，视为相等：
+// 门禁场景只需要"预发布 < 正式"这一档语义。
 func compareVersions(a, b string) int {
-	aParts := strings.SplitN(a, ".", 4)
-	bParts := strings.SplitN(b, ".", 4)
+	aCore, aPre, _ := strings.Cut(a, "-")
+	bCore, bPre, _ := strings.Cut(b, "-")
+	aParts := strings.SplitN(aCore, ".", 4)
+	bParts := strings.SplitN(bCore, ".", 4)
 	for i := 0; i < 3; i++ {
 		var av, bv int
 		if i < len(aParts) {
@@ -164,6 +162,12 @@ func compareVersions(a, b string) int {
 		if av > bv {
 			return 1
 		}
+	}
+	if aPre == "" && bPre != "" {
+		return 1
+	}
+	if aPre != "" && bPre == "" {
+		return -1
 	}
 	return 0
 }
@@ -714,7 +718,7 @@ func initDB() error {
 		return fmt.Errorf("failed to create health_checks index: %w", err)
 	}
 
-	if err := migrateDeviceTables(); err != nil {
+	if err := migrateAccessControlTables(); err != nil {
 		return err
 	}
 
@@ -1965,6 +1969,9 @@ func updateLeaderboard() error {
 			return fmt.Errorf("failed to scan row: %w", err)
 		}
 		results = append(results, uc)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("failed to iterate leaderboard rows: %w", err)
 	}
 
 	if len(results) == 0 {
