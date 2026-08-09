@@ -188,6 +188,12 @@ func migrateIndexingTables() error {
 		);
 		CREATE INDEX IF NOT EXISTS idx_index_operation_leases_user
 			ON index_operation_leases(user_id, lease_expires_at);
+
+		-- 存量库补列。CREATE TABLE IF NOT EXISTS 对已存在的表不生效，
+		-- 因此列的新增必须同时出现在 CREATE 文本（新库）和 ALTER（旧库）两处；
+		-- 只改 CREATE 文本会让升级后的旧库在引用新列的 SQL 上直接报错。
+		ALTER TABLE index_workspaces ADD COLUMN IF NOT EXISTS cloud_revision BIGINT NOT NULL DEFAULT 0;
+		ALTER TABLE index_jobs ADD COLUMN IF NOT EXISTS cloud_revision BIGINT NOT NULL DEFAULT 0;
 	`)
 	if err != nil {
 		return fmt.Errorf("failed to migrate indexing tables: %w", err)
@@ -1029,10 +1035,15 @@ func completeIndexJob(ctx context.Context, userID, jobID string) (indexJobView, 
 		if err != nil {
 			return indexJobView{}, newIndexUpstreamError("LCE cloud index publish returned an invalid revision: %w", err)
 		}
-		_, _ = db.ExecContext(opCtx, `
+		// 这条写入是防重复 publish（preCloudRevision > 0 短路）和防 sweeper
+		// 误 abort（heartbeat 续期）的前提：失败不阻断本次 complete，但必须可见。
+		if _, err := db.ExecContext(opCtx, `
 			UPDATE index_jobs SET cloud_revision = $1, heartbeat_at = NOW()
 			WHERE id = $2 AND user_id = $3 AND status = $4
-		`, cloudRevision, jobID, userID, indexJobStatusRunning)
+		`, cloudRevision, jobID, userID, indexJobStatusRunning); err != nil {
+			log.Printf("[INDEX] failed to record cloud_revision %d for job %s (user=%s): %v",
+				cloudRevision, jobID, userID, err)
+		}
 	}
 
 	tx, err := beginLockedIndexUserTx(opCtx, userID)
