@@ -6,25 +6,25 @@ LCE_DIR="$SCRIPT_DIR/../../lce"
 FRONTEND_DIR="$SCRIPT_DIR/../../acemcp-relay-frontend"
 RELAY_DIR="$SCRIPT_DIR/.."
 
-echo "=== Pulling latest code ==="
-git -C "$LCE_DIR" pull
-git -C "$RELAY_DIR" pull
-git -C "$FRONTEND_DIR" pull
+# 可选锁定部署版本：DEPLOY_REF_LCE / DEPLOY_REF_RELAY / DEPLOY_REF_FRONTEND
+# 指定 tag 或 commit 时按该版本部署；不指定则跟随远端分支（开发期默认）。
+update_repo() {
+  local dir="$1" ref="$2"
+  git -C "$dir" fetch --tags
+  if [ -n "$ref" ]; then
+    git -C "$dir" checkout --detach "$ref"
+  else
+    git -C "$dir" pull
+  fi
+}
 
-echo "=== Building cloud client ==="
-BUILD_DIR=$(mktemp -d)
-cp -r "$LCE_DIR/src" "$BUILD_DIR/src"
-cd "$BUILD_DIR"
-npm init -y >/dev/null 2>&1
-npm install --ignore-scripts --no-audit --no-fund \
-  @modelcontextprotocol/server @modelcontextprotocol/client ignore p-limit zod esbuild
-npx esbuild src/cloud/entry.ts --bundle --platform=node --target=node20 --format=cjs --minify --outfile=lce-cloud.cjs
-mkdir -p "$LCE_DIR/dist"
-cp lce-cloud.cjs "$LCE_DIR/dist/"
-cp "$LCE_DIR/src/cloud/boot.js" "$FRONTEND_DIR/public/boot.js"
-cp lce-cloud.cjs "$FRONTEND_DIR/public/lce-cloud.cjs"
-rm -rf "$BUILD_DIR"
-echo "  -> boot.js + lce-cloud.cjs ready"
+echo "=== Updating code ==="
+update_repo "$LCE_DIR" "${DEPLOY_REF_LCE:-}"
+update_repo "$RELAY_DIR" "${DEPLOY_REF_RELAY:-}"
+update_repo "$FRONTEND_DIR" "${DEPLOY_REF_FRONTEND:-}"
+
+# cloud 客户端不在服务器上构建：它经 lce 仓库的 publish-cloud workflow
+# 发布到 npm（@anmezing/lce-cloud），用户侧 npx 直接获取。
 
 echo "=== Rebuilding Docker containers ==="
 cd "$SCRIPT_DIR"
