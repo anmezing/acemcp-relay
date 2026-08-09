@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestCodebaseIndexDefinitionKeepsTenantAndControlFieldsServerManaged(t *testing.T) {
@@ -105,6 +106,72 @@ func TestHandleCodebaseIndexRejectsInvalidLifecycleInputBeforeDatabaseAccess(t *
 		if _, err := handleCodebaseIndex(context.Background(), "tenant", raw); err == nil {
 			t.Fatalf("invalid lifecycle input must fail: %#v", raw)
 		}
+	}
+}
+
+func TestCheckIndexStartRateLimitEnforcesPerRootInterval(t *testing.T) {
+	base := time.Now()
+
+	// full sync 首次调用必须放行
+	if wait := checkIndexStartRateLimit("rate-user-a", "root-1", base); wait != 0 {
+		t.Fatalf("first start must pass, got wait=%d", wait)
+	}
+	// 窗口内的重试要被挡下，并给出剩余等待秒数
+	if wait := checkIndexStartRateLimit("rate-user-a", "root-1", base.Add(5*time.Second)); wait <= 0 || wait > 30 {
+		t.Fatalf("retry within interval must be limited with 0 < wait <= 30, got %d", wait)
+	}
+	// 不同 root 互不影响
+	if wait := checkIndexStartRateLimit("rate-user-a", "root-2", base.Add(5*time.Second)); wait != 0 {
+		t.Fatalf("different root must pass, got wait=%d", wait)
+	}
+	// 不同用户互不影响
+	if wait := checkIndexStartRateLimit("rate-user-b", "root-1", base.Add(6*time.Second)); wait != 0 {
+		t.Fatalf("different user must pass, got wait=%d", wait)
+	}
+	// 间隔过后放行
+	if wait := checkIndexStartRateLimit("rate-user-a", "root-1", base.Add(indexStartMinInterval+5*time.Second)); wait != 0 {
+		t.Fatalf("start after interval must pass, got wait=%d", wait)
+	}
+}
+
+func TestCheckIndexClientVersionGatesStartArgsLikeHeader(t *testing.T) {
+	previous := minClientVersion
+	t.Cleanup(func() { minClientVersion = previous })
+
+	minClientVersion = ""
+	if err := checkIndexClientVersion("0.0.1"); err != nil {
+		t.Fatalf("no minimum configured must not gate, got %v", err)
+	}
+
+	minClientVersion = "1.1.0"
+	if err := checkIndexClientVersion(""); err != nil {
+		t.Fatalf("clients not reporting client_version must stay compatible, got %v", err)
+	}
+	if err := checkIndexClientVersion("1.1.0"); err != nil {
+		t.Fatalf("matching version must pass, got %v", err)
+	}
+	if err := checkIndexClientVersion("1.0.9"); err == nil || !strings.Contains(err.Error(), "below minimum") {
+		t.Fatalf("outdated version must be rejected with upgrade hint, got %v", err)
+	}
+	if err := checkIndexClientVersion("1.1.0-beta"); err == nil {
+		t.Fatal("prerelease of the minimum version must be rejected")
+	}
+}
+
+func TestHandleCodebaseIndexStartRejectsOutdatedClientVersionArg(t *testing.T) {
+	previous := minClientVersion
+	t.Cleanup(func() { minClientVersion = previous })
+	minClientVersion = "1.1.0"
+
+	// 版本门禁在文件校验与 DB 访问之前触发，返回工具错误信封所用的 error
+	_, err := handleCodebaseIndex(context.Background(), "tenant-version-gate", map[string]interface{}{
+		"operation":      "start",
+		"root_id":        "root-version-gate",
+		"client_version": "1.0.0",
+		"files":          []interface{}{},
+	})
+	if err == nil || !strings.Contains(err.Error(), "below minimum") {
+		t.Fatalf("start with outdated client_version must fail with upgrade hint, got %v", err)
 	}
 }
 

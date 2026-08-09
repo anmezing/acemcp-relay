@@ -8,6 +8,8 @@ import (
 	"path"
 	"regexp"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -15,13 +17,59 @@ import (
 const (
 	codebaseIndexToolName = "codebase_index"
 	maxIndexPathBytes     = 4096
+
+	// indexStartMinInterval 是同一 (user, root) 两次 start 之间的最小间隔：
+	// start 会触发 manifest 对账、staging 清理等重活，客户端重试逻辑失控时
+	// 靠它保护服务端。首次调用（无历史记录）必然放行，full sync 不受影响。
+	indexStartMinInterval = 30 * time.Second
+	// indexStartSeenMaxEntries 触发过期清理的上限，防止 (user, root) 基数
+	// 无界增长导致内存泄漏。
+	indexStartSeenMaxEntries = 4096
 )
 
 var (
 	sha256Pattern      = regexp.MustCompile(`^[a-fA-F0-9]{64}$`)
 	windowsDrivePrefix = regexp.MustCompile(`^[A-Za-z]:`)
 	indexRootIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
+
+	indexStartSeenMu sync.Mutex
+	indexStartSeen   = make(map[string]time.Time)
 )
+
+// checkIndexStartRateLimit 对同一 (user, root) 的 start 施加最小间隔。
+// 返回 0 表示放行并记录本次调用；返回正数表示还需等待的秒数（向上取整）。
+func checkIndexStartRateLimit(userID, rootID string, now time.Time) int {
+	key := userID + "\x00" + rootID
+	indexStartSeenMu.Lock()
+	defer indexStartSeenMu.Unlock()
+	if last, ok := indexStartSeen[key]; ok {
+		if wait := indexStartMinInterval - now.Sub(last); wait > 0 {
+			return int((wait + time.Second - 1) / time.Second)
+		}
+	}
+	if len(indexStartSeen) >= indexStartSeenMaxEntries {
+		for k, t := range indexStartSeen {
+			if now.Sub(t) >= indexStartMinInterval {
+				delete(indexStartSeen, k)
+			}
+		}
+	}
+	indexStartSeen[key] = now
+	return 0
+}
+
+// checkIndexClientVersion 用与 X-LCE-Client-Version 头相同的 MIN_CLIENT_VERSION
+// 逻辑门禁经 start args 上报的版本。空版本不拒绝：不上报该字段的老客户端兼容。
+func checkIndexClientVersion(clientVersion string) error {
+	clientVersion = strings.TrimSpace(clientVersion)
+	if clientVersion == "" || minClientVersion == "" {
+		return nil
+	}
+	if compareVersions(clientVersion, minClientVersion) < 0 {
+		return fmt.Errorf("client version %s is below minimum %s; please update lce-cloud", clientVersion, minClientVersion)
+	}
+	return nil
+}
 
 type mcpIndexManifestFile struct {
 	Path            string `json:"path"`
@@ -42,6 +90,7 @@ type mcpIndexStartArgs struct {
 	WorkspaceName   string                 `json:"workspace_name,omitempty"`
 	Branch          string                 `json:"branch,omitempty"`
 	Revision        string                 `json:"revision,omitempty"`
+	ClientVersion   string                 `json:"client_version,omitempty"`
 	Files           []mcpIndexManifestFile `json:"files"`
 	UnreadableFiles []string               `json:"unreadable_files,omitempty"`
 }
@@ -121,6 +170,7 @@ func codebaseIndexToolDefinition() (json.RawMessage, error) {
 						"workspace_name":   map[string]interface{}{"type": "string", "maxLength": 256},
 						"branch":           map[string]interface{}{"type": "string", "maxLength": 512},
 						"revision":         map[string]interface{}{"type": "string", "maxLength": 512},
+						"client_version":   map[string]interface{}{"type": "string", "maxLength": 64},
 						"files":            map[string]interface{}{"type": "array", "maxItems": maxIndexManifestFiles, "items": manifestFile},
 						"unreadable_files": map[string]interface{}{"type": "array", "maxItems": maxIndexManifestFiles, "items": map[string]interface{}{"type": "string", "minLength": 1, "maxLength": maxIndexPathBytes}},
 					},
@@ -306,6 +356,9 @@ func handleCodebaseIndex(ctx context.Context, userID string, raw map[string]inte
 		if !indexRootIDPattern.MatchString(rootID) {
 			return nil, fmt.Errorf("root_id must match %s", indexRootIDPattern.String())
 		}
+		if err := checkIndexClientVersion(input.ClientVersion); err != nil {
+			return nil, err
+		}
 		files, err := validateMCPManifestFiles(input.Files)
 		if err != nil {
 			return nil, err
@@ -324,6 +377,10 @@ func handleCodebaseIndex(ctx context.Context, userID string, raw map[string]inte
 		}
 		if len(workspaceName) > 256 || len(input.Branch) > 512 || len(input.Revision) > 512 {
 			return nil, fmt.Errorf("workspace_name, branch, or revision exceeds its size limit")
+		}
+		// 频率限制放在参数校验之后：畸形请求不占用 (user, root) 的时间窗。
+		if wait := checkIndexStartRateLimit(userID, rootID, time.Now()); wait > 0 {
+			return nil, fmt.Errorf("start was called for this root less than %s ago; retry after %d seconds", indexStartMinInterval, wait)
 		}
 		return createIndexJob(ctx, userID, indexStartRequest{
 			ProtocolVersion: indexProtocolVersion,

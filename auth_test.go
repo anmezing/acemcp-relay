@@ -43,3 +43,31 @@ func TestAuthenticateRequestRevalidatesRotatedKeysAgainstPostgres(t *testing.T) 
 		t.Fatal(err)
 	}
 }
+
+func TestCompareVersionsOrdersNumericSegmentsAndPrereleases(t *testing.T) {
+	tests := []struct {
+		a, b string
+		want int
+	}{
+		{"1.2.3", "1.2.3", 0},
+		{"1.2.3", "1.2.4", -1},
+		{"1.2.4", "1.2.3", 1},
+		{"1.10.0", "1.9.0", 1},
+		{"2.0.0", "1.99.99", 1},
+		{"1.2", "1.2.0", 0},
+		// semver：预发布 < 同数字正式版
+		{"1.2.3-beta", "1.2.3", -1},
+		{"1.2.3", "1.2.3-beta", 1},
+		// 数字段不同，预发布后缀不改变数字段的排序
+		{"1.2.3", "1.2.4-rc.1", -1},
+		{"1.2.4-rc.1", "1.2.3", 1},
+		{"1.2.3-beta", "1.2.4", -1},
+		// 双方都带预发布后缀：数字段相同视为相等（门禁只需要档位语义）
+		{"1.2.3-alpha", "1.2.3-beta", 0},
+	}
+	for _, test := range tests {
+		if got := compareVersions(test.a, test.b); got != test.want {
+			t.Errorf("compareVersions(%q, %q) = %d, want %d", test.a, test.b, got, test.want)
+		}
+	}
+}
