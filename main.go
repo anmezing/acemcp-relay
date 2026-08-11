@@ -2490,6 +2490,9 @@ func main() {
 	// 等价于 gin.Default()，但 Recovery 换成结构化日志版本：panic 会带
 	// request_id/path 落一条 logfmt 事件再回 500。
 	r := gin.New()
+	if err := r.SetTrustedProxies(nil); err != nil {
+		log.Fatalf("无法禁用未受信代理头: %v", err)
+	}
 	r.Use(gin.Logger())
 	r.Use(gin.CustomRecovery(func(c *gin.Context, recovered interface{}) {
 		logID, _ := c.Get(ContextKeyLogID)

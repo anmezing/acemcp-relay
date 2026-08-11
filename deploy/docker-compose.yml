@@ -46,6 +46,7 @@ services:
       lce:
         condition: service_healthy
     environment:
+      GIN_MODE: release
       SERVER_ADDR: "0.0.0.0:3009"
       LCE_MCP_URL: http://lce:3000/mcp
       LCE_TENANT_ASSERTION_SECRET: ${LCE_TENANT_ASSERTION_SECRET:?set LCE_TENANT_ASSERTION_SECRET in .env (>=32 chars, shared with lce)}
