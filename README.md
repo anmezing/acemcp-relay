@@ -100,6 +100,7 @@ go build -o acemcp-relay .
 | 变量 | 说明 | 默认值 |
 |------|------|--------|
 | `SERVER_ADDR` | 服务监听地址 | `127.0.0.1:8080` |
+| `TRUSTED_PROXIES` | 可提供 `X-Forwarded-For` 的反向代理 IP/CIDR，逗号分隔；直连时留空 | （空） |
 
 ### LCE MCP 配置
 

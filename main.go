@@ -49,6 +49,7 @@ var (
 	dbName                   string
 	redisHost                string
 	redisPort                int
+	trustedProxies           []string
 	bannedCacheTTL           time.Duration
 	defaultDailyRequestLimit int
 	dailyIndexBytesLimit     int64
@@ -118,6 +119,7 @@ func loadConfig() {
 	dbName = getEnv("DB_NAME", "postgres")
 	redisHost = getEnv("REDIS_HOST", "localhost")
 	redisPort = getEnvInt("REDIS_PORT", 6379)
+	trustedProxies = parseTrustedProxies(getEnv("TRUSTED_PROXIES", ""))
 	bannedCacheTTL = getEnvDuration("BANNED_CACHE_TTL", 5*time.Minute)
 	configureTrustedConsole(getEnv("CONSOLE_API_SECRET", ""))
 	defaultDailyRequestLimit = getEnvInt("DEFAULT_DAILY_REQUEST_LIMIT", 0)
@@ -147,6 +149,16 @@ func parsePathSet(value string) map[string]bool {
 		out[path] = true
 	}
 	return out
+}
+
+func parseTrustedProxies(value string) []string {
+	proxies := make([]string, 0)
+	for _, raw := range strings.Split(value, ",") {
+		if proxy := strings.TrimSpace(raw); proxy != "" {
+			proxies = append(proxies, proxy)
+		}
+	}
+	return proxies
 }
 
 func shouldDebugCapture(path string) bool {
@@ -2490,8 +2502,8 @@ func main() {
 	// 等价于 gin.Default()，但 Recovery 换成结构化日志版本：panic 会带
 	// request_id/path 落一条 logfmt 事件再回 500。
 	r := gin.New()
-	if err := r.SetTrustedProxies(nil); err != nil {
-		log.Fatalf("无法禁用未受信代理头: %v", err)
+	if err := r.SetTrustedProxies(trustedProxies); err != nil {
+		log.Fatalf("TRUSTED_PROXIES 配置无效: %v", err)
 	}
 	r.Use(gin.Logger())
 	r.Use(gin.CustomRecovery(func(c *gin.Context, recovered interface{}) {
