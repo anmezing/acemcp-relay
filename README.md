@@ -47,7 +47,7 @@ LCE 的多租户远程 MCP 服务。IDE Agent 只需配置一个 Streamable HTTP
 - **语言**：Go 1.25
 - **Web 框架**：Gin
 - **数据库**：PostgreSQL（请求日志、排行榜、API Key 存储）
-- **缓存**：Redis（封禁/设备绑定状态缓存；API Key 认证缓存为进程内实现）
+- **缓存**：Redis（封禁与配额状态；API Key 认证缓存为进程内实现）
 - **依赖管理**：Go Modules
 
 ## 前置要求
@@ -131,41 +131,19 @@ go build -o acemcp-relay .
 |------|------|--------|
 | `REDIS_PORT` | Redis 端口 | `6379` |
 
-### 设备绑定（防账号共用）
+### 访问控制与配额
 
 | 变量 | 说明 | 默认值 |
 |------|------|--------|
-| `DEVICE_BINDING_MODE` | `off` 不校验；`log` 只记告警不拦截；`enforce` 未注册设备返回 401 | `log` |
-| `DEVICE_CACHE_TTL` | 设备注册状态的 Redis 缓存 TTL | `5m` |
-| `DEVICE_IP_WINDOW` | 同设备多 IP 检测的滑动窗口 | `10m` |
-| `DEVICE_MAX_IPS` | 窗口内允许的最大来源 IP 数，超过写 `device_alerts` 告警；`0` 关闭检测 | `3` |
 | `CONSOLE_API_SECRET` | 网页控制台调用索引统计/清除接口的内部凭据，须与前端 `BETTER_AUTH_SECRET` 相同；Compose 部署已自动传入 | （空） |
+| `BANNED_CACHE_TTL` | 账号封禁查询的 Redis 正/负缓存 TTL | `5m` |
 | `DEFAULT_DAILY_REQUEST_LIMIT` | 每用户每日请求上限默认值（Asia/Shanghai 自然日），超限返回 429；`0` 不限。可在控制台「配额管理」按用户覆盖（`user_quotas` 表，改后即时生效） | `0` |
 | `DAILY_INDEX_BYTES_LIMIT` | 每用户每日索引字节上限（Asia/Shanghai 自然日），`0` 表示不限。每次 `codebase_index upload` 同时计入常规 MCP 请求配额和实际上传内容的字节配额；单文件与单批原始内容上限均为 512 KiB，完整 manifest 所在的客户端 MCP 请求体上限为 32 MiB，转发给 LCE 的单次 JSON-RPC 请求体上限为 4 MiB | `2147483648`（2 GiB） |
 | `MODEL_CONFIG_SECRET` | 按用户 rerank 配置的加密密钥，须与前端设置相同；未设置时关闭。用户密钥以 AES-256-GCM 加密存于 `user_model_configs`，Relay 解密后仅按检索请求注入 rerank。云端 embedding 和向量空间始终由 LCE 服务端控制，修改 rerank 不会清空或重建索引 | （空） |
 
-设备由前端 `/api/mcp-device` 为控制台生成的 MCP 配置登记，配置中的 `X-Client-Id` 用于远程 MCP 设备绑定。
-活跃设备数由前端 `MAX_DEVICES_PER_USER` 控制，默认 `1`，即**单设备互踢**：
-新设备登录立即踢掉旧设备，被踢设备在 `enforce` 模式下收到 401，必须重新走网页
-登录才能使用 —— 换设备无感，共用账号则互相踢下线且每次都要重新 OAuth。
-单设备模式下，**换设备（发生互踢）时还会轮换 API token**：被踢机器上的旧 token
-（包括被复制走的副本）随即失效（受 relay 认证缓存影响，最长延迟 30 秒）；此防线不依赖 `DEVICE_BINDING_MODE`，部署前端后
-立即生效。同一份已登记的 MCP 配置可在同一客户端重复连接，不触发互踢或 token 轮换。
-每次踢出都会写一条 `device_evicted` 告警，频繁互踢即共用信号：
-
-```sql
--- 最近 24h 换设备（互踢）次数排行，次数高的基本就是共用账号
-SELECT user_id, COUNT(*) AS evictions
-FROM device_alerts
-WHERE kind = 'device_evicted' AND created_at > NOW() - INTERVAL '1 day'
-GROUP BY user_id ORDER BY evictions DESC LIMIT 20;
-```
-
-灰度路径：先在 `log` 模式观察缺失或未登记的 `X-Client-Id`，确认用户均已从控制台重新复制完整 MCP 配置后切换到 `enforce`。
 封禁：管理员在控制台「用户管理」封禁账号后写入 `banned_users` 表，relay 对该用户
-所有请求返回 403（缓存 `banned:{user}`，封禁/解封即时生效）；设备登录同样被拒。
-排查：`SELECT * FROM device_alerts ORDER BY created_at DESC LIMIT 50;`
-（`missing_client_id` = 配置缺少 `X-Client-Id`；`unregistered_device` = 客户端 ID 未登记或已被踢；`multi_ip` = 疑似 token 被复制共用；`device_evicted` = 新设备登记踢出旧设备。）
+所有请求返回 403（缓存 `banned:{user}`，封禁/解封即时生效）。API Key 删除或重置后，
+Relay 的进程内认证缓存最多保留 30 秒；客户端身份只由 API Key 决定。
 
 ## 数据库表结构
 
@@ -179,6 +157,10 @@ GROUP BY user_id ORDER BY evictions DESC LIMIT 20;
 - **`index_jobs`**：索引任务状态、固定 `root_id`、阶段、文件/chunk 进度、心跳和错误；完成状态只在符号图收敛成功后提交
 - **`index_job_files`**：运行中任务的 manifest 和批次提交状态，任务完成、失败或超时后回收
 - **`indexed_files`**：服务端已完成索引的工作区文件快照，用于后续增量比较和删除检测
+- **`index_operation_leases`**：串行化同一工作区的发布、清理等破坏性操作
+- **`banned_users`**：账号封禁状态
+- **`user_quotas` / `org_quotas` / `org_member_quotas`**：个人、组织及组织成员配额覆盖
+- **`user_model_configs`**：按用户加密保存的 rerank 配置
 
 > 数据库连接池配置为最多 25 个打开/空闲连接，连接生命周期 30 分钟，以减少 SCRAM-SHA-256 认证带来的 CPU 开销。
 

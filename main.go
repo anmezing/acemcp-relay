@@ -118,9 +118,7 @@ func loadConfig() {
 	dbName = getEnv("DB_NAME", "postgres")
 	redisHost = getEnv("REDIS_HOST", "localhost")
 	redisPort = getEnvInt("REDIS_PORT", 6379)
-	// 沿用 DEVICE_CACHE_TTL 这个环境变量名：设备绑定移除后它只控制封禁
-	// 状态缓存，但改名会静默丢弃既有部署里已设置的值。
-	bannedCacheTTL = getEnvDuration("DEVICE_CACHE_TTL", 5*time.Minute)
+	bannedCacheTTL = getEnvDuration("BANNED_CACHE_TTL", 5*time.Minute)
 	configureTrustedConsole(getEnv("CONSOLE_API_SECRET", ""))
 	defaultDailyRequestLimit = getEnvInt("DEFAULT_DAILY_REQUEST_LIMIT", 0)
 	// 索引通道除常规请求数配额外，还按上传字节计费：同样一次 upload 可以只带

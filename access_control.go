@@ -15,13 +15,9 @@ import (
 
 // ── 访问控制（受信控制台 + 账号封禁）──────────────────────────────────────
 //
-// 设备绑定功能已整体移除（Decision 1：relay 只经配额做控制面，见 5fef319），
-// 本文件保留与设备无关的两块访问控制：
+// Relay 只经配额做控制面；本文件负责两块访问控制：
 //   - 受信控制台请求：前端管理接口用共享密钥派生的 token 访问 relay 管理端点；
 //   - 账号封禁：前端写 banned_users 表并删除 banned:{user} 缓存使其立即生效。
-//
-// 数据库中历史遗留的 devices / device_alerts 表不再由代码创建或读写，
-// 但也不主动 DROP（存量数据保留）。
 
 const (
 	consoleTokenHeader  = "X-LCE-Console-Token"
@@ -62,6 +58,13 @@ func isTrustedConsoleRequest(c *gin.Context) bool {
 }
 
 func migrateAccessControlTables() error {
+	if _, err := db.Exec(`
+		DROP TABLE IF EXISTS device_alerts;
+		DROP TABLE IF EXISTS devices;
+	`); err != nil {
+		return fmt.Errorf("failed to remove retired device access-control tables: %w", err)
+	}
+
 	_, err := db.Exec(`
 		CREATE TABLE IF NOT EXISTS banned_users (
 			user_id VARCHAR(255) PRIMARY KEY,

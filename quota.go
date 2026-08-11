@@ -24,8 +24,7 @@ var (
 	quotaLoc     *time.Location
 )
 
-// quotaCacheTTL 是配额上限缓存的独立 TTL。此前复用设备缓存 TTL（现
-// bannedCacheTTL），调那边的参数会意外改变配额生效延迟。
+// quotaCacheTTL 是配额上限缓存的独立 TTL，避免封禁缓存配置影响配额生效延迟。
 const quotaCacheTTL = 5 * time.Minute
 
 func quotaLocation() *time.Location {
