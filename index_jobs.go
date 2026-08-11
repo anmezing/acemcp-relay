@@ -108,6 +108,10 @@ type createIndexJobResponse struct {
 }
 
 func migrateIndexingTables() error {
+	// 租户归并说明：本文件所有表的 user_id 列（index_workspaces / index_jobs /
+	// indexed_files / index_operation_leases）以及各函数的 userID 参数，语义都是
+	// "租户"（tenant_id := org_id ?? user_id）。个人用户租户 = user_id，存量数据
+	// 与行为完全不变；组织密钥写入的是 org_id。列名不改（已部署迁移不可变）。
 	_, err := db.Exec(`
 		CREATE TABLE IF NOT EXISTS index_workspaces (
 			user_id VARCHAR(255) NOT NULL,
@@ -755,7 +759,10 @@ func uploadIndexBatch(ctx context.Context, userID string, req indexUploadRequest
 	if _, err := validateMCPToolCallBody("codebase_remote_index", args); err != nil {
 		return indexBatchResponse{}, err
 	}
-	if ok, used, limit := chargeIndexBytes(userID, batchBytes); !ok {
+	// 字节配额按租户池计（uploadIndexBatch 的 userID 参数即租户）；org 归属
+	// 从认证中间件放进 request context 的身份里取，缺失时按个人租户处理。
+	callerIdentity := authIdentityFromContext(ctx)
+	if ok, used, limit := chargeIndexBytes(userID, callerIdentity.OrgID, userTierFromContext(ctx), batchBytes); !ok {
 		return indexBatchResponse{}, fmt.Errorf(
 			"daily index quota exceeded (%d/%d bytes); retry after %s seconds",
 			used,
@@ -1312,7 +1319,9 @@ func clearUserIndexState(ctx context.Context, userID string) error {
 	return tx.Commit()
 }
 
-func clearRootIndexStateTx(ctx context.Context, tx *sql.Tx, userID, rootID string) error {
+// clearRootIndexStateTx 删除该 root 对应 workspace 的所有 relay 侧行，
+// 返回 indexed_files 的删除行数（供 delete-root 上报 deleted_files）。
+func clearRootIndexStateTx(ctx context.Context, tx *sql.Tx, userID, rootID string) (int64, error) {
 	normalizedRootID := lceIndexRootID(rootID)
 	statements := []string{
 		`DELETE FROM index_jobs AS jobs
@@ -1331,12 +1340,17 @@ func clearRootIndexStateTx(ctx context.Context, tx *sql.Tx, userID, rootID strin
 		 WHERE user_id = $1
 		   AND CASE WHEN BTRIM(root_id) = '' THEN 'default' ELSE BTRIM(root_id) END = $2`,
 	}
-	for _, statement := range statements {
-		if _, err := tx.ExecContext(ctx, statement, userID, normalizedRootID); err != nil {
-			return err
+	var deletedFiles int64
+	for i, statement := range statements {
+		result, err := tx.ExecContext(ctx, statement, userID, normalizedRootID)
+		if err != nil {
+			return 0, err
+		}
+		if i == 1 { // indexed_files 那条
+			deletedFiles, _ = result.RowsAffected()
 		}
 	}
-	return nil
+	return deletedFiles, nil
 }
 
 func clearRootIndexState(ctx context.Context, userID, rootID string) error {
@@ -1345,7 +1359,7 @@ func clearRootIndexState(ctx context.Context, userID, rootID string) error {
 		return err
 	}
 	defer tx.Rollback()
-	if err := clearRootIndexStateTx(ctx, tx, userID, rootID); err != nil {
+	if _, err := clearRootIndexStateTx(ctx, tx, userID, rootID); err != nil {
 		return err
 	}
 	return tx.Commit()

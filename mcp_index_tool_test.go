@@ -33,6 +33,29 @@ func TestCodebaseIndexDefinitionKeepsTenantAndControlFieldsServerManaged(t *test
 	}
 }
 
+func TestIndexRootIDPatternAcceptsBranchViewEncoding(t *testing.T) {
+	for _, allowed := range []string{
+		"repo-a",
+		"repo-a@feature-x",
+		"repo.a_b:c@release-1.2",
+		"repo@a@b", // 多个 '@'：/mcp/roots 按最后一个拆分
+	} {
+		if !indexRootIDPattern.MatchString(allowed) {
+			t.Fatalf("root_id %q must be accepted", allowed)
+		}
+	}
+	for _, denied := range []string{
+		"@feature-x",           // 首字符必须是字母数字
+		"repo-a@feature/x",     // '/' 不在字符集内：客户端必须在编码分支时清洗
+		"repo a@feature",       // 空格非法
+		"a" + strings.Repeat("b", maxIndexRootIDLen), // 超长
+	} {
+		if indexRootIDPattern.MatchString(denied) {
+			t.Fatalf("root_id %q must be rejected", denied)
+		}
+	}
+}
+
 func TestValidateIndexSourcePathEnforcesRemoteSafetyBoundary(t *testing.T) {
 	for _, allowed := range []string{"src/main.go", "README.md", "web/app.tsx", "config/example.yaml"} {
 		got, err := validateIndexSourcePath(allowed)
@@ -212,5 +235,16 @@ func TestAppendCodebaseIndexToolExposesExactlyFourPublicTools(t *testing.T) {
 		if tool.Name != want[i] {
 			t.Fatalf("tool %d = %q, want %q", i, tool.Name, want[i])
 		}
+	}
+}
+
+func TestCodebaseIndexFailRequiresErrorField(t *testing.T) {
+	// error 是契约必填字段（cloud-protocol.json requiredFields.fail）
+	_, err := handleCodebaseIndex(context.Background(), "user-1", map[string]interface{}{
+		"operation": "fail",
+		"job_id":    "7e224a32-3423-4bb0-9213-3c55a5797c9d",
+	})
+	if err == nil || !strings.Contains(err.Error(), "missing required argument: error") {
+		t.Fatalf("fail without error must be rejected before touching state, got: %v", err)
 	}
 }

@@ -121,7 +121,7 @@ func TestClearRootIndexStateMapsLegacyDefaultAndExecutesPortableSingleStatements
 			WillReturnResult(sqlmock.NewResult(0, 1))
 		mock.ExpectCommit()
 	}, func(tx *sql.Tx) {
-		if err := clearRootIndexStateTx(context.Background(), tx, "user-1", ""); err != nil {
+		if _, err := clearRootIndexStateTx(context.Background(), tx, "user-1", ""); err != nil {
 			t.Fatalf("clearRootIndexStateTx: %v", err)
 		}
 		if err := tx.Commit(); err != nil {

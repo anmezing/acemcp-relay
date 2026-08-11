@@ -18,6 +18,10 @@ const (
 	codebaseIndexToolName = "codebase_index"
 	maxIndexPathBytes     = 4096
 
+	// indexEnvelopeSchemaVersion 是跨仓库契约值（docs/contracts/cloud-protocol.json
+	// 的 responseEnvelope.schemaVersion），由 contract_pin_test.go 钉住。
+	indexEnvelopeSchemaVersion = "1.0"
+
 	// indexStartMinInterval 是同一 (user, root) 两次 start 之间的最小间隔：
 	// start 会触发 manifest 对账、staging 清理等重活，客户端重试逻辑失控时
 	// 靠它保护服务端。首次调用（无历史记录）必然放行，full sync 不受影响。
@@ -30,13 +34,17 @@ const (
 var (
 	sha256Pattern      = regexp.MustCompile(`^[a-fA-F0-9]{64}$`)
 	windowsDrivePrefix = regexp.MustCompile(`^[A-Za-z]:`)
-	indexRootIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
+	// '@' 允许出现在非首位：客户端把分支视图编码进 root_id（<root>@<branch>），
+	// /mcp/roots 按最后一个 '@' 拆出 base_root_id 与视图分支。分支名里不在
+	// 本字符集内的字符（如 '/'）必须由客户端在编码时清洗。
+	indexRootIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$`)
 
 	indexStartSeenMu sync.Mutex
 	indexStartSeen   = make(map[string]time.Time)
 )
 
-// checkIndexStartRateLimit 对同一 (user, root) 的 start 施加最小间隔。
+// checkIndexStartRateLimit 对同一 (tenant, root) 的 start 施加最小间隔
+//（userID 参数即租户：org_id ?? user_id，组织成员共享窗口）。
 // 返回 0 表示放行并记录本次调用；返回正数表示还需等待的秒数（向上取整）。
 func checkIndexStartRateLimit(userID, rootID string, now time.Time) int {
 	key := userID + "\x00" + rootID
@@ -111,6 +119,25 @@ type mcpIndexFailArgs struct {
 	Operation string `json:"operation"`
 	JobID     string `json:"job_id"`
 	Error     string `json:"error,omitempty"`
+}
+
+// codebaseIndexEnvelope 构造 codebase_index 的响应信封。字段名与
+// docs/contracts/cloud-protocol.json 的 responseEnvelope 契约一致：
+// ok 必有；成功带 payload，失败带 error:{message}。
+func codebaseIndexEnvelope(ok bool, payload interface{}, errMessage string) map[string]interface{} {
+	envelope := map[string]interface{}{
+		"schemaVersion":  indexEnvelopeSchemaVersion,
+		"toolName":       codebaseIndexToolName,
+		"ok":             ok,
+		"tool":           codebaseIndexToolName,
+		"responseFormat": "json",
+	}
+	if ok {
+		envelope["payload"] = payload
+	} else {
+		envelope["error"] = map[string]interface{}{"message": errMessage}
+	}
+	return envelope
 }
 
 func codebaseIndexToolDefinition() (json.RawMessage, error) {
@@ -191,7 +218,9 @@ func codebaseIndexToolDefinition() (json.RawMessage, error) {
 				map[string]interface{}{
 					"type":                 "object",
 					"additionalProperties": false,
-					"required":             []string{"operation", "job_id"},
+					// error 为契约必填（cloud-protocol.json requiredFields.fail）：
+					// 客户端放弃流程时必须说明原因，便于排障与配额审计。
+					"required": []string{"operation", "job_id", "error"},
 					"properties": map[string]interface{}{
 						"operation": operation("fail"),
 						"job_id":    map[string]interface{}{"type": "string", "minLength": 1},
@@ -340,6 +369,8 @@ func validateMCPUploadFiles(files []mcpIndexUploadFile) ([]indexManifestFile, er
 	return result, nil
 }
 
+// handleCodebaseIndex 的 userID 参数语义为租户（tenant_id := org_id ?? user_id），
+// 由 handleMCPToolsCall 解析后传入；索引数据与 LCE 调用全部按租户归属。
 func handleCodebaseIndex(ctx context.Context, userID string, raw map[string]interface{}) (interface{}, error) {
 	operation, _ := raw["operation"].(string)
 	operation = strings.TrimSpace(operation)
@@ -450,6 +481,10 @@ func handleCodebaseIndex(ctx context.Context, userID string, raw map[string]inte
 	case "fail":
 		var input mcpIndexFailArgs
 		if err := decodeStrictIndexArgs(raw, &input); err != nil {
+			return nil, err
+		}
+		// error 是契约必填字段（cloud-protocol.json requiredFields.fail）
+		if err := requireIndexArgument(raw, "error"); err != nil {
 			return nil, err
 		}
 		if uuid.Validate(strings.TrimSpace(input.JobID)) != nil {

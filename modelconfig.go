@@ -146,9 +146,11 @@ func loadRerankModelConfigArg(ctx context.Context, userID string) (map[string]in
 }
 
 // acquireModelConfigOperation keeps retrieval serialized with index publish or
-// clear while loading the optional request-local reranker.
-func acquireModelConfigOperation(ctx context.Context, userID, kind string) (*indexOperationLease, map[string]interface{}, error) {
-	lease, err := acquireSharedIndexOperation(ctx, userID, "model-call:"+uuid.NewString(), kind)
+// clear while loading the optional request-local reranker. The lease is scoped
+// to the tenant (whose index data the retrieval reads); the rerank config stays
+// per real user (BYO key belongs to the caller, not the org).
+func acquireModelConfigOperation(ctx context.Context, tenantID, userID, kind string) (*indexOperationLease, map[string]interface{}, error) {
+	lease, err := acquireSharedIndexOperation(ctx, tenantID, "model-call:"+uuid.NewString(), kind)
 	if err != nil {
 		return nil, nil, err
 	}

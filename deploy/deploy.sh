@@ -28,7 +28,7 @@ update_repo "$FRONTEND_DIR" "${DEPLOY_REF_FRONTEND:-}"
 
 echo "=== Rebuilding Docker containers ==="
 cd "$SCRIPT_DIR"
-docker compose up -d --build --no-deps relay frontend
+docker compose up -d --build --no-deps lce relay frontend
 
 echo "=== Done ==="
 docker compose ps

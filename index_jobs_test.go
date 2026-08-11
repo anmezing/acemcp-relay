@@ -277,6 +277,7 @@ func TestRewriteToolSchemaRemovesLocalOnlyFields(t *testing.T) {
 				"freshness_policy": {"type": "string"},
 				"technical_terms": {"type": "array"},
 				"response_format": {"type": "string"},
+				"root_id": {"type": "string"},
 				"output_mode": {"type": "string", "enum": ["context_pack", "context_bundle"]},
 				"workflow": {"type": "string"},
 				"direct_context": {"type": "object"},
@@ -304,13 +305,13 @@ func TestRewriteToolSchemaRemovesLocalOnlyFields(t *testing.T) {
 	schema := result["inputSchema"].(map[string]interface{})
 	props := schema["properties"].(map[string]interface{})
 
-	for _, kept := range []string{"information_request", "technical_terms", "response_format"} {
+	for _, kept := range []string{"information_request", "technical_terms", "response_format", "root_id"} {
 		if _, exists := props[kept]; !exists {
 			t.Fatalf("property %q should have been kept", kept)
 		}
 	}
-	if len(props) != 3 {
-		t.Fatalf("remote retrieval must advertise only its three supported caller arguments, got %#v", props)
+	if len(props) != 4 {
+		t.Fatalf("remote retrieval must advertise only its four supported caller arguments, got %#v", props)
 	}
 	if description, _ := result["description"].(string); !strings.Contains(description, "server-side LCE index") {
 		t.Fatalf("remote retrieval description was not specialized: %q", description)
@@ -416,6 +417,44 @@ func TestValidateChatMCPToolArgsRejectsUnknownArguments(t *testing.T) {
 	delete(args, "future_local_option")
 	if err := validateChatMCPToolArgs("codebase-retrieval", args); err != nil {
 		t.Fatalf("declared retrieval arguments should pass: %v", err)
+	}
+}
+
+func TestValidateChatMCPToolArgsRetrievalRootIDScope(t *testing.T) {
+	base := func() map[string]interface{} {
+		return map[string]interface{}{"information_request": "find auth code"}
+	}
+	// 可选 root_id（含 '@' 分支视图编码）必须放行，透传给 LCE
+	args := base()
+	args["root_id"] = "repo-a@feature-x"
+	if err := validateChatMCPToolArgs("codebase-retrieval", args); err != nil {
+		t.Fatalf("optional retrieval root_id should pass through: %v", err)
+	}
+	// 省略 root_id 仍然合法（默认作用域）
+	if err := validateChatMCPToolArgs("codebase-retrieval", base()); err != nil {
+		t.Fatalf("retrieval without root_id should pass: %v", err)
+	}
+	// 超过 codebase_index 的 root_id 长度上限必须拒绝
+	args = base()
+	args["root_id"] = strings.Repeat("a", maxIndexRootIDLen+1)
+	if err := validateChatMCPToolArgs("codebase-retrieval", args); err == nil {
+		t.Fatal("oversized retrieval root_id must be rejected")
+	}
+	// 恰好等于上限则放行
+	args["root_id"] = strings.Repeat("a", maxIndexRootIDLen)
+	if err := validateChatMCPToolArgs("codebase-retrieval", args); err != nil {
+		t.Fatalf("root_id at the length limit should pass: %v", err)
+	}
+	// 非字符串 fail-closed
+	args["root_id"] = 42
+	if err := validateChatMCPToolArgs("codebase-retrieval", args); err == nil {
+		t.Fatal("non-string root_id must be rejected")
+	}
+	// 同一上限也约束 codebase_symbol_graph 的 root_id
+	if err := validateChatMCPToolArgs("codebase_symbol_graph", map[string]interface{}{
+		"root_id": strings.Repeat("a", maxIndexRootIDLen+1), "symbol": "Handler",
+	}); err == nil {
+		t.Fatal("oversized symbol graph root_id must be rejected")
 	}
 }
 

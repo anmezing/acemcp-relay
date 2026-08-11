@@ -6,6 +6,7 @@ import (
 	"compress/gzip"
 	"context"
 	"crypto/md5"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
@@ -51,6 +52,8 @@ var (
 	bannedCacheTTL           time.Duration
 	defaultDailyRequestLimit int
 	dailyIndexBytesLimit     int64
+	proDailyRequestLimit     int
+	proDailyIndexBytesLimit  int64
 	debugCapturePaths        map[string]bool
 	debugCaptureMaxBytes     int
 	minClientVersion         string
@@ -58,8 +61,18 @@ var (
 )
 
 const (
-	ContextKeyUserID     = "user_id"
-	ContextKeyStartTime  = "start_time"
+	ContextKeyUserID    = "user_id"
+	ContextKeyUserTier  = "user_tier"
+	ContextKeyStartTime = "start_time"
+	// 租户归并：tenant_id := org_id ?? user_id。个人密钥（org_id 空）的租户就是
+	// user_id，行为与组织功能上线前完全一致。
+	ContextKeyTenantID = "tenant_id"
+	ContextKeyOrgID    = "org_id"
+	ContextKeyOrgRole  = "org_role"
+
+	// clientVersionHeader 是跨仓库契约值（docs/contracts/cloud-protocol.json
+	// 的 clientRequestHeaders），由 contract_pin_test.go 钉住。
+	clientVersionHeader  = "X-LCE-Client-Version"
 	ContextKeyLogID      = "log_id"
 	ContextKeyInsertDone = "insert_done"
 
@@ -113,6 +126,9 @@ func loadConfig() {
 	// 索引通道除常规请求数配额外，还按上传字节计费：同样一次 upload 可以只带
 	// 几字节，也可以携带一整批源码，请求数无法反映实际 embedding 成本。
 	dailyIndexBytesLimit = getEnvInt64("DAILY_INDEX_BYTES_LIMIT", defaultDailyIndexBytes)
+	// pro 档限额：与前端并行开发的分层配额契约。缺省 0 = 不限。
+	proDailyRequestLimit = getEnvInt("PRO_DAILY_REQUEST_LIMIT", 0)
+	proDailyIndexBytesLimit = getEnvInt64("PRO_DAILY_INDEX_BYTES_LIMIT", 0)
 	initModelConfigKey()
 	debugCapturePaths = parsePathSet(getEnv("DEBUG_CAPTURE_PATHS", ""))
 	debugCaptureMaxBytes = getEnvInt("DEBUG_CAPTURE_MAX_BYTES", 4096)
@@ -417,7 +433,18 @@ func (m *mcpClient) callTool(ctx context.Context, name string, args map[string]i
 	return m.callToolWithTimeout(ctx, name, args, defaultMCPCallTimeout)
 }
 
-func (m *mcpClient) callToolWithTimeout(ctx context.Context, name string, args map[string]interface{}, timeout time.Duration) (*mcpToolResult, error) {
+func (m *mcpClient) callToolWithTimeout(ctx context.Context, name string, args map[string]interface{}, timeout time.Duration) (result *mcpToolResult, err error) {
+	start := time.Now()
+	defer func() {
+		observeLCECall(name, start, err)
+		if err != nil {
+			logEvent("lce_call_failed",
+				"request_id", requestIDFromContext(ctx),
+				"tool", name,
+				"error", err.Error(),
+			)
+		}
+	}()
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	sid, err := m.ensureSession(ctx)
@@ -718,6 +745,30 @@ func initDB() error {
 		return fmt.Errorf("failed to create health_checks index: %w", err)
 	}
 
+	// api_keys 表由前端创建与管理，relay 只读其中的 tier。IF EXISTS 兜底
+	// 前端尚未建表的全新库；两边都用幂等 ADD COLUMN IF NOT EXISTS 建列不冲突。
+	_, err = db.Exec(`ALTER TABLE IF EXISTS api_keys ADD COLUMN IF NOT EXISTS tier TEXT NOT NULL DEFAULT 'free'`)
+	if err != nil {
+		return fmt.Errorf("failed to migrate api_keys tier column: %w", err)
+	}
+
+	// 组织归属列同样由前端写入（NULL = 个人密钥）。org_role 取值 'owner'|'member'。
+	// 两侧幂等 ADD COLUMN IF NOT EXISTS，谁先跑都不冲突。
+	_, err = db.Exec(`
+		ALTER TABLE IF EXISTS api_keys ADD COLUMN IF NOT EXISTS org_id TEXT;
+		ALTER TABLE IF EXISTS api_keys ADD COLUMN IF NOT EXISTS org_role TEXT;
+	`)
+	if err != nil {
+		return fmt.Errorf("failed to migrate api_keys org columns: %w", err)
+	}
+
+	// 审计补充：request_logs.user_id 永远是真实用户；tenant_id 记录该请求归属的
+	// 租户（org_id ?? user_id），旧行为 NULL。追加 ALTER，不改已部署的 CREATE 文本。
+	_, err = db.Exec(`ALTER TABLE request_logs ADD COLUMN IF NOT EXISTS tenant_id VARCHAR(255)`)
+	if err != nil {
+		return fmt.Errorf("failed to migrate request_logs tenant_id column: %w", err)
+	}
+
 	if err := migrateAccessControlTables(); err != nil {
 		return err
 	}
@@ -746,23 +797,214 @@ func initRedis() error {
 }
 
 // ── 认证 ──────────────────────────────────────────────────────────────────
+//
+// api key 认证走一层进程内缓存（单实例设计，横向扩展前需外置到 Redis）：
+//   - 正缓存 TTL 30s：封禁 / 删除 / 重置 key 的撤销延迟最多 30 秒，产品上可接受，
+//     不做跨进程失效机制。
+//   - 负缓存 TTL 5s：查无此 key 也短暂缓存，防止爆破流量打穿 PostgreSQL。
+//   - 容量上限 authCacheMaxEntries，写入时若已满先惰性清理过期条目；仍满则
+//     跳过缓存（请求本身仍走 DB 认证，fail-open 只影响缓存不影响正确性）。
+//
+// 哈希兼容：api_keys.id 由前端写入。存量为 MD5 hex，前端切换到 SHA-256 后
+// 写入 SHA-256 hex；这里同时用两种哈希查询（id 为主键，IN 两值仍走索引），
+// 因此前端切换写入算法时 relay 无需改动。
 
-func authenticateRequest(c *gin.Context) (string, bool) {
+const (
+	authCachePositiveTTL = 30 * time.Second
+	authCacheNegativeTTL = 5 * time.Second
+	authCacheMaxEntries  = 10000
+
+	// tier 取值契约（与前端并行开发，已定死）：'free' | 'pro'，
+	// 未知值按 free 处理（fail-safe：不给未知档位放开限额）。
+	tierFree = "free"
+	tierPro  = "pro"
+
+	// org_role 契约值：'owner' | 'member'。删除类操作只认显式 'owner'，
+	// 其他一切（member、空、脏数据）在组织语境下一律按非 owner 处理（fail-closed）。
+	orgRoleOwner = "owner"
+)
+
+// normalizeTier 把 api_keys.tier 归一到已知档位：只有显式 'pro' 生效，
+// 其他一切（空、未知值、脏数据）都按 free 处理。
+func normalizeTier(tier string) string {
+	if strings.TrimSpace(tier) == tierPro {
+		return tierPro
+	}
+	return tierFree
+}
+
+// authIdentity 是一次认证解析出的完整身份：真实用户、tier、组织归属。
+// TenantID 是数据归属与 LCE 租户的唯一口径：org_id ?? user_id。
+type authIdentity struct {
+	UserID  string
+	Tier    string
+	OrgID   string // 空 = 个人密钥
+	OrgRole string // 仅 OrgID 非空时有意义；'owner' | 'member'
+}
+
+func (a authIdentity) TenantID() string {
+	if a.OrgID != "" {
+		return a.OrgID
+	}
+	return a.UserID
+}
+
+// userTierCtxKey 把 tier 从认证中间件带进 request context，供索引链路
+// （handleCodebaseIndex → uploadIndexBatch → chargeIndexBytes）读取。
+type userTierCtxKey struct{}
+
+func withUserTier(ctx context.Context, tier string) context.Context {
+	return context.WithValue(ctx, userTierCtxKey{}, normalizeTier(tier))
+}
+
+func userTierFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return tierFree
+	}
+	tier, _ := ctx.Value(userTierCtxKey{}).(string)
+	return normalizeTier(tier)
+}
+
+// authIdentityCtxKey 把完整身份带进 request context：索引链路的配额计费需要
+// org_id 才能选择组织池限额。缺失时按零值（个人、free）处理，等价旧行为。
+type authIdentityCtxKey struct{}
+
+func withAuthIdentity(ctx context.Context, id authIdentity) context.Context {
+	return context.WithValue(ctx, authIdentityCtxKey{}, id)
+}
+
+func authIdentityFromContext(ctx context.Context) authIdentity {
+	if ctx == nil {
+		return authIdentity{}
+	}
+	id, _ := ctx.Value(authIdentityCtxKey{}).(authIdentity)
+	return id
+}
+
+type authCacheEntry struct {
+	identity  authIdentity
+	ok        bool
+	expiresAt time.Time
+}
+
+var (
+	authCacheMu sync.Mutex
+	authCache   = make(map[string]authCacheEntry)
+)
+
+func authCacheGet(key string, now time.Time) (authCacheEntry, bool) {
+	authCacheMu.Lock()
+	defer authCacheMu.Unlock()
+	entry, found := authCache[key]
+	if !found || now.After(entry.expiresAt) {
+		return authCacheEntry{}, false
+	}
+	return entry, true
+}
+
+func authCachePut(key string, entry authCacheEntry) {
+	authCacheMu.Lock()
+	defer authCacheMu.Unlock()
+	if _, exists := authCache[key]; !exists && len(authCache) >= authCacheMaxEntries {
+		now := time.Now()
+		for k, v := range authCache {
+			if now.After(v.expiresAt) {
+				delete(authCache, k)
+			}
+		}
+		if len(authCache) >= authCacheMaxEntries {
+			return // 仍满：跳过缓存，不驱逐未过期条目
+		}
+	}
+	authCache[key] = entry
+}
+
+func normalizeOrgRole(role, orgID string) string {
+	if strings.TrimSpace(orgID) == "" {
+		return ""
+	}
+	for _, candidate := range strings.Split(role, ",") {
+		if strings.TrimSpace(candidate) == orgRoleOwner {
+			return orgRoleOwner
+		}
+	}
+	return "member"
+}
+
+// lookupAPIKey 同时按 MD5 与 SHA-256 哈希匹配 api_keys.id（双读过渡）。
+// 个人密钥只依赖 Relay 自有表，避免 Better Auth 组织表尚未迁移时全站鉴权
+// 中断。组织密钥再以 Better Auth 表为权威来源；api_keys.org_role 只是展示
+// 冗余，不能让已移除成员或已降权 owner 继续获得组织权限。
+func lookupAPIKey(token string) (authIdentity, bool, error) {
+	md5Hash := md5.Sum([]byte(token))
+	sha256Hash := sha256.Sum256([]byte(token))
+	var id authIdentity
+	err := db.QueryRow(`
+		SELECT keys.user_id,
+		       COALESCE(keys.tier, 'free'),
+		       COALESCE(keys.org_id, '')
+		FROM api_keys AS keys
+		WHERE keys.id IN ($1, $2)
+	`,
+		hex.EncodeToString(md5Hash[:]), hex.EncodeToString(sha256Hash[:]),
+	).Scan(&id.UserID, &id.Tier, &id.OrgID)
+	if err == sql.ErrNoRows {
+		return authIdentity{}, false, nil
+	}
+	if err != nil {
+		return authIdentity{}, false, err
+	}
+	id.Tier = normalizeTier(id.Tier)
+	id.OrgID = strings.TrimSpace(id.OrgID)
+	if id.OrgID != "" {
+		var currentRole string
+		err = db.QueryRow(`
+			SELECT COALESCE(members."role", '')
+			FROM "member" AS members
+			JOIN "organization" AS organizations
+			  ON organizations."id" = members."organizationId"
+			WHERE members."organizationId" = $1
+			  AND members."userId" = $2
+		`, id.OrgID, id.UserID).Scan(&currentRole)
+		if err == sql.ErrNoRows {
+			return authIdentity{}, false, nil
+		}
+		if err != nil {
+			return authIdentity{}, false, err
+		}
+		id.OrgRole = normalizeOrgRole(currentRole, id.OrgID)
+	}
+	return id, true, nil
+}
+
+func authenticateRequest(c *gin.Context) (authIdentity, bool) {
 	authHeader := c.GetHeader("Authorization")
 	if authHeader == "" || !strings.HasPrefix(authHeader, "Bearer ") {
-		return "", false
+		return authIdentity{}, false
 	}
 
 	token := strings.TrimPrefix(authHeader, "Bearer ")
-	hash := md5.Sum([]byte(token))
-	tokenMD5 := hex.EncodeToString(hash[:])
-	var userID string
-	err := db.QueryRow("SELECT user_id FROM api_keys WHERE id = $1", tokenMD5).Scan(&userID)
-	if err != nil {
-		return "", false
+	cacheKey := func() string {
+		sum := sha256.Sum256([]byte(token))
+		return hex.EncodeToString(sum[:])
+	}()
+
+	now := time.Now()
+	if entry, hit := authCacheGet(cacheKey, now); hit {
+		return entry.identity, entry.ok
 	}
 
-	return userID, true
+	identity, ok, err := lookupAPIKey(token)
+	if err != nil {
+		// DB 故障：fail-closed 拒绝本次请求，且不缓存，故障恢复后立即回归正常
+		return authIdentity{}, false
+	}
+	ttl := authCachePositiveTTL
+	if !ok {
+		ttl = authCacheNegativeTTL
+	}
+	authCachePut(cacheKey, authCacheEntry{identity: identity, ok: ok, expiresAt: now.Add(ttl)})
+	return identity, ok
 }
 
 func authMiddleware() gin.HandlerFunc {
@@ -770,7 +1012,7 @@ func authMiddleware() gin.HandlerFunc {
 		startTime := time.Now()
 		c.Set(ContextKeyStartTime, startTime)
 
-		userID, ok := authenticateRequest(c)
+		identity, ok := authenticateRequest(c)
 		if !ok {
 			authHeader := c.GetHeader("Authorization")
 			if authHeader == "" {
@@ -780,12 +1022,32 @@ func authMiddleware() gin.HandlerFunc {
 			}
 			return
 		}
+		userID := identity.UserID
+		tier := identity.Tier
+		tenantID := identity.TenantID()
 
 		c.Set(ContextKeyUserID, userID)
+		c.Set(ContextKeyUserTier, tier)
+		c.Set(ContextKeyTenantID, tenantID)
+		c.Set(ContextKeyOrgID, identity.OrgID)
+		c.Set(ContextKeyOrgRole, identity.OrgRole)
+		// tier 与完整身份同时进 request context：索引链路（uploadIndexBatch）只拿
+		// 得到 context.Context，不经过 gin.Context；配额计费还需要 org 归属。
+		c.Request = c.Request.WithContext(
+			withAuthIdentity(withUserTier(c.Request.Context(), tier), identity),
+		)
 
-		if minClientVersion != "" {
-			clientVersion := strings.TrimSpace(c.GetHeader("X-LCE-Client-Version"))
-			if clientVersion != "" && compareVersions(clientVersion, minClientVersion) < 0 {
+		{
+			clientVersion := strings.TrimSpace(c.GetHeader(clientVersionHeader))
+			gate := evaluateVersionGate(clientVersion)
+			recordVersionGate(gate)
+			if gate == "reject_426" {
+				logEvent("client_version_rejected",
+					"user_id", userID,
+					"path", c.Request.URL.Path,
+					"client_version", clientVersion,
+					"min_version", minClientVersion,
+				)
 				c.AbortWithStatusJSON(http.StatusUpgradeRequired, gin.H{
 					"error":       fmt.Sprintf("client version %s is below minimum %s; please update lce-cloud", clientVersion, minClientVersion),
 					"min_version": minClientVersion,
@@ -801,7 +1063,14 @@ func authMiddleware() gin.HandlerFunc {
 
 		trustedConsole := isTrustedConsoleRequest(c)
 		if !trustedConsole {
-			if ok, limit := checkRequestQuota(userID); !ok {
+			if ok, limit := checkRequestQuota(userID, identity.OrgID, tier); !ok {
+				logEvent("quota_rejected",
+					"user_id", userID,
+					"tenant", tenantID,
+					"tier", tier,
+					"path", c.Request.URL.Path,
+					"limit", strconv.Itoa(limit),
+				)
 				c.Header("Retry-After", quotaRetryAfterHeader(time.Now()))
 				c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{"error": fmt.Sprintf("daily request quota exceeded (%d/day)", limit)})
 				return
@@ -815,6 +1084,16 @@ func authMiddleware() gin.HandlerFunc {
 
 		logID := uuid.New().String()
 		c.Set(ContextKeyLogID, logID)
+		// request_id 复用请求日志表的 id：响应头回传方便用户报障，
+		// 塞进 request context 让 LCE 调用的错误日志能带上同一个 id。
+		c.Header("X-Request-Id", logID)
+		c.Request = c.Request.WithContext(withRequestID(c.Request.Context(), logID))
+		logEvent("request_start",
+			"request_id", logID,
+			"user_id", userID,
+			"path", c.Request.URL.Path,
+			"method", c.Request.Method,
+		)
 
 		insertDone := make(chan struct{})
 		c.Set(ContextKeyInsertDone, insertDone)
@@ -825,9 +1104,9 @@ func authMiddleware() gin.HandlerFunc {
 		go func() {
 			defer close(insertDone)
 			_, err := db.Exec(`
-				INSERT INTO request_logs (id, user_id, status, request_path, request_method, request_timestamp, client_ip)
-				VALUES ($1, $2, $3, $4, $5, $6, $7)
-			`, logID, userID, StatusPending, path, method, startTime, clientIP)
+				INSERT INTO request_logs (id, user_id, tenant_id, status, request_path, request_method, request_timestamp, client_ip)
+				VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+			`, logID, userID, tenantID, StatusPending, path, method, startTime, clientIP)
 			if err != nil {
 				log.Printf("[ERROR] Failed to insert request log: %v", err)
 			}
@@ -955,11 +1234,12 @@ type chatMCPToolPolicy struct {
 // future local/admin capabilities cannot become remotely callable by accident.
 var chatMCPToolPolicies = map[string]chatMCPToolPolicy{
 	"codebase-retrieval": {
-		description: "Search the authenticated user's server-side LCE index. Use information_request for the semantic goal and technical_terms for exact identifier hints. Returns a tenant context pack; local worktree, Git, connectors, workflows, and context_bundle are not available through this remote service.",
+		description: "Search the authenticated user's server-side LCE index. Use information_request for the semantic goal and technical_terms for exact identifier hints. Pass the optional root_id to scope retrieval to one indexed root; omit it to search the tenant default scope. Returns a tenant context pack; local worktree, Git, connectors, workflows, and context_bundle are not available through this remote service.",
 		arguments: stringSet(
 			"information_request",
 			"technical_terms",
 			"response_format",
+			"root_id",
 		),
 		required: stringSet("information_request"),
 	},
@@ -1077,6 +1357,17 @@ func validateChatMCPToolArgs(toolName string, args map[string]interface{}) error
 		}
 		if text, ok := value.(string); ok && strings.TrimSpace(text) == "" {
 			return fmt.Errorf("required argument must not be blank: %s", field)
+		}
+	}
+	// root_id 透传给 LCE 前施加与 codebase_index 相同的长度上限（fail-closed：
+	// 非字符串一律拒绝）。只有白名单里含 root_id 的工具才会走到这里。
+	if value, exists := args["root_id"]; exists && value != nil {
+		text, ok := value.(string)
+		if !ok {
+			return fmt.Errorf("root_id must be a string")
+		}
+		if len(text) > maxIndexRootIDLen {
+			return fmt.Errorf("root_id exceeds %d bytes", maxIndexRootIDLen)
 		}
 	}
 	return nil
@@ -1444,11 +1735,28 @@ func clientUpdateAvailable(c *gin.Context) bool {
 	if latestClientVersion == "" {
 		return false
 	}
-	v := strings.TrimSpace(c.GetHeader("X-LCE-Client-Version"))
-	return v != "" && compareVersions(v, latestClientVersion) < 0
+	v := strings.TrimSpace(c.GetHeader(clientVersionHeader))
+	if v != "" && compareVersions(v, latestClientVersion) < 0 {
+		recordVersionGate("update_hint")
+		return true
+	}
+	return false
+}
+
+// requestTenantID 取本请求的租户（org_id ?? user_id）。中间件未设置时（如
+// 单测直接构造 gin.Context）退回 user_id，与组织功能上线前行为一致。
+func requestTenantID(c *gin.Context) string {
+	if tenantID := c.GetString(ContextKeyTenantID); tenantID != "" {
+		return tenantID
+	}
+	return c.GetString(ContextKeyUserID)
 }
 
 func handleMCPToolsCall(c *gin.Context, id json.RawMessage, params json.RawMessage, userID string) {
+	tenantID := requestTenantID(c)
+	if tenantID == "" {
+		tenantID = userID
+	}
 	var p struct {
 		Name      string                 `json:"name"`
 		Arguments map[string]interface{} `json:"arguments"`
@@ -1468,13 +1776,15 @@ func handleMCPToolsCall(c *gin.Context, id json.RawMessage, params json.RawMessa
 	logIDStr, _ := c.Get(ContextKeyLogID)
 	logIDVal, _ := logIDStr.(string)
 	toolPath := "/mcp/tools/call/" + p.Name
+	c.Set(ContextKeyMetricsPath, toolPath)
 	updateRequestPathAsync(logIDVal, toolPath, getInsertDone(c))
 
 	if p.Arguments == nil {
 		p.Arguments = make(map[string]interface{})
 	}
 	if p.Name == codebaseIndexToolName {
-		payload, err := handleCodebaseIndex(c.Request.Context(), userID, p.Arguments)
+		// 索引编排与数据归属全部按租户：index_jobs 等表的 user_id 列存 tenantID。
+		payload, err := handleCodebaseIndex(c.Request.Context(), tenantID, p.Arguments)
 		if err != nil {
 			if errors.Is(c.Request.Context().Err(), context.Canceled) {
 				completeRequestLogAsync(getRequestLogEntry(c, 499))
@@ -1486,14 +1796,7 @@ func handleMCPToolsCall(c *gin.Context, id json.RawMessage, params json.RawMessa
 				errorSource = "lce"
 			}
 			saveErrorDetailsAsync(logIDVal, errorSource, err.Error(), getInsertDone(c))
-			encoded, _ := json.Marshal(map[string]interface{}{
-				"schemaVersion":  "1.0",
-				"toolName":       codebaseIndexToolName,
-				"ok":             false,
-				"tool":           codebaseIndexToolName,
-				"responseFormat": "json",
-				"error":          map[string]interface{}{"message": err.Error()},
-			})
+			encoded, _ := json.Marshal(codebaseIndexEnvelope(false, nil, err.Error()))
 			c.JSON(http.StatusOK, rpcResult(id, map[string]interface{}{
 				"content": []map[string]interface{}{{"type": "text", "text": string(encoded)}},
 				"isError": true,
@@ -1501,14 +1804,7 @@ func handleMCPToolsCall(c *gin.Context, id json.RawMessage, params json.RawMessa
 			completeRequestLogAsync(getRequestLogEntry(c, http.StatusOK))
 			return
 		}
-		indexResult := map[string]interface{}{
-			"schemaVersion":  "1.0",
-			"toolName":       codebaseIndexToolName,
-			"ok":             true,
-			"tool":           codebaseIndexToolName,
-			"responseFormat": "json",
-			"payload":        payload,
-		}
+		indexResult := codebaseIndexEnvelope(true, payload, "")
 		if clientUpdateAvailable(c) {
 			indexResult["_client_update_available"] = true
 		}
@@ -1530,16 +1826,19 @@ func handleMCPToolsCall(c *gin.Context, id json.RawMessage, params json.RawMessa
 		completeRequestLogAsync(getRequestLogEntry(c, http.StatusOK))
 		return
 	}
-	p.Arguments["tenant_id"] = userID
+	// 传给 LCE 的租户永远是 tenant_id := org_id ?? user_id（强制覆写，客户端不可指定）。
+	p.Arguments["tenant_id"] = tenantID
 	var operationLease *indexOperationLease
 	var cfg map[string]interface{}
 	var err error
 	if chatMCPToolUsesRerankConfig(p.Name) {
-		operationLease, cfg, err = acquireModelConfigOperation(c.Request.Context(), userID, "chat-retrieval")
+		// 操作租约按租户（与索引 publish/clear 串行的是租户数据）；
+		// BYO rerank 配置仍按真实用户（用的是调用者自己的 key）。
+		operationLease, cfg, err = acquireModelConfigOperation(c.Request.Context(), tenantID, userID, "chat-retrieval")
 	} else {
 		operationLease, err = acquireSharedIndexOperation(
 			c.Request.Context(),
-			userID,
+			tenantID,
 			"chat-tool:"+uuid.NewString(),
 			"chat-"+p.Name,
 		)
@@ -1571,16 +1870,17 @@ func handleMCPToolsCall(c *gin.Context, id json.RawMessage, params json.RawMessa
 			p.Name, len(result.Content), previewBytesForLog(result.Content, debugCaptureMaxBytes))
 	}
 
-	contentText := string(result.Content)
-	if clientUpdateAvailable(c) {
-		var parsed map[string]interface{}
-		if json.Unmarshal(result.Content, &parsed) == nil {
-			parsed["_client_update_available"] = true
-			if reEncoded, err := json.Marshal(parsed); err == nil {
-				contentText = string(reEncoded)
-			}
+	// _client_update_available 与 _index_status 合并注入：同一次 unmarshal/marshal。
+	// _index_status 只注入 codebase-retrieval 的成功 JSON 响应；查询失败只降级为
+	// 不注入（进度可见是 best-effort，不能拖垮检索本身）。
+	var activeJob *activeIndexJob
+	if p.Name == "codebase-retrieval" && !result.IsError {
+		if activeJob, err = loadActiveIndexJob(c.Request.Context(), tenantID); err != nil {
+			log.Printf("[INDEX_STATUS] active job lookup failed (tenant=%s): %v", tenantID, err)
+			activeJob = nil
 		}
 	}
+	contentText := injectRetrievalExtras(result.Content, clientUpdateAvailable(c), activeJob)
 
 	c.JSON(http.StatusOK, rpcResult(id, map[string]interface{}{
 		"content": []map[string]interface{}{
@@ -1595,15 +1895,16 @@ func handleMCPToolsCall(c *gin.Context, id json.RawMessage, params json.RawMessa
 
 const clearIndexCooldownSeconds = 72 * 60 * 60 // 72 hours
 
-func clearIndexCooldownKey(userID string) string {
-	return "clear_cooldown:" + userID
+// clearIndexCooldownKey 按租户计冷却：组织索引是共享数据，冷却也共享。
+func clearIndexCooldownKey(tenantID string) string {
+	return "clear_cooldown:" + tenantID
 }
 
-func checkClearIndexCooldown(ctx context.Context, userID string) error {
+func checkClearIndexCooldown(ctx context.Context, tenantID string) error {
 	if redisClient == nil {
 		return nil
 	}
-	ttl, err := redisClient.TTL(ctx, clearIndexCooldownKey(userID)).Result()
+	ttl, err := redisClient.TTL(ctx, clearIndexCooldownKey(tenantID)).Result()
 	if err != nil || ttl <= 0 {
 		return nil
 	}
@@ -1612,11 +1913,11 @@ func checkClearIndexCooldown(ctx context.Context, userID string) error {
 	return fmt.Errorf("清除索引冷却中，剩余 %d 小时 %d 分钟后可再次操作", hours, minutes)
 }
 
-func setClearIndexCooldown(ctx context.Context, userID string) {
+func setClearIndexCooldown(ctx context.Context, tenantID string) {
 	if redisClient == nil {
 		return
 	}
-	redisClient.Set(ctx, clearIndexCooldownKey(userID), "1", time.Duration(clearIndexCooldownSeconds)*time.Second)
+	redisClient.Set(ctx, clearIndexCooldownKey(tenantID), "1", time.Duration(clearIndexCooldownSeconds)*time.Second)
 }
 
 func deleteUserLogsAsync(userID string) {
@@ -1642,13 +1943,19 @@ func handleClearIndex(c *gin.Context) {
 		completeRequestLogAsync(getRequestLogEntry(c, http.StatusUnauthorized))
 		return
 	}
+	// 数据归属按租户：组织密钥清的是整个组织的索引，个人密钥行为不变。
+	tenantID := requestTenantID(c)
 
-	if err := checkClearIndexCooldown(c.Request.Context(), userIDStr); err != nil {
+	if rejectNonOwnerIndexDeletion(c) {
+		return
+	}
+
+	if err := checkClearIndexCooldown(c.Request.Context(), tenantID); err != nil {
 		c.JSON(http.StatusTooManyRequests, gin.H{"error": err.Error()})
 		completeRequestLogAsync(getRequestLogEntry(c, http.StatusTooManyRequests))
 		return
 	}
-	lease, err := acquireExclusiveIndexOperation(c.Request.Context(), userIDStr, "clear-index")
+	lease, err := acquireExclusiveIndexOperation(c.Request.Context(), tenantID, "clear-index")
 	if err != nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "索引正在执行其他操作: " + err.Error()})
 		completeRequestLogAsync(getRequestLogEntry(c, http.StatusServiceUnavailable))
@@ -1663,13 +1970,13 @@ func handleClearIndex(c *gin.Context) {
 	// LCE 清失败只会导致下一次全量重传覆盖旧数据，可自愈。
 	// 事务在调 LCE 之前就已提交并释放连接与 advisory 锁，不会占着连接池等
 	// 长时间网络调用。
-	if err := clearUserIndexState(opCtx, userIDStr); err != nil {
+	if err := clearUserIndexState(opCtx, tenantID); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "清除 Relay 索引状态失败: " + err.Error()})
 		completeRequestLogAsync(getRequestLogEntry(c, http.StatusInternalServerError))
 		return
 	}
 
-	args := map[string]interface{}{"tenant_id": userIDStr}
+	args := map[string]interface{}{"tenant_id": tenantID}
 	result, err := lce.callToolWithTimeout(opCtx, "codebase_clear_index", args, remoteIndexMCPCallTimeout)
 	if err != nil {
 		logIDStr, _ := c.Get(ContextKeyLogID)
@@ -1686,7 +1993,8 @@ func handleClearIndex(c *gin.Context) {
 		return
 	}
 
-	setClearIndexCooldown(c.Request.Context(), userIDStr)
+	setClearIndexCooldown(c.Request.Context(), tenantID)
+	// 审计日志按真实用户删除：request_logs 归属个人，与租户归并无关。
 	deleteUserLogsAsync(userIDStr)
 
 	c.JSON(http.StatusOK, gin.H{"success": true, "message": "索引和日志已清除"})
@@ -1702,7 +2010,9 @@ func handleTenantStats(c *gin.Context) {
 		return
 	}
 
-	args := map[string]interface{}{"tenant_id": userIDStr}
+	// 统计口径按租户：组织成员看到的是组织共享索引的统计。
+	tenantID := requestTenantID(c)
+	args := map[string]interface{}{"tenant_id": tenantID}
 	result, err := lce.callTool(c.Request.Context(), "codebase_tenant_stats", args)
 	if err != nil {
 		logIDStr, _ := c.Get(ContextKeyLogID)
@@ -1731,13 +2041,20 @@ func handleTenantStats(c *gin.Context) {
 	var completedJobCount int
 	row := db.QueryRow(
 		`SELECT COUNT(*) FROM index_jobs WHERE user_id = $1 AND status = $2`,
-		userIDStr,
+		tenantID,
 		indexJobStatusCompleted,
 	)
 	if err := row.Scan(&completedJobCount); err != nil {
-		log.Printf("[STATS] completed index job count failed (user=%s): %v", userIDStr, err)
+		log.Printf("[STATS] completed index job count failed (tenant=%s): %v", tenantID, err)
 	}
 	stats["indexingCount"] = completedJobCount
+
+	// active_job 是对外契约字段：有 running 任务才带，字段名不可改。
+	if activeJob, err := loadActiveIndexJob(c.Request.Context(), tenantID); err != nil {
+		log.Printf("[STATS] active job lookup failed (tenant=%s): %v", tenantID, err)
+	} else if activeJob != nil {
+		stats["active_job"] = activeJob.activeJobPayload()
+	}
 
 	c.JSON(http.StatusOK, stats)
 	completeRequestLogAsync(getRequestLogEntry(c, http.StatusOK))
@@ -2163,13 +2480,46 @@ func main() {
 		pprofMux.HandleFunc("/debug/pprof/profile", pprof.Profile)
 		pprofMux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
 		pprofMux.HandleFunc("/debug/pprof/trace", pprof.Trace)
-		log.Println("[PPROF] Listening on 127.0.0.1:6060")
+		// /metrics 默认只在这个 loopback 内部端口暴露：nginx 只向 relay 转发
+		// /mcp 前缀，主端口不注册 /metrics（除非配置 METRICS_TOKEN）。
+		pprofMux.Handle("/metrics", metricsHandler())
+		log.Println("[PPROF] Listening on 127.0.0.1:6060 (pprof + /metrics)")
 		if err := http.ListenAndServe("127.0.0.1:6060", pprofMux); err != nil {
 			log.Printf("[PPROF] Server error: %v", err)
 		}
 	}()
 
-	r := gin.Default()
+	// 等价于 gin.Default()，但 Recovery 换成结构化日志版本：panic 会带
+	// request_id/path 落一条 logfmt 事件再回 500。
+	r := gin.New()
+	r.Use(gin.Logger())
+	r.Use(gin.CustomRecovery(func(c *gin.Context, recovered interface{}) {
+		logID, _ := c.Get(ContextKeyLogID)
+		logIDStr, _ := logID.(string)
+		logEvent("panic_recovered",
+			"request_id", logIDStr,
+			"path", c.Request.URL.Path,
+			"method", c.Request.Method,
+			"panic", fmt.Sprintf("%v", recovered),
+		)
+		c.AbortWithStatus(http.StatusInternalServerError)
+	}))
+	r.Use(metricsMiddleware())
+
+	// 可选的公网 /metrics：仅当 METRICS_TOKEN 非空时注册（注册在 authMiddleware
+	// 之前，不走 api key 认证）；token 不匹配一律 404，不泄露端点存在性。
+	// 未配置时该路由不存在，自然 404。
+	if metricsToken := strings.TrimSpace(os.Getenv("METRICS_TOKEN")); metricsToken != "" {
+		metricsGinHandler := gin.WrapH(metricsHandler())
+		r.GET("/metrics", func(c *gin.Context) {
+			if c.GetHeader("Authorization") != "Bearer "+metricsToken {
+				c.JSON(http.StatusNotFound, gin.H{"error": "route not found"})
+				return
+			}
+			metricsGinHandler(c)
+		})
+	}
+
 	r.Use(authMiddleware())
 
 	r.POST("/mcp", handleMCPPost)
@@ -2182,6 +2532,8 @@ func main() {
 	})
 	r.POST("/mcp/clear-index", handleClearIndex)
 	r.GET("/mcp/tenant-stats", handleTenantStats)
+	r.GET("/mcp/roots", handleListRoots)
+	r.POST("/mcp/delete-root", handleDeleteRoot)
 
 	r.NoRoute(func(c *gin.Context) {
 		if shouldDebugCapture(c.Request.URL.Path) {

@@ -7,7 +7,7 @@ LCE 的多租户远程 MCP 服务。IDE Agent 只需配置一个 Streamable HTTP
 - **纯 MCP 首次与增量索引**：`codebase_index` 比较 Agent 提交的完整工作区 manifest 与服务端快照，首次返回全量文件，后续只返回新增或变更文件并检测删除文件
 - **索引任务进度**：持久化任务阶段、文件数、chunk 数、分支、revision、心跳和完成状态
 - **LCE MCP 对接**：对外通过 `codebase_index` 同步索引、通过 `codebase-retrieval` 执行向量召回和精排；底层索引原语不向客户端暴露
-- **API Key 认证**：基于 Bearer Token 的认证中间件，通过 PostgreSQL 存储 API Key，Redis 缓存加速验证
+- **API Key 认证**：基于 Bearer Token 的认证中间件，API Key 存于 PostgreSQL（`api_keys.id` 为 key 的哈希 hex，兼容存量 MD5 与新的 SHA-256 双读）；relay 进程内缓存认证结果（正缓存 30s / 负缓存 5s），封禁、删除、重置 key 的撤销延迟最多 30 秒
 - **请求日志**：自动记录每个请求的状态、耗时、来源 IP 等信息到 PostgreSQL
 - **错误追踪**：异步记录代理层和上游服务的错误详情
 - **任务回收**：索引任务完成或失败后删除暂存文件；运行任务心跳超时后自动标记并回收
@@ -30,12 +30,13 @@ LCE 的多租户远程 MCP 服务。IDE Agent 只需配置一个 Streamable HTTP
 
 ### MCP 工具边界
 
-远程 MCP 对模型只暴露 4 个租户安全工具：
+远程 MCP 对模型只暴露 3 个租户安全工具：
 
 - `codebase-retrieval`：在租户服务端索引上执行向量召回与精排；向量空间由 LCE 固定，Relay 只按用户注入可选 rerank 配置。
 - `codebase_symbol_graph`：查询指定 `root_id` 的服务端符号图。
-- `codebase_tenant_stats`：查询当前租户的聚合索引统计。
 - `codebase_index`：不依赖 IDE 插件的索引入口。Agent 使用自身文件读取能力提交完整 manifest，再按 `pending_files` 分批上传内容，最后完成任务并收敛符号图。
+
+`codebase_tenant_stats` 是网页控制台的内部统计接口，不会出现在远程 MCP 的 `tools/list` 中。
 
 `codebase_index` 的操作顺序为 `start -> upload -> complete`，可用 `status` 同步续期 Relay 与 LCE 的任务租约并查询进度，失败时调用 `fail` 回收任务。服务端负责注入 `tenant_id`，并强制执行 SHA-256 内容匹配、路径过滤、manifest/批次上限、每日索引字节配额、root 隔离和删除检测。Relay 使用同一个 job UUID 调用 LCE 的内部 `begin -> stage/renew -> publish/abort` 协议；首次 full job 以 `replace_root=true` 发布完整根快照，能够清除仅存在于云端的旧文件。PostgreSQL 中的词法、精确、向量和经编译器细化的符号图数据只在 publish 时原子可见。`codebase_remote_index` 和 `codebase_clear_index` 是内部控制面，不能由模型直接调用。
 
@@ -46,7 +47,7 @@ LCE 的多租户远程 MCP 服务。IDE Agent 只需配置一个 Streamable HTTP
 - **语言**：Go 1.25
 - **Web 框架**：Gin
 - **数据库**：PostgreSQL（请求日志、排行榜、API Key 存储）
-- **缓存**：Redis（API Key 缓存）
+- **缓存**：Redis（封禁/设备绑定状态缓存；API Key 认证缓存为进程内实现）
 - **依赖管理**：Go Modules
 
 ## 前置要求
@@ -148,7 +149,7 @@ go build -o acemcp-relay .
 新设备登录立即踢掉旧设备，被踢设备在 `enforce` 模式下收到 401，必须重新走网页
 登录才能使用 —— 换设备无感，共用账号则互相踢下线且每次都要重新 OAuth。
 单设备模式下，**换设备（发生互踢）时还会轮换 API token**：被踢机器上的旧 token
-（包括被复制走的副本）立即失效；此防线不依赖 `DEVICE_BINDING_MODE`，部署前端后
+（包括被复制走的副本）随即失效（受 relay 认证缓存影响，最长延迟 30 秒）；此防线不依赖 `DEVICE_BINDING_MODE`，部署前端后
 立即生效。同一份已登记的 MCP 配置可在同一客户端重复连接，不触发互踢或 token 轮换。
 每次踢出都会写一条 `device_evicted` 告警，频繁互踢即共用信号：
 
@@ -180,6 +181,12 @@ GROUP BY user_id ORDER BY evictions DESC LIMIT 20;
 - **`indexed_files`**：服务端已完成索引的工作区文件快照，用于后续增量比较和删除检测
 
 > 数据库连接池配置为最多 25 个打开/空闲连接，连接生命周期 30 分钟，以减少 SCRAM-SHA-256 认证带来的 CPU 开销。
+
+## 部署形态
+
+**relay 为单实例设计**：认证缓存（api key 30s 正缓存 / 5s 负缓存）、`codebase_index start` 频率限制、MCP session 均为进程内状态。横向扩展（多副本）前需将这些状态外置到 Redis，否则各副本状态不一致（缓存各自失效、限流被放大 N 倍、session 无法跨副本路由）。
+
+API key 撤销语义：前端封禁账号、删除或重置密钥后，旧 key 仍可能通过 relay 进程内缓存认证最多 30 秒；这是已确认可接受的延迟，不提供跨进程即时失效机制。
 
 ## 已知限制
 

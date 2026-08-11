@@ -158,11 +158,11 @@ func TestChargeIndexBytesRejectsWithoutIncreasingUsage(t *testing.T) {
 	server := withTestIndexQuota(t, 100)
 	userID := "quota-user"
 
-	allowed, used, _ := chargeIndexBytes(userID, 60)
+	allowed, used, _ := chargeIndexBytes(userID, "", tierFree, 60)
 	if !allowed || used != 60 {
 		t.Fatalf("first charge = allowed %v, used %d; want true, 60", allowed, used)
 	}
-	allowed, used, _ = chargeIndexBytes(userID, 50)
+	allowed, used, _ = chargeIndexBytes(userID, "", tierFree, 50)
 	if allowed || used != 60 {
 		t.Fatalf("over-limit charge = allowed %v, used %d; want false, unchanged 60", allowed, used)
 	}
@@ -188,7 +188,7 @@ func TestChargeIndexBytesIsAtomicUnderConcurrency(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			allowed, _, _ := chargeIndexBytes(userID, 10)
+			allowed, _, _ := chargeIndexBytes(userID, "", tierFree, 10)
 			if allowed {
 				mu.Lock()
 				allowedCount++
