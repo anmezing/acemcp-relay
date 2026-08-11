@@ -1,0 +1,9 @@
+.git
+.github
+.env
+.env.*
+*.log
+coverage*
+deploy
+lce-relay
+*_test.go
