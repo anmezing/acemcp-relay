@@ -1438,7 +1438,9 @@ func startIndexJobSweeper(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			platformModelConfigBarrier.RLock()
 			sweepExpiredIndexJobs(ctx)
+			platformModelConfigBarrier.RUnlock()
 		}
 	}
 }

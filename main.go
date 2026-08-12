@@ -41,6 +41,8 @@ var (
 	serverAddr               string
 	lceMCPURL                string
 	lceHealthURL             string
+	lcePlatformConfigURL     string
+	lcePlatformConfigToken   string
 	tenantAssertions         *tenantAssertionSigner
 	dbHost                   string
 	dbPort                   int
@@ -99,13 +101,19 @@ func loadConfig() {
 	// 它只说明进程活着，功能性判断仍由 tools/list 负责。
 	// TrimRight 防止 LCE_MCP_URL 带尾斜杠时拼出 "…//health"。
 	lceHealthURL = strings.TrimRight(lceMCPURL, "/") + "/health"
+	lcePlatformConfigURL = strings.TrimRight(lceMCPURL, "/") + "/platform-model-config"
 	// 与 LCE 共享的租户断言密钥。未配置时不附带断言：LCE 在 loopback 且未配密钥时
 	// 不强制校验，本地开发照旧；LCE 一旦配上密钥，未带断言的租户调用会被拒绝。
-	signer, err := newTenantAssertionSigner(os.Getenv("LCE_TENANT_ASSERTION_SECRET"))
+	tenantAssertionSecret := os.Getenv("LCE_TENANT_ASSERTION_SECRET")
+	signer, err := newTenantAssertionSigner(tenantAssertionSecret)
 	if err != nil {
 		log.Fatalf("[CONFIG] %v", err)
 	}
 	tenantAssertions = signer
+	if tenantAssertionSecret != "" {
+		hash := sha256.Sum256([]byte("lce-platform-model-config-auth:" + tenantAssertionSecret))
+		lcePlatformConfigToken = hex.EncodeToString(hash[:])
+	}
 	if tenantAssertions == nil {
 		if !isLoopbackServerAddr(serverAddr) {
 			log.Fatalf("[CONFIG] LCE_TENANT_ASSERTION_SECRET is required when binding to a non-loopback address (%s)", serverAddr)
@@ -2533,7 +2541,13 @@ func main() {
 		})
 	}
 
+	// 平台模型控制面只接受控制台派生 token，不依赖某个用户 API key。
+	// 路由注册在普通 authMiddleware 之前，避免把管理员操作绑定到个人凭据。
+	r.GET("/internal/platform-model-config", handleGetPlatformModelConfig)
+	r.POST("/internal/platform-model-config", handleSavePlatformModelConfig)
+
 	r.Use(authMiddleware())
+	r.Use(platformModelConfigReadBarrier())
 
 	r.POST("/mcp", handleMCPPost)
 	r.DELETE("/mcp", handleMCPDelete)

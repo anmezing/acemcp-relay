@@ -39,6 +39,8 @@ func TestTrustedConsoleRequest(t *testing.T) {
 	}{
 		{name: "tenant stats", method: http.MethodGet, path: "/mcp/tenant-stats", token: validToken, want: true},
 		{name: "clear index", method: http.MethodPost, path: "/mcp/clear-index", token: validToken, want: true},
+		{name: "read platform models", method: http.MethodGet, path: "/internal/platform-model-config", token: validToken, want: true},
+		{name: "write platform models", method: http.MethodPost, path: "/internal/platform-model-config", token: validToken, want: true},
 		{name: "missing token", method: http.MethodGet, path: "/mcp/tenant-stats", want: false},
 		{name: "wrong token", method: http.MethodGet, path: "/mcp/tenant-stats", token: "wrong", want: false},
 		{name: "wrong method", method: http.MethodPost, path: "/mcp/tenant-stats", token: validToken, want: false},
