@@ -76,7 +76,7 @@ services:
       - "host.docker.internal:host-gateway"
     environment:
       PORT: "3001"
-      BETTER_AUTH_URL: ${BETTER_AUTH_URL:-https://513689.xyz}
+      BETTER_AUTH_URL: ${BETTER_AUTH_URL:-https://lcebot.com}
       BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:?set BETTER_AUTH_SECRET in .env}
       AUTH_LINUXDO_ID: ${AUTH_LINUXDO_ID:-}
       AUTH_LINUXDO_SECRET: ${AUTH_LINUXDO_SECRET:-}
