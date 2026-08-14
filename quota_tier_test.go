@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"errors"
 	"testing"
+	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/alicebob/miniredis/v2"
@@ -47,6 +49,19 @@ func withTierQuotaEnv(t *testing.T, freeReq, proReq int, freeBytes, proBytes int
 func expectNoQuotaOverride(mock sqlmock.Sqlmock, userID string) {
 	mock.ExpectQuery("SELECT daily_limit FROM user_quotas").WithArgs(userID).
 		WillReturnRows(sqlmock.NewRows([]string{"daily_limit"}))
+	expectNoActivePlan(mock, userID)
+}
+
+func expectNoIndexBytesOverride(mock sqlmock.Sqlmock, userID string) {
+	mock.ExpectQuery("SELECT daily_index_bytes_limit FROM user_quotas").WithArgs(userID).
+		WillReturnRows(sqlmock.NewRows([]string{"daily_index_bytes_limit"}))
+	expectNoActivePlan(mock, userID)
+}
+
+func expectNoActivePlan(mock sqlmock.Sqlmock, userID string) {
+	mock.ExpectQuery("SELECT daily_request_limit, daily_index_bytes_limit, expires_at").
+		WithArgs(userID).
+		WillReturnRows(sqlmock.NewRows([]string{"daily_request_limit", "daily_index_bytes_limit", "expires_at"}))
 }
 
 func TestNormalizeTierUnknownValuesFallBackToFree(t *testing.T) {
@@ -146,7 +161,9 @@ func TestGetUserDailyLimitPerUserOverrideBeatsTierDefault(t *testing.T) {
 }
 
 func TestChargeIndexBytesFreeAndProUseTheirOwnLimits(t *testing.T) {
-	withTierQuotaEnv(t, 0, 0, 100, 300)
+	mock, _ := withTierQuotaEnv(t, 0, 0, 100, 300)
+	expectNoIndexBytesOverride(mock, "free-user")
+	expectNoIndexBytesOverride(mock, "pro-user")
 
 	if allowed, _, limit := chargeIndexBytes("free-user", "", "free", 100); !allowed || limit != 100 {
 		t.Fatalf("free charge at limit: allowed=%v limit=%d", allowed, limit)
@@ -164,7 +181,8 @@ func TestChargeIndexBytesFreeAndProUseTheirOwnLimits(t *testing.T) {
 }
 
 func TestChargeIndexBytesUnknownTierUsesFreeLimit(t *testing.T) {
-	withTierQuotaEnv(t, 0, 0, 100, 0)
+	mock, _ := withTierQuotaEnv(t, 0, 0, 100, 0)
+	expectNoIndexBytesOverride(mock, "weird-user")
 
 	if allowed, _, _ := chargeIndexBytes("weird-user", "", "platinum", 101); allowed {
 		t.Fatal("unknown tier must use the free byte limit, not pro unlimited")
@@ -172,9 +190,125 @@ func TestChargeIndexBytesUnknownTierUsesFreeLimit(t *testing.T) {
 }
 
 func TestChargeIndexBytesProZeroMeansUnlimited(t *testing.T) {
-	withTierQuotaEnv(t, 0, 0, 100, 0)
+	mock, _ := withTierQuotaEnv(t, 0, 0, 100, 0)
+	expectNoIndexBytesOverride(mock, "pro-user")
 
 	if allowed, _, limit := chargeIndexBytes("pro-user", "", "pro", 1<<30); !allowed || limit != 0 {
 		t.Fatalf("pro with limit 0 must pass any size, allowed=%v limit=%d", allowed, limit)
+	}
+}
+
+func TestUserIndexBytesOverrideBeatsTierDefault(t *testing.T) {
+	mock, _ := withTierQuotaEnv(t, 0, 0, 100, 300)
+	mock.ExpectQuery("SELECT daily_index_bytes_limit FROM user_quotas").
+		WithArgs("override-user").
+		WillReturnRows(sqlmock.NewRows([]string{"daily_index_bytes_limit"}).AddRow(125))
+
+	if allowed, _, limit := chargeIndexBytes("override-user", "", "pro", 125); !allowed || limit != 125 {
+		t.Fatalf("charge at override: allowed=%v limit=%d, want allowed limit=125", allowed, limit)
+	}
+	if allowed, _, limit := chargeIndexBytes("override-user", "", "pro", 1); allowed || limit != 125 {
+		t.Fatalf("charge over override: allowed=%v limit=%d, want rejected limit=125", allowed, limit)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestNullUserIndexBytesOverrideInheritsTier(t *testing.T) {
+	mock, _ := withTierQuotaEnv(t, 0, 0, 100, 300)
+	mock.ExpectQuery("SELECT daily_index_bytes_limit FROM user_quotas").
+		WithArgs("inherit-user").
+		WillReturnRows(sqlmock.NewRows([]string{"daily_index_bytes_limit"}).AddRow(nil))
+	expectNoActivePlan(mock, "inherit-user")
+
+	if allowed, _, limit := chargeIndexBytes("inherit-user", "", "pro", 300); !allowed || limit != 300 {
+		t.Fatalf("null override: allowed=%v limit=%d, want pro default 300", allowed, limit)
+	}
+}
+
+func TestActivePlanProvidesBothPersonalQuotaDimensions(t *testing.T) {
+	mock, _ := withTierQuotaEnv(t, 10, 20, 100, 200)
+	mock.ExpectQuery("SELECT daily_limit FROM user_quotas").WithArgs("paid-user").
+		WillReturnRows(sqlmock.NewRows([]string{"daily_limit"}))
+	expiresAt := time.Now().Add(time.Hour)
+	mock.ExpectQuery("SELECT daily_request_limit, daily_index_bytes_limit, expires_at").
+		WithArgs("paid-user").
+		WillReturnRows(sqlmock.NewRows([]string{"daily_request_limit", "daily_index_bytes_limit", "expires_at"}).
+			AddRow(77, 777, expiresAt))
+
+	if got := getUserDailyLimit("paid-user", "free"); got != 77 {
+		t.Fatalf("request limit = %d, want paid plan 77", got)
+	}
+
+	mock.ExpectQuery("SELECT daily_index_bytes_limit FROM user_quotas").WithArgs("paid-user").
+		WillReturnRows(sqlmock.NewRows([]string{"daily_index_bytes_limit"}).AddRow(nil))
+	mock.ExpectQuery("SELECT daily_request_limit, daily_index_bytes_limit, expires_at").
+		WithArgs("paid-user").
+		WillReturnRows(sqlmock.NewRows([]string{"daily_request_limit", "daily_index_bytes_limit", "expires_at"}).
+			AddRow(77, 777, expiresAt))
+	if got := getUserIndexBytesLimit("paid-user", "free"); got != 777 {
+		t.Fatalf("index byte limit = %d, want paid plan 777", got)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestActivePlanQuotaCacheExpiresBeforeSubscription(t *testing.T) {
+	mock, server := withTierQuotaEnv(t, 10, 20, 100, 200)
+	mock.ExpectQuery("SELECT daily_limit FROM user_quotas").WithArgs("paid-user").
+		WillReturnRows(sqlmock.NewRows([]string{"daily_limit"}))
+	expiresAt := time.Now().Add(2 * time.Minute)
+	mock.ExpectQuery("SELECT daily_request_limit, daily_index_bytes_limit, expires_at").
+		WithArgs("paid-user").
+		WillReturnRows(sqlmock.NewRows([]string{"daily_request_limit", "daily_index_bytes_limit", "expires_at"}).
+			AddRow(77, 777, expiresAt))
+
+	if got := getUserDailyLimit("paid-user", "free"); got != 77 {
+		t.Fatalf("request limit = %d, want paid plan 77", got)
+	}
+	ttl := server.TTL("quota:limit:paid-user")
+	if ttl <= 0 || ttl >= quotaCacheTTL {
+		t.Fatalf("cache TTL = %v, want positive and shorter than %v", ttl, quotaCacheTTL)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestQuotaDatabaseErrorsAreNotCached(t *testing.T) {
+	mock, server := withTierQuotaEnv(t, 10, 20, 100, 200)
+	mock.ExpectQuery("SELECT daily_limit FROM user_quotas").WithArgs("db-error-user").
+		WillReturnError(errors.New("database unavailable"))
+
+	if got := getUserDailyLimit("db-error-user", "pro"); got != 20 {
+		t.Fatalf("request limit = %d, want fail-open pro default 20", got)
+	}
+	if server.Exists("quota:limit:db-error-user") {
+		t.Fatal("database errors must not populate the request quota cache")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestActivePlanLookupErrorsAreNotCached(t *testing.T) {
+	mock, server := withTierQuotaEnv(t, 10, 20, 100, 200)
+	mock.ExpectQuery("SELECT daily_index_bytes_limit FROM user_quotas").
+		WithArgs("plan-error-user").
+		WillReturnRows(sqlmock.NewRows([]string{"daily_index_bytes_limit"}))
+	mock.ExpectQuery("SELECT daily_request_limit, daily_index_bytes_limit, expires_at").
+		WithArgs("plan-error-user").
+		WillReturnError(errors.New("database unavailable"))
+
+	if got := getUserIndexBytesLimit("plan-error-user", "pro"); got != 200 {
+		t.Fatalf("index byte limit = %d, want fail-open pro default 200", got)
+	}
+	if server.Exists("quota:limit:indexbytes:plan-error-user") {
+		t.Fatal("active-plan lookup errors must not populate the quota cache")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
 	}
 }

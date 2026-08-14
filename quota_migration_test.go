@@ -19,6 +19,10 @@ func TestMigrateQuotaTablesRunsOrgQuotaAlterSeparately(t *testing.T) {
 
 	mock.ExpectExec("CREATE TABLE IF NOT EXISTS user_quotas").
 		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec("ALTER TABLE user_quotas").
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec("CREATE TABLE IF NOT EXISTS user_subscriptions").
+		WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec("CREATE TABLE IF NOT EXISTS org_quotas").
 		WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec("ALTER TABLE org_quotas").

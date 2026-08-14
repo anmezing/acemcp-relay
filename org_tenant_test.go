@@ -36,32 +36,36 @@ func expectOrgQuotaRow(mock sqlmock.Sqlmock, orgID string, reqLimit, bytesLimit 
 func TestGetOrgQuotaLimitsAllowsIndependentInheritedDimensions(t *testing.T) {
 	mock, server := withTierQuotaEnv(t, 7, 0, 100, 0)
 	expectOrgQuotaRow(mock, "org-null-request", nil, int64(50))
+	expectOrgOwnerEntitlement(mock, "org-null-request", nil, nil, nil, "free")
 
 	limits := getOrgQuotaLimits("org-null-request")
-	if limits.RequestSet || limits.Request != 0 {
-		t.Fatalf("NULL request limit must inherit tier, got %+v", limits)
+	if !limits.RequestSet || limits.Request != 7 {
+		t.Fatalf("NULL request limit must inherit owner tier, got %+v", limits)
 	}
 	if !limits.IndexBytesSet || limits.IndexBytes != 50 {
 		t.Fatalf("configured byte limit lost when request is NULL: %+v", limits)
 	}
-	if cached, err := server.Get("quota:limit:orgq:org-null-request"); err != nil || cached != "v1,n,50" {
-		t.Fatalf("nullable org quota cache = %q (%v), want v1,n,50", cached, err)
+	if cached, err := server.Get("quota:limit:orgq:org-null-request"); err != nil || cached != "v2,7,50" {
+		t.Fatalf("resolved org quota cache = %q (%v), want v2,7,50", cached, err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatal(err)
 	}
 }
 
-func TestParseOrgQuotaCacheSupportsLegacyAndNullableFormats(t *testing.T) {
-	legacy, ok := parseOrgQuotaCache("10,20")
-	if !ok || !legacy.RequestSet || legacy.Request != 10 || !legacy.IndexBytesSet || legacy.IndexBytes != 20 {
-		t.Fatalf("legacy cache parse = %+v ok=%v", legacy, ok)
+func TestParseOrgQuotaCacheSupportsOnlyFinalV2Format(t *testing.T) {
+	if _, ok := parseOrgQuotaCache("10,20"); ok {
+		t.Fatal("unversioned old cache data must be rejected")
 	}
-	partial, ok := parseOrgQuotaCache("v1,25,n")
-	if !ok || !partial.RequestSet || partial.Request != 25 || partial.IndexBytesSet {
-		t.Fatalf("nullable cache parse = %+v ok=%v", partial, ok)
+	if _, ok := parseOrgQuotaCache("v1,25,n"); ok {
+		t.Fatal("v1 nullable cache data is obsolete and must be rejected")
 	}
-	if _, ok := parseOrgQuotaCache("v1,broken,n"); ok {
+	final, ok := parseOrgQuotaCache("v2,25,250")
+	if !ok || !final.RequestSet || final.Request != 25 ||
+		!final.IndexBytesSet || final.IndexBytes != 250 {
+		t.Fatalf("final cache parse = %+v ok=%v", final, ok)
+	}
+	if _, ok := parseOrgQuotaCache("v2,broken,250"); ok {
 		t.Fatal("invalid cache value must be rejected")
 	}
 }
@@ -69,6 +73,23 @@ func TestParseOrgQuotaCacheSupportsLegacyAndNullableFormats(t *testing.T) {
 func expectNoOrgQuotaRow(mock sqlmock.Sqlmock, orgID string) {
 	mock.ExpectQuery("SELECT daily_request_limit, daily_index_bytes_limit FROM org_quotas").WithArgs(orgID).
 		WillReturnRows(sqlmock.NewRows([]string{"daily_request_limit", "daily_index_bytes_limit"}))
+	expectOrgOwnerEntitlement(mock, orgID, nil, nil, nil, "free")
+}
+
+func expectOrgOwnerEntitlement(
+	mock sqlmock.Sqlmock,
+	orgID string,
+	requestLimit, indexBytesLimit, expiresAt interface{},
+	ownerTier string,
+) {
+	mock.ExpectQuery("SELECT subscriptions.daily_request_limit").
+		WithArgs(orgID).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"daily_request_limit",
+			"daily_index_bytes_limit",
+			"expires_at",
+			"owner_tier",
+		}).AddRow(requestLimit, indexBytesLimit, expiresAt, ownerTier))
 }
 
 func TestMemberQuotaLimitCacheKeyContract(t *testing.T) {
@@ -164,18 +185,18 @@ func TestCheckRequestQuotaPersonalAndOrgKeysCountIndependently(t *testing.T) {
 	}
 }
 
-func TestCheckRequestQuotaOrgWithoutQuotaRowFallsBackToTierDefault(t *testing.T) {
+func TestCheckRequestQuotaOrgWithoutQuotaRowUsesOwnerTierNotCallerTier(t *testing.T) {
 	mock, _ := withTierQuotaEnv(t, 2, 100, 0, 0)
 	expectNoMemberQuotaRow(mock, "org-2", "member-1")
 	expectNoOrgQuotaRow(mock, "org-2")
 
 	for i := 0; i < 2; i++ {
-		if ok, limit := checkRequestQuota("member-1", "org-2", "free"); !ok || limit != 2 {
-			t.Fatalf("request %d: ok=%v limit=%d, want tier default 2", i, ok, limit)
+		if ok, limit := checkRequestQuota("member-1", "org-2", "pro"); !ok || limit != 2 {
+			t.Fatalf("request %d: ok=%v limit=%d, want owner free limit 2", i, ok, limit)
 		}
 	}
-	if ok, _ := checkRequestQuota("member-1", "org-2", "free"); ok {
-		t.Fatal("org without org_quotas must fall back to the caller tier default")
+	if ok, _ := checkRequestQuota("member-1", "org-2", "pro"); ok {
+		t.Fatal("a pro member must not raise a free owner's organization limit")
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatal(err)
@@ -224,15 +245,55 @@ func TestChargeIndexBytesOrgUsesOrgQuotaAndSharesTenantPool(t *testing.T) {
 	}
 }
 
-func TestChargeIndexBytesOrgWithoutQuotaRowFallsBackToTier(t *testing.T) {
+func TestChargeIndexBytesOrgWithoutQuotaRowUsesOwnerTierNotCallerTier(t *testing.T) {
 	mock, _ := withTierQuotaEnv(t, 0, 0, 100, 0)
 	expectNoOrgQuotaRow(mock, "org-3")
 
-	if allowed, _, limit := chargeIndexBytes("org-3", "org-3", "free", 100); !allowed || limit != 100 {
-		t.Fatalf("org fallback byte charge: allowed=%v limit=%d, want tier default 100", allowed, limit)
+	if allowed, _, limit := chargeIndexBytes("org-3", "org-3", "pro", 100); !allowed || limit != 100 {
+		t.Fatalf("org fallback byte charge: allowed=%v limit=%d, want owner free limit 100", allowed, limit)
 	}
-	if allowed, _, _ := chargeIndexBytes("org-3", "org-3", "free", 1); allowed {
-		t.Fatal("tier-default byte limit must apply to the org pool")
+	if allowed, _, _ := chargeIndexBytes("org-3", "org-3", "pro", 1); allowed {
+		t.Fatal("a pro member must not make a free owner's org byte pool unlimited")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestOrgWithoutSubscriptionInheritsOwnerBaseProTier(t *testing.T) {
+	mock, _ := withTierQuotaEnv(t, 2, 9, 100, 900)
+	expectNoMemberQuotaRow(mock, "org-owner-pro", "member-free")
+	mock.ExpectQuery("SELECT daily_request_limit, daily_index_bytes_limit FROM org_quotas").
+		WithArgs("org-owner-pro").
+		WillReturnRows(sqlmock.NewRows([]string{"daily_request_limit", "daily_index_bytes_limit"}))
+	expectOrgOwnerEntitlement(mock, "org-owner-pro", nil, nil, nil, "pro")
+
+	if ok, limit := checkRequestQuota("member-free", "org-owner-pro", "free"); !ok || limit != 9 {
+		t.Fatalf("owner base tier request limit: ok=%v limit=%d, want 9", ok, limit)
+	}
+	if allowed, _, limit := chargeIndexBytes("org-owner-pro", "org-owner-pro", "free", 900); !allowed || limit != 900 {
+		t.Fatalf("owner base tier byte limit: allowed=%v limit=%d, want 900", allowed, limit)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestOrgWithoutAdminOverrideInheritsOwnerPlan(t *testing.T) {
+	mock, _ := withTierQuotaEnv(t, 2, 100, 100, 1000)
+	expectNoMemberQuotaRow(mock, "org-paid", "member-1")
+	mock.ExpectQuery("SELECT daily_request_limit, daily_index_bytes_limit FROM org_quotas").
+		WithArgs("org-paid").
+		WillReturnRows(sqlmock.NewRows([]string{"daily_request_limit", "daily_index_bytes_limit"}))
+	expectOrgOwnerEntitlement(mock, "org-paid", 9, 900, time.Now().Add(time.Hour), "free")
+
+	if ok, limit := checkRequestQuota("member-1", "org-paid", "free"); !ok || limit != 9 {
+		t.Fatalf("organization request plan: ok=%v limit=%d, want 9", ok, limit)
+	}
+
+	// owner 套餐两个维度已作为一份最终权益缓存，字节请求不再重复查库。
+	if allowed, _, limit := chargeIndexBytes("org-paid", "org-paid", "free", 900); !allowed || limit != 900 {
+		t.Fatalf("organization byte plan: allowed=%v limit=%d, want 900", allowed, limit)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatal(err)
