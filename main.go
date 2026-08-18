@@ -1271,9 +1271,12 @@ const (
 	mcpServerVersion        = "2.0.0"
 	mcpSessionTTL           = 30 * time.Minute
 	mcpSessionSweepInterval = 60 * time.Second
-	mcpMaxSessions          = 1000
-	mcpMaxSessionsPerUser   = 16
 	toolsCacheTTL           = 5 * time.Minute
+)
+
+var (
+	mcpMaxSessions        = max(1, getEnvInt("MCP_MAX_SESSIONS", 1000))
+	mcpMaxSessionsPerUser = max(1, getEnvInt("MCP_MAX_SESSIONS_PER_USER", 16))
 )
 
 type chatMCPToolPolicy struct {
