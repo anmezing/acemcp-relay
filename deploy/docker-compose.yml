@@ -29,6 +29,7 @@ services:
       QUERY_REWRITE_TIMEOUT_MS: ${QUERY_REWRITE_TIMEOUT_MS:-4000}
       LCE_HTTP_MAX_CONCURRENT_REQUESTS: ${LCE_HTTP_MAX_CONCURRENT_REQUESTS:-16}
       LCE_HTTP_MAX_SESSIONS: ${LCE_HTTP_MAX_SESSIONS:-16}
+      LCE_CLOUD_DB_POOL_MAX: ${LCE_CLOUD_DB_POOL_MAX:-16}
     healthcheck:
       test: ["CMD-SHELL", "node -e \"fetch('http://localhost:3000/mcp/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
       interval: 30s
