@@ -1272,7 +1272,7 @@ const (
 	mcpSessionTTL           = 30 * time.Minute
 	mcpSessionSweepInterval = 60 * time.Second
 	mcpMaxSessions          = 1000
-	mcpMaxSessionsPerUser   = 16
+	mcpMaxSessionsPerUser   = 1000 // temporary load-test override; restore to 16 after test
 	toolsCacheTTL           = 5 * time.Minute
 )
 
