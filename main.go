@@ -1167,6 +1167,41 @@ func completeRequestLogAsync(entry RequestLogEntry) {
 	}()
 }
 
+const staleRequestLogAfter = 15 * time.Minute
+
+// Requests are initially inserted as pending so the log is visible while an
+// MCP call is running. A process restart or a database outage can otherwise
+// leave that marker forever; only records older than the stale threshold are
+// reconciled, so active long-running requests are not touched.
+func reconcileStaleRequestLogs() {
+	result, err := db.Exec(`
+		UPDATE request_logs
+		SET status = $1, status_code = $2, response_duration_ms = EXTRACT(EPOCH FROM (NOW() - request_timestamp) * 1000)::bigint, updated_at = NOW()
+		WHERE status = $3 AND request_timestamp < NOW() - INTERVAL '15 minutes'
+	`, StatusCompleted, 499, StatusPending)
+	if err != nil {
+		log.Printf("[REQUEST_LOG] Failed to reconcile stale pending logs: %v", err)
+		return
+	}
+	if count, _ := result.RowsAffected(); count > 0 {
+		log.Printf("[REQUEST_LOG] Reconciled %d stale pending logs", count)
+	}
+}
+
+func startRequestLogReconciler(ctx context.Context) {
+	reconcileStaleRequestLogs()
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			reconcileStaleRequestLogs()
+		}
+	}
+}
+
 func saveErrorDetailsAsync(logID string, source string, errorMsg string, insertDone <-chan struct{}) {
 	if logID == "" || errorMsg == "" {
 		return
@@ -2490,6 +2525,7 @@ func main() {
 
 	go startMCPSessionSweeper(ctx)
 	go startIndexJobSweeper(ctx)
+	go startRequestLogReconciler(ctx)
 
 	go func() {
 		pprofMux := http.NewServeMux()
