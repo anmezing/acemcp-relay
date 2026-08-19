@@ -107,42 +107,32 @@ func tryAcquireIndexOperation(
 	}
 	defer tx.Rollback()
 
-	if _, err := tx.ExecContext(ctx,
-		`DELETE FROM index_operation_leases WHERE user_id = $1 AND lease_expires_at <= NOW()`,
-		userID,
-	); err != nil {
-		return false, err
-	}
-
-	var conflict bool
+	var acquired bool
 	if err := tx.QueryRowContext(ctx, `
-		SELECT EXISTS(
-			SELECT 1
-			FROM index_operation_leases
-			WHERE user_id = $1
-			  AND (mode = $2 OR $3 = $2 OR resource = $4)
+		WITH expired AS (
+			DELETE FROM index_operation_leases
+			WHERE user_id = $2 AND lease_expires_at <= NOW()
+		), inserted AS (
+			INSERT INTO index_operation_leases (
+				lease_token, user_id, resource, mode, kind, lease_expires_at
+			)
+			SELECT $1, $2, $3, $4, $5, NOW() + ($6 * INTERVAL '1 millisecond')
+			WHERE NOT EXISTS (
+				SELECT 1 FROM index_operation_leases
+				WHERE user_id = $2
+				  AND lease_expires_at > NOW()
+				  AND (mode = $7 OR $4 = $7 OR resource = $3)
+			)
+			RETURNING 1
 		)
-	`, userID, indexOperationExclusive, mode, resource).Scan(&conflict); err != nil {
-		return false, err
-	}
-	if conflict {
-		if err := tx.Commit(); err != nil {
-			return false, err
-		}
-		return false, nil
-	}
-
-	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO index_operation_leases (
-			lease_token, user_id, resource, mode, kind, lease_expires_at
-		) VALUES ($1, $2, $3, $4, $5, NOW() + ($6 * INTERVAL '1 millisecond'))
-	`, token, userID, resource, mode, kind, indexOperationLeaseDuration.Milliseconds()); err != nil {
+		SELECT EXISTS(SELECT 1 FROM inserted)
+	`, token, userID, resource, mode, kind, indexOperationLeaseDuration.Milliseconds(), indexOperationExclusive).Scan(&acquired); err != nil {
 		return false, err
 	}
 	if err := tx.Commit(); err != nil {
 		return false, err
 	}
-	return true, nil
+	return acquired, nil
 }
 
 func (l *indexOperationLease) renew() {

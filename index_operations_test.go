@@ -10,7 +10,6 @@ import (
 func expectIndexOperationLock(mock sqlmock.Sqlmock, userID string) {
 	mock.ExpectBegin()
 	mock.ExpectExec("pg_advisory_xact_lock").WithArgs(userID).WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectExec("DELETE FROM index_operation_leases").WithArgs(userID).WillReturnResult(sqlmock.NewResult(0, 0))
 }
 
 func TestTryAcquireIndexOperationInsertsAvailableSharedLease(t *testing.T) {
@@ -24,12 +23,9 @@ func TestTryAcquireIndexOperationInsertsAvailableSharedLease(t *testing.T) {
 	defer func() { db = previousDB }()
 
 	expectIndexOperationLock(mock, "user-1")
-	mock.ExpectQuery("SELECT EXISTS").
-		WithArgs("user-1", indexOperationExclusive, indexOperationShared, "job:job-1").
-		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
-	mock.ExpectExec("INSERT INTO index_operation_leases").
-		WithArgs(sqlmock.AnyArg(), "user-1", "job:job-1", indexOperationShared, "upload-batch", indexOperationLeaseDuration.Milliseconds()).
-		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery("WITH expired AS").
+		WithArgs("lease-1", "user-1", "job:job-1", indexOperationShared, "upload-batch", indexOperationLeaseDuration.Milliseconds(), indexOperationExclusive).
+		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
 	mock.ExpectCommit()
 
 	acquired, err := tryAcquireIndexOperation(
@@ -57,9 +53,9 @@ func TestTryAcquireIndexOperationDoesNotInsertOnConflict(t *testing.T) {
 	defer func() { db = previousDB }()
 
 	expectIndexOperationLock(mock, "user-1")
-	mock.ExpectQuery("SELECT EXISTS").
-		WithArgs("user-1", indexOperationExclusive, indexOperationShared, "job:job-1").
-		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
+	mock.ExpectQuery("WITH expired AS").
+		WithArgs("lease-2", "user-1", "job:job-1", indexOperationShared, "upload-batch", indexOperationLeaseDuration.Milliseconds(), indexOperationExclusive).
+		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
 	mock.ExpectCommit()
 
 	acquired, err := tryAcquireIndexOperation(
@@ -87,9 +83,9 @@ func TestTryAcquireExclusiveIndexOperationConflictsWithAnyActiveLease(t *testing
 	defer func() { db = previousDB }()
 
 	expectIndexOperationLock(mock, "user-1")
-	mock.ExpectQuery("SELECT EXISTS").
-		WithArgs("user-1", indexOperationExclusive, indexOperationExclusive, "*").
-		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
+	mock.ExpectQuery("WITH expired AS").
+		WithArgs("lease-3", "user-1", "*", indexOperationExclusive, "clear-index", indexOperationLeaseDuration.Milliseconds(), indexOperationExclusive).
+		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
 	mock.ExpectCommit()
 
 	acquired, err := tryAcquireIndexOperation(
