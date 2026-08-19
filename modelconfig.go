@@ -11,8 +11,6 @@ import (
 	"fmt"
 	"log"
 	"time"
-
-	"github.com/google/uuid"
 )
 
 // ── 按用户 Rerank 配置────────────────────────────────────────────────────
@@ -143,21 +141,4 @@ func loadRerankModelConfigArg(ctx context.Context, userID string) (map[string]in
 		return nil, nil
 	}
 	return map[string]interface{}{"rerank": rerank}, nil
-}
-
-// acquireModelConfigOperation keeps retrieval serialized with index publish or
-// clear while loading the optional request-local reranker. The lease is scoped
-// to the tenant (whose index data the retrieval reads); the rerank config stays
-// per real user (BYO key belongs to the caller, not the org).
-func acquireModelConfigOperation(ctx context.Context, tenantID, userID, kind string) (*indexOperationLease, map[string]interface{}, error) {
-	lease, err := acquireSharedIndexOperation(ctx, tenantID, "model-call:"+uuid.NewString(), kind)
-	if err != nil {
-		return nil, nil, err
-	}
-	cfg, err := loadRerankModelConfigArg(lease.Context(), userID)
-	if err != nil {
-		lease.Release()
-		return nil, nil, err
-	}
-	return lease, cfg, nil
 }

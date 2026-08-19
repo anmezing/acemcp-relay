@@ -1884,32 +1884,24 @@ func handleMCPToolsCall(c *gin.Context, id json.RawMessage, params json.RawMessa
 	}
 	// 传给 LCE 的租户永远是 tenant_id := org_id ?? user_id（强制覆写，客户端不可指定）。
 	p.Arguments["tenant_id"] = tenantID
-	var operationLease *indexOperationLease
 	var cfg map[string]interface{}
 	var err error
 	if chatMCPToolUsesRerankConfig(p.Name) {
-		// 操作租约按租户（与索引 publish/clear 串行的是租户数据）；
-		// BYO rerank 配置仍按真实用户（用的是调用者自己的 key）。
-		operationLease, cfg, err = acquireModelConfigOperation(c.Request.Context(), tenantID, userID, "chat-retrieval")
-	} else {
-		operationLease, err = acquireSharedIndexOperation(
-			c.Request.Context(),
-			tenantID,
-			"chat-tool:"+uuid.NewString(),
-			"chat-"+p.Name,
-		)
+		// 公开工具是只读查询。LCE 的查询和索引发布/清理都在 PostgreSQL
+		// 事务中完成，MVCC 已保证查询只会看到提交前或提交后的完整版本；这里
+		// 不再为每次查询写跨进程租约。BYO rerank 配置仍按真实用户加载。
+		cfg, err = loadRerankModelConfigArg(c.Request.Context(), userID)
 	}
 	if err != nil {
 		c.JSON(http.StatusOK, rpcError(id, -32000, err.Error()))
 		completeRequestLogAsync(getRequestLogEntry(c, http.StatusOK))
 		return
 	}
-	defer operationLease.Release()
 	if cfg != nil {
 		p.Arguments["model_config"] = cfg
 	}
 
-	result, err := lce.callTool(operationLease.Context(), p.Name, p.Arguments)
+	result, err := lce.callTool(c.Request.Context(), p.Name, p.Arguments)
 	if err != nil {
 		if errors.Is(c.Request.Context().Err(), context.Canceled) {
 			completeRequestLogAsync(getRequestLogEntry(c, 499))
