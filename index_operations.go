@@ -116,12 +116,12 @@ func tryAcquireIndexOperation(
 			INSERT INTO index_operation_leases (
 				lease_token, user_id, resource, mode, kind, lease_expires_at
 			)
-			SELECT $1, $2, $3, $4, $5, NOW() + ($6 * INTERVAL '1 millisecond')
+			SELECT $1, $2, $3, $4::text, $5, NOW() + ($6 * INTERVAL '1 millisecond')
 			WHERE NOT EXISTS (
 				SELECT 1 FROM index_operation_leases
 				WHERE user_id = $2
 				  AND lease_expires_at > NOW()
-				  AND (mode = $7 OR $4 = $7 OR resource = $3)
+				  AND (mode = $7::text OR $4::text = $7::text OR resource = $3)
 			)
 			RETURNING 1
 		)
