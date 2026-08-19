@@ -28,6 +28,9 @@ update_repo "$LCE_DIR" "${DEPLOY_REF_LCE:-}" "${DEPLOY_BRANCH_LCE:-feat/multi-te
 update_repo "$RELAY_DIR" "${DEPLOY_REF_RELAY:-}" "${DEPLOY_BRANCH_RELAY:-main}"
 update_repo "$FRONTEND_DIR" "${DEPLOY_REF_FRONTEND:-}" "${DEPLOY_BRANCH_FRONTEND:-main}"
 
+echo "=== Applying host capacity settings ==="
+"$SCRIPT_DIR/tune-host.sh"
+
 # cloud 客户端不在服务器上构建：它经 lce 仓库的 publish-cloud workflow
 # 发布到 npm（@anmezing/lce-cloud），用户侧 npx 直接获取。
 
