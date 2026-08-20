@@ -63,7 +63,7 @@ func tokenHashes(token string) (string, string) {
 }
 
 func TestAuthenticateRequestMD5KeyStillAuthenticates(t *testing.T) {
-	const token = "ace_legacy_md5"
+	const token = "lce_legacy_md5"
 	context, mock, cleanup := newAuthTestContext(t, token)
 	defer cleanup()
 
@@ -80,7 +80,7 @@ func TestAuthenticateRequestMD5KeyStillAuthenticates(t *testing.T) {
 }
 
 func TestAuthenticateRequestSHA256KeyAuthenticates(t *testing.T) {
-	const token = "ace_new_sha256"
+	const token = "lce_new_sha256"
 	context, mock, cleanup := newAuthTestContext(t, token)
 	defer cleanup()
 
@@ -98,7 +98,7 @@ func TestAuthenticateRequestSHA256KeyAuthenticates(t *testing.T) {
 }
 
 func TestAuthenticateRequestCacheHitSkipsDatabase(t *testing.T) {
-	const token = "ace_cached"
+	const token = "lce_cached"
 	context, mock, cleanup := newAuthTestContext(t, token)
 	defer cleanup()
 
@@ -118,7 +118,7 @@ func TestAuthenticateRequestCacheHitSkipsDatabase(t *testing.T) {
 }
 
 func TestAuthenticateRequestTTLExpiryRequeriesAndRevokesRotatedKey(t *testing.T) {
-	const token = "ace_rotated"
+	const token = "lce_rotated"
 	context, mock, cleanup := newAuthTestContext(t, token)
 	defer cleanup()
 
@@ -145,7 +145,7 @@ func TestAuthenticateRequestTTLExpiryRequeriesAndRevokesRotatedKey(t *testing.T)
 }
 
 func TestAuthenticateRequestNegativeCacheSuppressesRepeatedMisses(t *testing.T) {
-	const token = "ace_unknown"
+	const token = "lce_unknown"
 	context, mock, cleanup := newAuthTestContext(t, token)
 	defer cleanup()
 
@@ -176,7 +176,7 @@ func TestAuthenticateRequestNegativeCacheSuppressesRepeatedMisses(t *testing.T) 
 }
 
 func TestAuthenticateRequestDatabaseErrorFailsClosedWithoutCaching(t *testing.T) {
-	const token = "ace_db_down"
+	const token = "lce_db_down"
 	context, mock, cleanup := newAuthTestContext(t, token)
 	defer cleanup()
 
@@ -274,7 +274,7 @@ func TestVersionGateMetrics(t *testing.T) {
 // ── tier 读取与缓存 ────────────────────────────────────────────────────────
 
 func TestAuthenticateRequestReadsTierAndCachesIt(t *testing.T) {
-	const token = "ace_pro_key"
+	const token = "lce_pro_key"
 	context, mock, cleanup := newAuthTestContext(t, token)
 	defer cleanup()
 
@@ -296,7 +296,7 @@ func TestAuthenticateRequestReadsTierAndCachesIt(t *testing.T) {
 }
 
 func TestAuthenticateRequestUnknownTierFallsBackToFree(t *testing.T) {
-	const token = "ace_weird_tier"
+	const token = "lce_weird_tier"
 	context, mock, cleanup := newAuthTestContext(t, token)
 	defer cleanup()
 
@@ -315,7 +315,7 @@ func TestAuthenticateRequestUnknownTierFallsBackToFree(t *testing.T) {
 // ── 组织身份读取与缓存 ─────────────────────────────────────────────────────
 
 func TestAuthenticateRequestReadsOrgFieldsAndCachesThem(t *testing.T) {
-	const token = "ace_org_member_key"
+	const token = "lce_org_member_key"
 	context, mock, cleanup := newAuthTestContext(t, token)
 	defer cleanup()
 
@@ -343,7 +343,7 @@ func TestAuthenticateRequestReadsOrgFieldsAndCachesThem(t *testing.T) {
 }
 
 func TestAuthenticateRequestRejectsOrgKeyWithoutCurrentMembership(t *testing.T) {
-	const token = "ace_removed_org_member"
+	const token = "lce_removed_org_member"
 	context, mock, cleanup := newAuthTestContext(t, token)
 	defer cleanup()
 
