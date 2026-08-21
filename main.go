@@ -1313,6 +1313,17 @@ var chatMCPToolPolicies = map[string]chatMCPToolPolicy{
 		),
 		required: stringSet("root_id", "symbol"),
 	},
+	"codebase_enhance_prompt": {
+		description: "Enhance a coding request using verified context from the authenticated tenant's server-side LCE index. The original prompt remains authoritative. The service supplies tenant identity; root_id may scope the request to one indexed branch view.",
+		arguments: stringSet(
+			"prompt",
+			"technical_terms",
+			"root_id",
+			"output_language",
+			"response_format",
+		),
+		required: stringSet("prompt"),
+	},
 }
 
 func stringSet(values ...string) map[string]struct{} {
