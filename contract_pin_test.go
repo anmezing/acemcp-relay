@@ -40,11 +40,18 @@ type cloudProtocolContract struct {
 	} `json:"responseEnvelope"`
 	ManifestEntryFields  []string `json:"manifestEntryFields"`
 	ClientRequestHeaders []string `json:"clientRequestHeaders"`
+	PromptEnhancement    struct {
+		RequiredArguments       []string `json:"requiredArguments"`
+		OptionalArguments       []string `json:"optionalArguments"`
+		RelayInjectedArguments  []string `json:"relayInjectedArguments"`
+		VerifiedReferenceFields []string `json:"verifiedReferenceFields"`
+	} `json:"promptEnhancement"`
 }
 
 func loadCloudProtocolContract(t *testing.T) cloudProtocolContract {
 	t.Helper()
 	candidates := []string{
+		filepath.Join("..", "lce-cloud-retrieval-parity", "docs", "contracts", "cloud-protocol.json"),
 		filepath.Join("..", "lce-clean-20260704-213701", "docs", "contracts", "cloud-protocol.json"),
 		filepath.Join("..", "lce", "docs", "contracts", "cloud-protocol.json"),
 	}
@@ -239,5 +246,33 @@ func TestContractPinPublicToolSurfaceIsContractSubset(t *testing.T) {
 			t.Errorf("relay exposes tool %q not present in contract cloudToolSurface %v",
 				tool, contract.CloudToolSurface)
 		}
+	}
+}
+
+func TestContractPinPromptEnhancementPolicy(t *testing.T) {
+	contract := loadCloudProtocolContract(t)
+	policy, ok := chatMCPToolPolicies["codebase_enhance_prompt"]
+	if !ok {
+		t.Fatal("relay prompt enhancement policy is missing")
+	}
+	wantArguments := append(
+		append([]string(nil), contract.PromptEnhancement.RequiredArguments...),
+		contract.PromptEnhancement.OptionalArguments...,
+	)
+	if diff := diffStringSets("prompt enhancement arguments", sortedStringSetKeys(policy.arguments), wantArguments); diff != "" {
+		t.Error(diff)
+	}
+	if diff := diffStringSets("prompt enhancement required arguments", sortedStringSetKeys(policy.required), contract.PromptEnhancement.RequiredArguments); diff != "" {
+		t.Error(diff)
+	}
+	if !reflect.DeepEqual(contract.PromptEnhancement.RelayInjectedArguments, []string{"tenant_id"}) {
+		t.Errorf("unexpected relay-injected prompt fields: %v", contract.PromptEnhancement.RelayInjectedArguments)
+	}
+	if diff := diffStringSets(
+		"prompt enhancement verified reference fields",
+		contract.PromptEnhancement.VerifiedReferenceFields,
+		[]string{"rootId", "path", "startLine", "endLine", "breadcrumb"},
+	); diff != "" {
+		t.Error(diff)
 	}
 }

@@ -173,6 +173,7 @@ func TestFilterChatMCPToolsHidesIndexManagementTools(t *testing.T) {
 		{"name":"codebase_git_context","description":"git"},
 		{"name":"codebase_review_changes","description":"review"},
 		{"name":"codebase_symbol_graph","description":"graph","inputSchema":{"type":"object","properties":{"root_id":{"type":"string"},"symbol":{"type":"string"}}}},
+		{"name":"codebase_enhance_prompt","description":"enhance","inputSchema":{"type":"object","properties":{"prompt":{"type":"string"},"technical_terms":{"type":"array"},"root_id":{"type":"string"},"output_language":{"type":"string"},"response_format":{"type":"string"},"tenant_id":{"type":"string"}},"required":["tenant_id","prompt"]}},
 		{"name":"codebase_tenant_stats","description":"stats","inputSchema":{"type":"object","properties":{"response_format":{"type":"string"}}}},
 		{"name":"future_admin_tool","description":"must stay private"}
 	]`)
@@ -190,7 +191,7 @@ func TestFilterChatMCPToolsHidesIndexManagementTools(t *testing.T) {
 	for i, tool := range tools {
 		got[i] = tool.Name
 	}
-	if !reflect.DeepEqual(got, []string{"codebase-retrieval", "codebase_symbol_graph"}) {
+	if !reflect.DeepEqual(got, []string{"codebase-retrieval", "codebase_symbol_graph", "codebase_enhance_prompt"}) {
 		t.Fatalf("unexpected chat MCP tools: %#v", got)
 	}
 }
@@ -214,7 +215,7 @@ func TestFilterChatMCPToolsRequiresExactRemoteContract(t *testing.T) {
 }
 
 func TestChatMCPToolPolicyKeepsTenantToolsAndRejectsRawManagement(t *testing.T) {
-	for _, allowed := range []string{"codebase-retrieval", "codebase_symbol_graph", codebaseIndexToolName} {
+	for _, allowed := range []string{"codebase-retrieval", "codebase_symbol_graph", "codebase_enhance_prompt", codebaseIndexToolName} {
 		if !isChatMCPToolAllowed(allowed) {
 			t.Fatalf("%q must remain available through chat MCP", allowed)
 		}
@@ -232,10 +233,43 @@ func TestChatMCPToolPolicyKeepsTenantToolsAndRejectsRawManagement(t *testing.T) 
 	}
 }
 
-func TestAppendCodebaseIndexToolExposesExactlyFourTools(t *testing.T) {
+func TestPromptEnhancementPolicyHidesTenantAndRejectsCallerOverride(t *testing.T) {
 	raw := json.RawMessage(`[
 		{"name":"codebase-retrieval","inputSchema":{"type":"object","properties":{"information_request":{"type":"string"}}}},
-		{"name":"codebase_symbol_graph","inputSchema":{"type":"object","properties":{"root_id":{"type":"string"},"symbol":{"type":"string"}}}}
+		{"name":"codebase_symbol_graph","inputSchema":{"type":"object","properties":{"root_id":{"type":"string"},"symbol":{"type":"string"}}}},
+		{"name":"codebase_enhance_prompt","inputSchema":{"type":"object","properties":{"tenant_id":{"type":"string"},"prompt":{"type":"string"},"root_id":{"type":"string"}},"required":["tenant_id","prompt"]}}
+	]`)
+	filtered, err := filterChatMCPTools(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var tools []map[string]interface{}
+	if err := json.Unmarshal(filtered, &tools); err != nil {
+		t.Fatal(err)
+	}
+	prompt := tools[2]
+	schema := prompt["inputSchema"].(map[string]interface{})
+	properties := schema["properties"].(map[string]interface{})
+	if _, exposed := properties["tenant_id"]; exposed {
+		t.Fatal("tenant_id must not be caller-visible")
+	}
+	required := schema["required"].([]interface{})
+	if !reflect.DeepEqual(required, []interface{}{"prompt"}) {
+		t.Fatalf("unexpected prompt enhancer required fields: %#v", required)
+	}
+	if err := validateChatMCPToolArgs("codebase_enhance_prompt", map[string]interface{}{"prompt": "fix auth"}); err != nil {
+		t.Fatalf("valid prompt enhancement args rejected: %v", err)
+	}
+	if err := validateChatMCPToolArgs("codebase_enhance_prompt", map[string]interface{}{"prompt": "fix auth", "tenant_id": "other"}); err == nil {
+		t.Fatal("caller-controlled tenant_id must be rejected")
+	}
+}
+
+func TestAppendCodebaseIndexToolExposesExpectedTools(t *testing.T) {
+	raw := json.RawMessage(`[
+		{"name":"codebase-retrieval","inputSchema":{"type":"object","properties":{"information_request":{"type":"string"}}}},
+		{"name":"codebase_symbol_graph","inputSchema":{"type":"object","properties":{"root_id":{"type":"string"},"symbol":{"type":"string"}}}},
+		{"name":"codebase_enhance_prompt","inputSchema":{"type":"object","properties":{"prompt":{"type":"string"}}}}
 	]`)
 	filtered, err := filterChatMCPTools(raw)
 	if err != nil {
@@ -249,13 +283,13 @@ func TestAppendCodebaseIndexToolExposesExactlyFourTools(t *testing.T) {
 	if err := json.Unmarshal(combined, &tools); err != nil {
 		t.Fatal(err)
 	}
-	if len(tools) != 3 {
-		t.Fatalf("remote MCP must expose exactly three tools, got %d", len(tools))
+	if len(tools) != 4 {
+		t.Fatalf("remote MCP must expose exactly four tools, got %d", len(tools))
 	}
-	if tools[2]["name"] != codebaseIndexToolName {
-		t.Fatalf("third tool must be %s, got %#v", codebaseIndexToolName, tools[2]["name"])
+	if tools[3]["name"] != codebaseIndexToolName {
+		t.Fatalf("fourth tool must be %s, got %#v", codebaseIndexToolName, tools[3]["name"])
 	}
-	schema := tools[2]["inputSchema"].(map[string]interface{})
+	schema := tools[3]["inputSchema"].(map[string]interface{})
 	operations := schema["oneOf"].([]interface{})
 	if len(operations) != 5 {
 		t.Fatalf("index tool must advertise five lifecycle operations, got %d", len(operations))
