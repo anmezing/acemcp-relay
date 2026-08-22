@@ -23,6 +23,24 @@ update_repo() {
   fi
 }
 
+prune_docker_resources() {
+  if [ "${DEPLOY_PRUNE_DOCKER_RESOURCES:-true}" != "true" ]; then
+    echo "=== Docker resource cleanup disabled ==="
+    return
+  fi
+
+  local keep_storage="${DEPLOY_BUILD_CACHE_KEEP_STORAGE:-5GB}"
+  local unused_image_age="${DEPLOY_UNUSED_IMAGE_MAX_AGE:-168h}"
+
+  echo "=== Pruning unused Docker build cache (keep storage: $keep_storage) ==="
+  docker builder prune --force --keep-storage "$keep_storage" || \
+    echo "WARNING: Docker build cache cleanup failed; deployment remains active" >&2
+
+  echo "=== Pruning unused Docker images older than $unused_image_age ==="
+  docker image prune --all --force --filter "until=$unused_image_age" || \
+    echo "WARNING: Docker image cleanup failed; deployment remains active" >&2
+}
+
 echo "=== Updating code ==="
 update_repo "$LCE_DIR" "${DEPLOY_REF_LCE:-}" "${DEPLOY_BRANCH_LCE:-feat/multi-tenant-relay}"
 update_repo "$RELAY_DIR" "${DEPLOY_REF_RELAY:-}" "${DEPLOY_BRANCH_RELAY:-main}"
@@ -37,6 +55,8 @@ echo "=== Applying host capacity settings ==="
 echo "=== Rebuilding Docker containers ==="
 cd "$SCRIPT_DIR"
 docker compose up -d --build --no-deps lce relay frontend
+
+prune_docker_resources
 
 echo "=== Done ==="
 docker compose ps
