@@ -494,32 +494,48 @@ func quotaResetAt(now time.Time) time.Time {
 	return time.Date(year, month, day+1, 0, 0, 0, 0, quotaLocation())
 }
 
-// chargeIndexBytes 累加当日已索引字节并判断是否超限，返回 (是否放行, 已用, 上限)。
-// 与请求数配额一致：Redis 故障时放行，避免基础设施抖动演变成全站不可索引。
-// 放行的字节同时累加进 relay_index_bytes_total（全局 counter，含 fail-open 路径：
-// 指标口径是"实际接收的索引字节"，不是"Redis 记账成功的字节"）。
+// indexQuotaDecision 区分正常拒绝与记账基础设施故障。调用方必须把后者作为
+// 临时服务故障处理，不能把未记账的昂贵索引请求放给上游。
+type indexQuotaDecision struct {
+	Allowed     bool
+	Unavailable bool
+	Used        int64
+	Limit       int64
+}
+
+// chargeIndexBytes 累加当日已索引字节并判断是否超限。
+// 只有 Redis 原子记账成功的字节才累加 relay_index_bytes_total；Redis 故障时
+// fail closed，避免日索引成本上限随基础设施故障一起失效。
 // 个人租户优先用 user_quotas 的字节覆盖；组织租户使用已解析的 owner 最终权益。
 // 组织成员个人上限仍只约束请求数。
-func chargeIndexBytes(tenantID, orgID, tier string, bytes int64) (bool, int64, int64) {
-	allowed, used, limit := chargeIndexBytesQuota(tenantID, orgID, tier, bytes)
-	if allowed && bytes > 0 {
+func chargeIndexBytes(tenantID, orgID, tier string, bytes int64) indexQuotaDecision {
+	decision := chargeIndexBytesQuota(tenantID, orgID, tier, bytes)
+	if decision.Allowed && bytes > 0 {
 		metricIndexBytes.Add(float64(bytes))
 	}
-	if !allowed {
+	if decision.Unavailable {
+		logEvent("index_quota_unavailable",
+			"user_id", tenantID,
+			"tenant", tenantID,
+			"org", orgID,
+			"tier", normalizeTier(tier),
+			"bytes", strconv.FormatInt(bytes, 10),
+		)
+	} else if !decision.Allowed {
 		logEvent("index_quota_rejected",
 			"user_id", tenantID,
 			"tenant", tenantID,
 			"org", orgID,
 			"tier", normalizeTier(tier),
 			"bytes", strconv.FormatInt(bytes, 10),
-			"used", strconv.FormatInt(used, 10),
-			"limit", strconv.FormatInt(limit, 10),
+			"used", strconv.FormatInt(decision.Used, 10),
+			"limit", strconv.FormatInt(decision.Limit, 10),
 		)
 	}
-	return allowed, used, limit
+	return decision
 }
 
-func chargeIndexBytesQuota(tenantID, orgID, tier string, bytes int64) (bool, int64, int64) {
+func chargeIndexBytesQuota(tenantID, orgID, tier string, bytes int64) indexQuotaDecision {
 	limit := tierIndexBytesLimit(tier)
 	if orgID == "" {
 		limit = getUserIndexBytesLimit(tenantID, tier)
@@ -531,7 +547,7 @@ func chargeIndexBytesQuota(tenantID, orgID, tier string, bytes int64) (bool, int
 		}
 	}
 	if limit <= 0 || bytes <= 0 {
-		return true, 0, limit
+		return indexQuotaDecision{Allowed: true, Limit: limit}
 	}
 
 	ctx := context.Background()
@@ -552,27 +568,28 @@ func chargeIndexBytesQuota(tenantID, orgID, tier string, bytes int64) (bool, int
 	value, err := redisClient.Eval(ctx, chargeScript, []string{key}, bytes, limit, int64((48*time.Hour)/time.Second)).Result()
 	if err != nil {
 		log.Printf("[QUOTA] index byte accounting failed (tenant=%s): %v", tenantID, err)
-		return true, 0, limit
+		return indexQuotaDecision{Unavailable: true, Limit: limit}
 	}
 	parts, ok := value.([]interface{})
 	if !ok || len(parts) != 2 {
 		log.Printf("[QUOTA] invalid index byte accounting response (tenant=%s): %#v", tenantID, value)
-		return true, 0, limit
+		return indexQuotaDecision{Unavailable: true, Limit: limit}
 	}
 	allowed, allowedOK := parts[0].(int64)
 	used, usedOK := parts[1].(int64)
 	if !allowedOK || !usedOK {
 		log.Printf("[QUOTA] invalid index byte accounting values (tenant=%s): %#v", tenantID, parts)
-		return true, 0, limit
+		return indexQuotaDecision{Unavailable: true, Limit: limit}
 	}
-	return allowed == 1, used, limit
+	return indexQuotaDecision{Allowed: allowed == 1, Used: used, Limit: limit}
 }
 
 type requestQuotaDecision struct {
-	Allowed bool
-	Used    int64
-	Limit   int
-	Scope   string
+	Allowed     bool
+	Unavailable bool
+	Used        int64
+	Limit       int
+	Scope       string
 }
 
 const reserveRequestQuotaScript = `
@@ -629,12 +646,12 @@ func reserveRequestQuota(
 	).Result()
 	if err != nil {
 		log.Printf("[QUOTA] request accounting failed: %v", err)
-		return requestQuotaDecision{Allowed: true}
+		return requestQuotaDecision{Unavailable: true}
 	}
 	parts, ok := value.([]interface{})
 	if !ok || len(parts) != 4 {
 		log.Printf("[QUOTA] invalid request accounting response: %#v", value)
-		return requestQuotaDecision{Allowed: true}
+		return requestQuotaDecision{Unavailable: true}
 	}
 	allowed, allowedOK := parts[0].(int64)
 	used, usedOK := parts[1].(int64)
@@ -642,7 +659,7 @@ func reserveRequestQuota(
 	scopeID, scopeOK := parts[3].(int64)
 	if !allowedOK || !usedOK || !limitOK || !scopeOK {
 		log.Printf("[QUOTA] invalid request accounting values: %#v", parts)
-		return requestQuotaDecision{Allowed: true}
+		return requestQuotaDecision{Unavailable: true}
 	}
 	scope := "personal"
 	if scopeID == 1 && poolKey != memberKey {
@@ -660,7 +677,7 @@ func reserveRequestQuota(
 
 // checkRequestQuotaDetailed 原子预占当日请求额度。达到上限后不会继续增加计数；
 // 组织成员上限与组织共享池在同一 Lua 脚本中检查和扣减，避免组织池拒绝后仍消耗
-// 成员额度。Redis 故障时放行。
+// 成员额度。Redis 故障时返回 Unavailable，由 HTTP 边界 fail closed。
 func checkRequestQuotaDetailed(userID, orgID, tier string) requestQuotaDecision {
 	ctx := context.Background()
 	day := time.Now().In(quotaLocation()).Format("20060102")

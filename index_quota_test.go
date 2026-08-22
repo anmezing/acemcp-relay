@@ -1,14 +1,20 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/alicebob/miniredis/v2"
+	"github.com/gin-gonic/gin"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -158,13 +164,13 @@ func TestChargeIndexBytesRejectsWithoutIncreasingUsage(t *testing.T) {
 	server := withTestIndexQuota(t, 100)
 	userID := "quota-user"
 
-	allowed, used, _ := chargeIndexBytes(userID, "", tierFree, 60)
-	if !allowed || used != 60 {
-		t.Fatalf("first charge = allowed %v, used %d; want true, 60", allowed, used)
+	decision := chargeIndexBytes(userID, "", tierFree, 60)
+	if !decision.Allowed || decision.Used != 60 {
+		t.Fatalf("first charge = allowed %v, used %d; want true, 60", decision.Allowed, decision.Used)
 	}
-	allowed, used, _ = chargeIndexBytes(userID, "", tierFree, 50)
-	if allowed || used != 60 {
-		t.Fatalf("over-limit charge = allowed %v, used %d; want false, unchanged 60", allowed, used)
+	decision = chargeIndexBytes(userID, "", tierFree, 50)
+	if decision.Allowed || decision.Used != 60 {
+		t.Fatalf("over-limit charge = allowed %v, used %d; want false, unchanged 60", decision.Allowed, decision.Used)
 	}
 	stored, err := server.Get(indexBytesKey(userID))
 	if err != nil {
@@ -188,8 +194,8 @@ func TestChargeIndexBytesIsAtomicUnderConcurrency(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			allowed, _, _ := chargeIndexBytes(userID, "", tierFree, 10)
-			if allowed {
+			decision := chargeIndexBytes(userID, "", tierFree, 10)
+			if decision.Allowed {
 				mu.Lock()
 				allowedCount++
 				mu.Unlock()
@@ -264,5 +270,80 @@ func TestRequestQuotaIsAtomicUnderConcurrency(t *testing.T) {
 	day := time.Now().In(quotaLocation()).Format("20060102")
 	if stored, err := server.Get("quota:used:concurrent-request-user:" + day); err != nil || stored != "10" {
 		t.Fatalf("stored usage = %q (%v), want 10", stored, err)
+	}
+}
+
+func TestQuotaAccountingFailsClosedWhenRedisIsUnavailable(t *testing.T) {
+	mock, server := withTierQuotaEnv(t, 2, 0, 100, 0)
+	expectNoQuotaOverride(mock, "redis-down-user")
+	expectNoIndexBytesOverride(mock, "redis-down-user")
+	addr := server.Addr()
+	server.Close()
+	redisClient = redis.NewClient(&redis.Options{
+		Addr: addr, MaxRetries: -1, DialTimeout: 10 * time.Millisecond,
+	})
+
+	request := checkRequestQuotaDetailed("redis-down-user", "", tierFree)
+	if request.Allowed || !request.Unavailable {
+		t.Fatalf("request quota on Redis failure = %+v, want unavailable and denied", request)
+	}
+	index := chargeIndexBytes("redis-down-user", "", tierFree, 10)
+	if index.Allowed || !index.Unavailable || index.Limit != 100 {
+		t.Fatalf("index quota on Redis failure = %+v, want unavailable and denied with limit 100", index)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAuthMiddlewareReturns503WhenQuotaAccountingIsUnavailable(t *testing.T) {
+	mock, server := withTierQuotaEnv(t, 2, 0, 0, 0)
+	const token = "lce_quota_outage_test"
+	const userID = "quota-outage-user"
+	mock.ExpectQuery("SELECT EXISTS").WithArgs(userID).
+		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
+	expectNoQuotaOverride(mock, userID)
+
+	resetAuthCache()
+	t.Cleanup(resetAuthCache)
+	digest := sha256.Sum256([]byte(token))
+	authCachePut(hex.EncodeToString(digest[:]), authCacheEntry{
+		identity:  authIdentity{UserID: userID, Tier: tierFree},
+		ok:        true,
+		expiresAt: time.Now().Add(time.Minute),
+	})
+	addr := server.Addr()
+	server.Close()
+	redisClient = redis.NewClient(&redis.Options{
+		Addr: addr, MaxRetries: -1, DialTimeout: 10 * time.Millisecond,
+	})
+
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.Use(authMiddleware())
+	handlerReached := false
+	router.GET("/mcp", func(c *gin.Context) {
+		handlerReached = true
+		c.Status(http.StatusNoContent)
+	})
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/mcp", nil)
+	request.Header.Set("Authorization", "Bearer "+token)
+	router.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if recorder.Header().Get("Retry-After") != "5" {
+		t.Fatalf("Retry-After = %q, want 5", recorder.Header().Get("Retry-After"))
+	}
+	if !strings.Contains(recorder.Body.String(), `"code":"QUOTA_ACCOUNTING_UNAVAILABLE"`) {
+		t.Fatalf("response lacks stable quota outage code: %s", recorder.Body.String())
+	}
+	if handlerReached {
+		t.Fatal("business handler must not run while quota accounting is unavailable")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
 	}
 }

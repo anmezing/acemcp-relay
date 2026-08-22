@@ -1,0 +1,84 @@
+{
+  "$comment": "三仓库（lce / relay / 前端）共享云协议契约的单一源头。relay 与前端提交本文件的精确快照，独立 CI 直接读取快照且缺失即失败；修改本文件必须三仓同步。",
+  "schemaVersion": "1.1",
+  "cloudToolSurface": [
+    "codebase-retrieval",
+    "codebase_symbol_graph",
+    "codebase_enhance_prompt",
+    "codebase_git_context",
+    "codebase_review_changes"
+  ],
+  "codebaseIndex": {
+    "operations": ["start", "upload", "status", "complete", "fail"],
+    "requiredFields": {
+      "start": ["operation", "root_id", "files"],
+      "upload": ["operation", "job_id", "root_id", "files"],
+      "complete": ["operation", "job_id"],
+      "fail": ["operation", "job_id", "error"]
+    },
+    "optionalFields": {
+      "start": ["client_version", "branch", "revision"]
+    },
+    "limits": {
+      "maxFileBytes": 524288,
+      "estimatedChunkBytes": 4096,
+      "maxEstimatedChunks": 128
+    }
+  },
+  "responseEnvelope": {
+    "schemaVersion": "1.0",
+    "required": ["ok"],
+    "onSuccess": ["payload"],
+    "onError": ["error"],
+    "errorShape": ["message"]
+  },
+  "manifestEntryFields": ["path", "hash", "size", "estimated_chunks"],
+  "clientRequestHeaders": ["Authorization", "X-LCE-Client-Version"],
+  "codebaseRetrieval": {
+    "$comment": "codebase-retrieval 经 relay 的可选透传参数。root_id 把检索限定到单个索引根（缺省=全租户，向后兼容）；客户端默认自动注入当前分支视图的 root_id。",
+    "optionalArguments": ["root_id"]
+  },
+  "promptEnhancement": {
+    "$comment": "Relay removes tenant_id from the public schema and injects the authenticated tenant. The npm client defaults root_id to the current published branch view. Paths and line ranges in results are derived from retrieved chunks, not generation output.",
+    "toolName": "codebase_enhance_prompt",
+    "input": {
+      "requiredFields": ["prompt"],
+      "optionalFields": ["technical_terms", "root_id", "output_language", "response_format"],
+      "relayInjectedFields": ["tenant_id"],
+      "defaults": {
+        "output_language": "auto",
+        "response_format": "text"
+      }
+    },
+    "verifiedReferenceFields": ["rootId", "path", "startLine", "endLine", "breadcrumb"],
+    "jsonEnvelope": {
+      "schemaVersion": "1.0",
+      "requiredFields": ["schemaVersion", "toolName", "ok", "tool", "responseFormat"],
+      "successFields": [
+        "payload.originalPrompt",
+        "payload.enhancedPrompt",
+        "payload.references",
+        "payload.warnings",
+        "payload.retrieval"
+      ],
+      "errorFields": ["error.message", "error.code"],
+      "errorCodes": ["PROMPT_ENHANCER_NOT_CONFIGURED", "INVALID_ARGUMENTS", "TENANT_ACCESS_DENIED"]
+    },
+    "costs": {
+      "readOnly": true,
+      "providerCalls": {
+        "embedding": "required",
+        "rerank": "when configured",
+        "generation": "required"
+      },
+      "writesIndex": false
+    }
+  },
+  "rootViews": {
+    "$comment": "分支视图编码为 root_id = <base_root_id>@<view_branch>。'@' 只允许非首位；分支 token 字符集为 [A-Za-z0-9._-]，清洗会改变原名时追加 8 位哈希后缀以避免碰撞；root_id 总长 ≤ maxRootIdLength（relay maxIndexRootIDLen）。无 '@' 的 root_id 即 default 视图。/mcp/roots 按最后一个 '@' 派生 base_root_id 与 view_branch。",
+    "separator": "@",
+    "defaultView": "default",
+    "maxRootIdLength": 128,
+    "rootsDerivedFields": ["base_root_id", "view_branch"]
+  }
+}

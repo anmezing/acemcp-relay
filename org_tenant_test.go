@@ -259,10 +259,10 @@ func TestChargeIndexBytesOrgUsesOrgQuotaAndSharesTenantPool(t *testing.T) {
 	expectOrgQuotaRow(mock, "org-1", 0, 50)
 
 	// 组织有 org_quotas：字节上限用 50 而不是 tier 默认 1000；计数按租户（org）共享
-	if allowed, _, limit := chargeIndexBytes("org-1", "org-1", "free", 50); !allowed || limit != 50 {
-		t.Fatalf("org byte charge: allowed=%v limit=%d, want 50", allowed, limit)
+	if decision := chargeIndexBytes("org-1", "org-1", "free", 50); !decision.Allowed || decision.Limit != 50 {
+		t.Fatalf("org byte charge: allowed=%v limit=%d, want 50", decision.Allowed, decision.Limit)
 	}
-	if allowed, _, _ := chargeIndexBytes("org-1", "org-1", "free", 1); allowed {
+	if decision := chargeIndexBytes("org-1", "org-1", "free", 1); decision.Allowed {
 		t.Fatal("org byte pool is shared: second charge must be rejected")
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
@@ -274,10 +274,10 @@ func TestChargeIndexBytesOrgWithoutQuotaRowUsesOwnerTierNotCallerTier(t *testing
 	mock, _ := withTierQuotaEnv(t, 0, 0, 100, 0)
 	expectNoOrgQuotaRow(mock, "org-3")
 
-	if allowed, _, limit := chargeIndexBytes("org-3", "org-3", "pro", 100); !allowed || limit != 100 {
-		t.Fatalf("org fallback byte charge: allowed=%v limit=%d, want owner free limit 100", allowed, limit)
+	if decision := chargeIndexBytes("org-3", "org-3", "pro", 100); !decision.Allowed || decision.Limit != 100 {
+		t.Fatalf("org fallback byte charge: allowed=%v limit=%d, want owner free limit 100", decision.Allowed, decision.Limit)
 	}
-	if allowed, _, _ := chargeIndexBytes("org-3", "org-3", "pro", 1); allowed {
+	if decision := chargeIndexBytes("org-3", "org-3", "pro", 1); decision.Allowed {
 		t.Fatal("a pro member must not make a free owner's org byte pool unlimited")
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
@@ -296,8 +296,8 @@ func TestOrgWithoutSubscriptionInheritsOwnerBaseProTier(t *testing.T) {
 	if ok, limit := checkRequestQuota("member-free", "org-owner-pro", "free"); !ok || limit != 9 {
 		t.Fatalf("owner base tier request limit: ok=%v limit=%d, want 9", ok, limit)
 	}
-	if allowed, _, limit := chargeIndexBytes("org-owner-pro", "org-owner-pro", "free", 900); !allowed || limit != 900 {
-		t.Fatalf("owner base tier byte limit: allowed=%v limit=%d, want 900", allowed, limit)
+	if decision := chargeIndexBytes("org-owner-pro", "org-owner-pro", "free", 900); !decision.Allowed || decision.Limit != 900 {
+		t.Fatalf("owner base tier byte limit: allowed=%v limit=%d, want 900", decision.Allowed, decision.Limit)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatal(err)
@@ -317,8 +317,8 @@ func TestOrgWithoutAdminOverrideInheritsOwnerPlan(t *testing.T) {
 	}
 
 	// owner 套餐两个维度已作为一份最终权益缓存，字节请求不再重复查库。
-	if allowed, _, limit := chargeIndexBytes("org-paid", "org-paid", "free", 900); !allowed || limit != 900 {
-		t.Fatalf("organization byte plan: allowed=%v limit=%d, want 900", allowed, limit)
+	if decision := chargeIndexBytes("org-paid", "org-paid", "free", 900); !decision.Allowed || decision.Limit != 900 {
+		t.Fatalf("organization byte plan: allowed=%v limit=%d, want 900", decision.Allowed, decision.Limit)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatal(err)

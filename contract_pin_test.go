@@ -13,16 +13,16 @@ import (
 
 // ── 跨仓库契约钉住 ─────────────────────────────────────────────────────────
 //
-// docs/contracts/cloud-protocol.json（在 LCE 仓库）是三仓库（lce / relay /
-// 前端）共享云协议契约的单一源头。本测试把 relay 侧的契约面钉在这份文件上：
+// contracts/cloud-protocol.json 是随 relay 提交的 LCE 云协议精确快照。
+// 本测试把 relay 侧的契约面钉在这份文件上：
 //   - codebase_index 工具 schema 的 operations 枚举与各 operation 的 required 集合
 //   - 响应信封（codebaseIndexEnvelope）的 schemaVersion 与字段名
 //   - manifest 条目字段（mcpIndexManifestFile 的 json tag）
 //   - 客户端请求头（clientVersionHeader / Authorization）
 //   - 公开工具面是契约 cloudToolSurface 的子集
 //
-// 契约文件是 sibling checkout；不存在时跳过（CI 单独跑 relay 时不阻塞），
-// 存在时任何漂移都必须红。
+// 快照缺失、格式错误或实现漂移都必须让独立 CI 失败；同步快照时还会在
+// 三仓联动验证中比较文件摘要，避免依赖 sibling checkout 和静默 skip。
 
 type cloudProtocolContract struct {
 	SchemaVersion    string   `json:"schemaVersion"`
@@ -30,6 +30,11 @@ type cloudProtocolContract struct {
 	CodebaseIndex    struct {
 		Operations     []string            `json:"operations"`
 		RequiredFields map[string][]string `json:"requiredFields"`
+		Limits         struct {
+			MaxFileBytes        int `json:"maxFileBytes"`
+			EstimatedChunkBytes int `json:"estimatedChunkBytes"`
+			MaxEstimatedChunks  int `json:"maxEstimatedChunks"`
+		} `json:"limits"`
 	} `json:"codebaseIndex"`
 	ResponseEnvelope struct {
 		SchemaVersion string   `json:"schemaVersion"`
@@ -41,35 +46,26 @@ type cloudProtocolContract struct {
 	ManifestEntryFields  []string `json:"manifestEntryFields"`
 	ClientRequestHeaders []string `json:"clientRequestHeaders"`
 	PromptEnhancement    struct {
-		RequiredArguments       []string `json:"requiredArguments"`
-		OptionalArguments       []string `json:"optionalArguments"`
-		RelayInjectedArguments  []string `json:"relayInjectedArguments"`
+		ToolName string `json:"toolName"`
+		Input    struct {
+			RequiredFields      []string `json:"requiredFields"`
+			OptionalFields      []string `json:"optionalFields"`
+			RelayInjectedFields []string `json:"relayInjectedFields"`
+		} `json:"input"`
 		VerifiedReferenceFields []string `json:"verifiedReferenceFields"`
 	} `json:"promptEnhancement"`
 }
 
 func loadCloudProtocolContract(t *testing.T) cloudProtocolContract {
 	t.Helper()
-	candidates := []string{
-		filepath.Join("..", "lce-cloud-retrieval-parity", "docs", "contracts", "cloud-protocol.json"),
-		filepath.Join("..", "lce-clean-20260704-213701", "docs", "contracts", "cloud-protocol.json"),
-		filepath.Join("..", "lce", "docs", "contracts", "cloud-protocol.json"),
-	}
-	var raw []byte
-	var found string
-	for _, candidate := range candidates {
-		data, err := os.ReadFile(candidate)
-		if err == nil {
-			raw, found = data, candidate
-			break
-		}
-	}
-	if found == "" {
-		t.Skipf("cloud-protocol.json not found in sibling checkouts %v; skipping cross-repo contract pin", candidates)
+	contractPath := filepath.Join("contracts", "cloud-protocol.json")
+	raw, err := os.ReadFile(contractPath)
+	if err != nil {
+		t.Fatalf("read required cloud protocol snapshot %s: %v", contractPath, err)
 	}
 	var contract cloudProtocolContract
 	if err := json.Unmarshal(raw, &contract); err != nil {
-		t.Fatalf("parse %s: %v", found, err)
+		t.Fatalf("parse %s: %v", contractPath, err)
 	}
 	return contract
 }
@@ -145,6 +141,18 @@ func TestContractPinCodebaseIndexOperationsAndRequiredFields(t *testing.T) {
 		if msg := diffStringSets(fmt.Sprintf("operation %q required fields", op), gotRequired, wantRequired); msg != "" {
 			t.Error(msg)
 		}
+	}
+}
+
+func TestContractPinIndexEstimationLimits(t *testing.T) {
+	contract := loadCloudProtocolContract(t)
+	limits := contract.CodebaseIndex.Limits
+	if limits.MaxFileBytes != maxIndexFileBytes ||
+		limits.EstimatedChunkBytes != estimatedIndexChunkBytes ||
+		limits.MaxEstimatedChunks != maxIndexEstimatedChunks {
+		t.Fatalf("index limits mismatch: relay=(%d,%d,%d) contract=(%d,%d,%d)",
+			maxIndexFileBytes, estimatedIndexChunkBytes, maxIndexEstimatedChunks,
+			limits.MaxFileBytes, limits.EstimatedChunkBytes, limits.MaxEstimatedChunks)
 	}
 }
 
@@ -256,17 +264,20 @@ func TestContractPinPromptEnhancementPolicy(t *testing.T) {
 		t.Fatal("relay prompt enhancement policy is missing")
 	}
 	wantArguments := append(
-		append([]string(nil), contract.PromptEnhancement.RequiredArguments...),
-		contract.PromptEnhancement.OptionalArguments...,
+		append([]string(nil), contract.PromptEnhancement.Input.RequiredFields...),
+		contract.PromptEnhancement.Input.OptionalFields...,
 	)
 	if diff := diffStringSets("prompt enhancement arguments", sortedStringSetKeys(policy.arguments), wantArguments); diff != "" {
 		t.Error(diff)
 	}
-	if diff := diffStringSets("prompt enhancement required arguments", sortedStringSetKeys(policy.required), contract.PromptEnhancement.RequiredArguments); diff != "" {
+	if diff := diffStringSets("prompt enhancement required arguments", sortedStringSetKeys(policy.required), contract.PromptEnhancement.Input.RequiredFields); diff != "" {
 		t.Error(diff)
 	}
-	if !reflect.DeepEqual(contract.PromptEnhancement.RelayInjectedArguments, []string{"tenant_id"}) {
-		t.Errorf("unexpected relay-injected prompt fields: %v", contract.PromptEnhancement.RelayInjectedArguments)
+	if contract.PromptEnhancement.ToolName != "codebase_enhance_prompt" {
+		t.Errorf("unexpected prompt tool name: %q", contract.PromptEnhancement.ToolName)
+	}
+	if !reflect.DeepEqual(contract.PromptEnhancement.Input.RelayInjectedFields, []string{"tenant_id"}) {
+		t.Errorf("unexpected relay-injected prompt fields: %v", contract.PromptEnhancement.Input.RelayInjectedFields)
 	}
 	if diff := diffStringSets(
 		"prompt enhancement verified reference fields",

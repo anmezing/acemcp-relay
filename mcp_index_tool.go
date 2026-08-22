@@ -17,6 +17,10 @@ import (
 const (
 	codebaseIndexToolName = "codebase_index"
 	maxIndexPathBytes     = 4096
+	// 云客户端按每 4 KiB 估算一个分块；单文件上限为 512 KiB，因此 manifest
+	// 中的 estimated_chunks 最大为 128。两个值由 cloud-protocol.json 钉住。
+	estimatedIndexChunkBytes = 4096
+	maxIndexEstimatedChunks  = (maxIndexFileBytes + estimatedIndexChunkBytes - 1) / estimatedIndexChunkBytes
 
 	// indexEnvelopeSchemaVersion 是跨仓库契约值（docs/contracts/cloud-protocol.json
 	// 的 responseEnvelope.schemaVersion），由 contract_pin_test.go 钉住。
@@ -44,7 +48,7 @@ var (
 )
 
 // checkIndexStartRateLimit 对同一 (tenant, root) 的 start 施加最小间隔
-//（userID 参数即租户：org_id ?? user_id，组织成员共享窗口）。
+// （userID 参数即租户：org_id ?? user_id，组织成员共享窗口）。
 // 返回 0 表示放行并记录本次调用；返回正数表示还需等待的秒数（向上取整）。
 func checkIndexStartRateLimit(userID, rootID string, now time.Time) int {
 	key := userID + "\x00" + rootID
@@ -149,7 +153,7 @@ func codebaseIndexToolDefinition() (json.RawMessage, error) {
 			"path":             map[string]interface{}{"type": "string", "minLength": 1, "maxLength": maxIndexPathBytes},
 			"hash":             map[string]interface{}{"type": "string", "pattern": "^[a-fA-F0-9]{64}$"},
 			"size":             map[string]interface{}{"type": "integer", "minimum": 1, "maximum": maxIndexFileBytes},
-			"estimated_chunks": map[string]interface{}{"type": "integer", "minimum": 1},
+			"estimated_chunks": map[string]interface{}{"type": "integer", "minimum": 1, "maximum": maxIndexEstimatedChunks},
 		},
 	}
 	uploadFile := map[string]interface{}{
@@ -331,8 +335,8 @@ func validateMCPManifestFiles(files []mcpIndexManifestFile) ([]indexManifestFile
 		if file.Size < 1 || file.Size > maxIndexFileBytes {
 			return nil, fmt.Errorf("manifest file size is invalid: %s", filePath)
 		}
-		if file.EstimatedChunks < 1 || file.EstimatedChunks > int(maxIndexFileBytes) {
-			return nil, fmt.Errorf("estimated_chunks must be between 1 and %d: %s", maxIndexFileBytes, filePath)
+		if file.EstimatedChunks < 1 || file.EstimatedChunks > maxIndexEstimatedChunks {
+			return nil, fmt.Errorf("estimated_chunks must be between 1 and %d: %s", maxIndexEstimatedChunks, filePath)
 		}
 		result = append(result, indexManifestFile{
 			Path:            filePath,

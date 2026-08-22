@@ -523,14 +523,14 @@ func TestValidateChatMCPToolArgsRequiresRemoteRoot(t *testing.T) {
 	}
 }
 
-func TestOnlyRetrievalUsesTenantRerankConfig(t *testing.T) {
-	if !chatMCPToolUsesRerankConfig("codebase-retrieval") {
-		t.Fatal("retrieval must receive the tenant rerank configuration")
-	}
-	for _, toolName := range []string{"codebase_symbol_graph"} {
-		if chatMCPToolUsesRerankConfig(toolName) {
-			t.Fatalf("%s must not depend on rerank configuration", toolName)
+func TestRetrievalAndPromptEnhancementUseTenantRerankConfig(t *testing.T) {
+	for _, toolName := range []string{"codebase-retrieval", "codebase_enhance_prompt"} {
+		if !chatMCPToolUsesRerankConfig(toolName) {
+			t.Fatalf("%s must receive the tenant rerank configuration", toolName)
 		}
+	}
+	if chatMCPToolUsesRerankConfig("codebase_symbol_graph") {
+		t.Fatal("codebase_symbol_graph must not depend on rerank configuration")
 	}
 }
 

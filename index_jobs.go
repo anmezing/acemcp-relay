@@ -762,11 +762,15 @@ func uploadIndexBatch(ctx context.Context, userID string, req indexUploadRequest
 	// 字节配额按租户池计（uploadIndexBatch 的 userID 参数即租户）；org 归属
 	// 从认证中间件放进 request context 的身份里取，缺失时按个人租户处理。
 	callerIdentity := authIdentityFromContext(ctx)
-	if ok, used, limit := chargeIndexBytes(userID, callerIdentity.OrgID, userTierFromContext(ctx), batchBytes); !ok {
+	quota := chargeIndexBytes(userID, callerIdentity.OrgID, userTierFromContext(ctx), batchBytes)
+	if quota.Unavailable {
+		return indexBatchResponse{}, fmt.Errorf("index quota accounting temporarily unavailable; retry later")
+	}
+	if !quota.Allowed {
 		return indexBatchResponse{}, fmt.Errorf(
 			"daily index quota exceeded (%d/%d bytes); retry after %s seconds",
-			used,
-			limit,
+			quota.Used,
+			quota.Limit,
 			quotaRetryAfterHeader(time.Now()),
 		)
 	}

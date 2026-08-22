@@ -1081,7 +1081,22 @@ func authMiddleware() gin.HandlerFunc {
 
 		trustedConsole := isTrustedConsoleRequest(c)
 		if !trustedConsole {
-			if quota := checkRequestQuotaDetailed(userID, identity.OrgID, tier); !quota.Allowed {
+			quota := checkRequestQuotaDetailed(userID, identity.OrgID, tier)
+			if quota.Unavailable {
+				logEvent("quota_unavailable",
+					"user_id", userID,
+					"tenant", tenantID,
+					"tier", tier,
+					"path", c.Request.URL.Path,
+				)
+				c.Header("Retry-After", "5")
+				c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{
+					"error": "quota accounting temporarily unavailable",
+					"code":  "QUOTA_ACCOUNTING_UNAVAILABLE",
+				})
+				return
+			}
+			if !quota.Allowed {
 				now := time.Now()
 				retryAfter := quotaRetryAfterHeader(now)
 				logEvent("quota_rejected",
@@ -1364,7 +1379,7 @@ func isChatMCPToolAllowed(name string) bool {
 }
 
 func chatMCPToolUsesRerankConfig(name string) bool {
-	return name == "codebase-retrieval"
+	return name == "codebase-retrieval" || name == "codebase_enhance_prompt"
 }
 
 func rewriteToolSchema(toolJSON json.RawMessage) (json.RawMessage, error) {

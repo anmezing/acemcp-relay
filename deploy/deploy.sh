@@ -23,6 +23,24 @@ update_repo() {
   fi
 }
 
+verify_contract_snapshots() {
+  local canonical="$LCE_DIR/docs/contracts/cloud-protocol.json"
+  local snapshot
+  for snapshot in \
+    "$RELAY_DIR/contracts/cloud-protocol.json" \
+    "$FRONTEND_DIR/contracts/cloud-protocol.json"; do
+    if [ ! -f "$canonical" ] || [ ! -f "$snapshot" ]; then
+      echo "ERROR: required cloud protocol contract is missing: $canonical or $snapshot" >&2
+      return 1
+    fi
+    if ! cmp -s "$canonical" "$snapshot"; then
+      echo "ERROR: cloud protocol snapshot is stale: $snapshot" >&2
+      echo "Sync it from $canonical and commit all affected repositories before deploying." >&2
+      return 1
+    fi
+  done
+}
+
 prune_docker_resources() {
   if [ "${DEPLOY_PRUNE_DOCKER_RESOURCES:-true}" != "true" ]; then
     echo "=== Docker resource cleanup disabled ==="
@@ -52,6 +70,9 @@ echo "=== Updating code ==="
 update_repo "$LCE_DIR" "${DEPLOY_REF_LCE:-}" "${DEPLOY_BRANCH_LCE:-feat/multi-tenant-relay}"
 update_repo "$RELAY_DIR" "${DEPLOY_REF_RELAY:-}" "${DEPLOY_BRANCH_RELAY:-main}"
 update_repo "$FRONTEND_DIR" "${DEPLOY_REF_FRONTEND:-}" "${DEPLOY_BRANCH_FRONTEND:-main}"
+
+echo "=== Verifying cross-repository contracts ==="
+verify_contract_snapshots
 
 echo "=== Applying host capacity settings ==="
 "$SCRIPT_DIR/tune-host.sh"

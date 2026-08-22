@@ -165,17 +165,17 @@ func TestChargeIndexBytesFreeAndProUseTheirOwnLimits(t *testing.T) {
 	expectNoIndexBytesOverride(mock, "free-user")
 	expectNoIndexBytesOverride(mock, "pro-user")
 
-	if allowed, _, limit := chargeIndexBytes("free-user", "", "free", 100); !allowed || limit != 100 {
-		t.Fatalf("free charge at limit: allowed=%v limit=%d", allowed, limit)
+	if decision := chargeIndexBytes("free-user", "", "free", 100); !decision.Allowed || decision.Limit != 100 {
+		t.Fatalf("free charge at limit: allowed=%v limit=%d", decision.Allowed, decision.Limit)
 	}
-	if allowed, _, _ := chargeIndexBytes("free-user", "", "free", 1); allowed {
+	if decision := chargeIndexBytes("free-user", "", "free", 1); decision.Allowed {
 		t.Fatal("free user over 100 bytes must be rejected")
 	}
 
-	if allowed, _, limit := chargeIndexBytes("pro-user", "", "pro", 300); !allowed || limit != 300 {
-		t.Fatalf("pro charge at limit: allowed=%v limit=%d", allowed, limit)
+	if decision := chargeIndexBytes("pro-user", "", "pro", 300); !decision.Allowed || decision.Limit != 300 {
+		t.Fatalf("pro charge at limit: allowed=%v limit=%d", decision.Allowed, decision.Limit)
 	}
-	if allowed, _, _ := chargeIndexBytes("pro-user", "", "pro", 1); allowed {
+	if decision := chargeIndexBytes("pro-user", "", "pro", 1); decision.Allowed {
 		t.Fatal("pro user over 300 bytes must be rejected")
 	}
 }
@@ -184,7 +184,7 @@ func TestChargeIndexBytesUnknownTierUsesFreeLimit(t *testing.T) {
 	mock, _ := withTierQuotaEnv(t, 0, 0, 100, 0)
 	expectNoIndexBytesOverride(mock, "weird-user")
 
-	if allowed, _, _ := chargeIndexBytes("weird-user", "", "platinum", 101); allowed {
+	if decision := chargeIndexBytes("weird-user", "", "platinum", 101); decision.Allowed {
 		t.Fatal("unknown tier must use the free byte limit, not pro unlimited")
 	}
 }
@@ -193,8 +193,8 @@ func TestChargeIndexBytesProZeroMeansUnlimited(t *testing.T) {
 	mock, _ := withTierQuotaEnv(t, 0, 0, 100, 0)
 	expectNoIndexBytesOverride(mock, "pro-user")
 
-	if allowed, _, limit := chargeIndexBytes("pro-user", "", "pro", 1<<30); !allowed || limit != 0 {
-		t.Fatalf("pro with limit 0 must pass any size, allowed=%v limit=%d", allowed, limit)
+	if decision := chargeIndexBytes("pro-user", "", "pro", 1<<30); !decision.Allowed || decision.Limit != 0 {
+		t.Fatalf("pro with limit 0 must pass any size, allowed=%v limit=%d", decision.Allowed, decision.Limit)
 	}
 }
 
@@ -204,11 +204,11 @@ func TestUserIndexBytesOverrideBeatsTierDefault(t *testing.T) {
 		WithArgs("override-user").
 		WillReturnRows(sqlmock.NewRows([]string{"daily_index_bytes_limit"}).AddRow(125))
 
-	if allowed, _, limit := chargeIndexBytes("override-user", "", "pro", 125); !allowed || limit != 125 {
-		t.Fatalf("charge at override: allowed=%v limit=%d, want allowed limit=125", allowed, limit)
+	if decision := chargeIndexBytes("override-user", "", "pro", 125); !decision.Allowed || decision.Limit != 125 {
+		t.Fatalf("charge at override: allowed=%v limit=%d, want allowed limit=125", decision.Allowed, decision.Limit)
 	}
-	if allowed, _, limit := chargeIndexBytes("override-user", "", "pro", 1); allowed || limit != 125 {
-		t.Fatalf("charge over override: allowed=%v limit=%d, want rejected limit=125", allowed, limit)
+	if decision := chargeIndexBytes("override-user", "", "pro", 1); decision.Allowed || decision.Limit != 125 {
+		t.Fatalf("charge over override: allowed=%v limit=%d, want rejected limit=125", decision.Allowed, decision.Limit)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatal(err)
@@ -222,8 +222,8 @@ func TestNullUserIndexBytesOverrideInheritsTier(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"daily_index_bytes_limit"}).AddRow(nil))
 	expectNoActivePlan(mock, "inherit-user")
 
-	if allowed, _, limit := chargeIndexBytes("inherit-user", "", "pro", 300); !allowed || limit != 300 {
-		t.Fatalf("null override: allowed=%v limit=%d, want pro default 300", allowed, limit)
+	if decision := chargeIndexBytes("inherit-user", "", "pro", 300); !decision.Allowed || decision.Limit != 300 {
+		t.Fatalf("null override: allowed=%v limit=%d, want pro default 300", decision.Allowed, decision.Limit)
 	}
 }
 

@@ -45,9 +45,9 @@ func TestIndexRootIDPatternAcceptsBranchViewEncoding(t *testing.T) {
 		}
 	}
 	for _, denied := range []string{
-		"@feature-x",           // 首字符必须是字母数字
-		"repo-a@feature/x",     // '/' 不在字符集内：客户端必须在编码分支时清洗
-		"repo a@feature",       // 空格非法
+		"@feature-x",       // 首字符必须是字母数字
+		"repo-a@feature/x", // '/' 不在字符集内：客户端必须在编码分支时清洗
+		"repo a@feature",   // 空格非法
 		"a" + strings.Repeat("b", maxIndexRootIDLen), // 超长
 	} {
 		if indexRootIDPattern.MatchString(denied) {
@@ -98,6 +98,16 @@ func TestMCPIndexFileValidationRequiresRealSHAAndText(t *testing.T) {
 		Path: "src/main.go", Hash: hash, Size: 0, EstimatedChunks: 1,
 	}}); err == nil {
 		t.Fatal("empty files must stay outside the index manifest")
+	}
+	if _, err := validateMCPManifestFiles([]mcpIndexManifestFile{{
+		Path: "src/main.go", Hash: hash, Size: maxIndexFileBytes, EstimatedChunks: maxIndexEstimatedChunks,
+	}}); err != nil {
+		t.Fatalf("maximum valid estimated chunk count was rejected: %v", err)
+	}
+	if _, err := validateMCPManifestFiles([]mcpIndexManifestFile{{
+		Path: "src/main.go", Hash: hash, Size: maxIndexFileBytes, EstimatedChunks: maxIndexEstimatedChunks + 1,
+	}}); err == nil || !strings.Contains(err.Error(), "between 1 and 128") {
+		t.Fatalf("estimated chunk count above the protocol maximum must fail, got %v", err)
 	}
 	if _, err := validateMCPUploadFiles([]mcpIndexUploadFile{{
 		Path: "src/main.go", Hash: hash, Content: "a\x00b",
