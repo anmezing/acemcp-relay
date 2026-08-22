@@ -216,3 +216,53 @@ func TestQuotaRetryAfterUsesShanghaiDayBoundary(t *testing.T) {
 		t.Fatalf("Retry-After = %s, want 1 second", got)
 	}
 }
+
+func TestRequestQuotaRejectsWithoutIncreasingUsage(t *testing.T) {
+	mock, server := withTierQuotaEnv(t, 2, 0, 0, 0)
+	expectNoQuotaOverride(mock, "bounded-user")
+
+	for i := 0; i < 2; i++ {
+		if decision := checkRequestQuotaDetailed("bounded-user", "", tierFree); !decision.Allowed {
+			t.Fatalf("request %d within quota was rejected: %+v", i+1, decision)
+		}
+	}
+	rejected := checkRequestQuotaDetailed("bounded-user", "", tierFree)
+	if rejected.Allowed || rejected.Used != 2 || rejected.Limit != 2 || rejected.Scope != "personal" {
+		t.Fatalf("unexpected rejection: %+v", rejected)
+	}
+	day := time.Now().In(quotaLocation()).Format("20060102")
+	if stored, err := server.Get("quota:used:bounded-user:" + day); err != nil || stored != "2" {
+		t.Fatalf("rejected request changed usage to %q (%v), want 2", stored, err)
+	}
+}
+
+func TestRequestQuotaIsAtomicUnderConcurrency(t *testing.T) {
+	_, server := withTierQuotaEnv(t, 10, 0, 0, 0)
+	if err := server.Set("quota:limit:concurrent-request-user", "10"); err != nil {
+		t.Fatal(err)
+	}
+
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	allowedCount := 0
+	for range 20 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if checkRequestQuotaDetailed("concurrent-request-user", "", tierFree).Allowed {
+				mu.Lock()
+				allowedCount++
+				mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+
+	if allowedCount != 10 {
+		t.Fatalf("allowed %d concurrent requests, want exactly 10", allowedCount)
+	}
+	day := time.Now().In(quotaLocation()).Format("20060102")
+	if stored, err := server.Get("quota:used:concurrent-request-user:" + day); err != nil || stored != "10" {
+		t.Fatalf("stored usage = %q (%v), want 10", stored, err)
+	}
+}

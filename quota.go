@@ -477,17 +477,21 @@ func indexBytesKey(tenantID string) string {
 }
 
 func quotaRetryAfterHeader(now time.Time) string {
-	localNow := now.In(quotaLocation())
-	year, month, day := localNow.Date()
-	nextWindow := time.Date(year, month, day+1, 0, 0, 0, 0, quotaLocation())
-	seconds := int64(nextWindow.Sub(localNow) / time.Second)
-	if nextWindow.Sub(localNow)%time.Second != 0 {
+	remaining := quotaResetAt(now).Sub(now)
+	seconds := int64(remaining / time.Second)
+	if remaining%time.Second != 0 {
 		seconds++
 	}
 	if seconds < 1 {
 		seconds = 1
 	}
 	return strconv.FormatInt(seconds, 10)
+}
+
+func quotaResetAt(now time.Time) time.Time {
+	localNow := now.In(quotaLocation())
+	year, month, day := localNow.Date()
+	return time.Date(year, month, day+1, 0, 0, 0, 0, quotaLocation())
 }
 
 // chargeIndexBytes 累加当日已索引字节并判断是否超限，返回 (是否放行, 已用, 上限)。
@@ -564,61 +568,131 @@ func chargeIndexBytesQuota(tenantID, orgID, tier string, bytes int64) (bool, int
 	return allowed == 1, used, limit
 }
 
-// checkRequestQuota 累加当日计数并判断是否超限。Redis 故障时放行。
+type requestQuotaDecision struct {
+	Allowed bool
+	Used    int64
+	Limit   int
+	Scope   string
+}
+
+const reserveRequestQuotaScript = `
+	local member_limit = tonumber(ARGV[1])
+	local pool_limit = tonumber(ARGV[2])
+	local ttl = tonumber(ARGV[3])
+	local member_used = 0
+	local pool_used = 0
+
+	if member_limit > 0 then
+		member_used = tonumber(redis.call('GET', KEYS[1]) or '0')
+		if member_used >= member_limit then
+			return {0, member_used, member_limit, 1}
+		end
+	end
+	if pool_limit > 0 then
+		pool_used = tonumber(redis.call('GET', KEYS[2]) or '0')
+		if pool_used >= pool_limit then
+			return {0, pool_used, pool_limit, 2}
+		end
+	end
+
+	if member_limit > 0 then
+		member_used = redis.call('INCR', KEYS[1])
+		if member_used == 1 then redis.call('EXPIRE', KEYS[1], ttl) end
+	end
+	if pool_limit > 0 then
+		pool_used = redis.call('INCR', KEYS[2])
+		if pool_used == 1 then redis.call('EXPIRE', KEYS[2], ttl) end
+	end
+
+	if pool_limit > 0 then return {1, pool_used, pool_limit, 2} end
+	if member_limit > 0 then return {1, member_used, member_limit, 1} end
+	return {1, 0, 0, 0}
+`
+
+func reserveRequestQuota(
+	ctx context.Context,
+	memberKey string,
+	memberLimit int,
+	poolKey string,
+	poolLimit int,
+) requestQuotaDecision {
+	if memberLimit <= 0 && poolLimit <= 0 {
+		return requestQuotaDecision{Allowed: true}
+	}
+	value, err := redisClient.Eval(
+		ctx,
+		reserveRequestQuotaScript,
+		[]string{memberKey, poolKey},
+		memberLimit,
+		poolLimit,
+		int64((48*time.Hour)/time.Second),
+	).Result()
+	if err != nil {
+		log.Printf("[QUOTA] request accounting failed: %v", err)
+		return requestQuotaDecision{Allowed: true}
+	}
+	parts, ok := value.([]interface{})
+	if !ok || len(parts) != 4 {
+		log.Printf("[QUOTA] invalid request accounting response: %#v", value)
+		return requestQuotaDecision{Allowed: true}
+	}
+	allowed, allowedOK := parts[0].(int64)
+	used, usedOK := parts[1].(int64)
+	limit, limitOK := parts[2].(int64)
+	scopeID, scopeOK := parts[3].(int64)
+	if !allowedOK || !usedOK || !limitOK || !scopeOK {
+		log.Printf("[QUOTA] invalid request accounting values: %#v", parts)
+		return requestQuotaDecision{Allowed: true}
+	}
+	scope := "personal"
+	if scopeID == 1 && poolKey != memberKey {
+		scope = "member"
+	} else if scopeID == 2 && poolKey != memberKey {
+		scope = "organization"
+	}
+	return requestQuotaDecision{
+		Allowed: allowed == 1,
+		Used:    used,
+		Limit:   int(limit),
+		Scope:   scope,
+	}
+}
+
+// checkRequestQuotaDetailed 原子预占当日请求额度。达到上限后不会继续增加计数；
+// 组织成员上限与组织共享池在同一 Lua 脚本中检查和扣减，避免组织池拒绝后仍消耗
+// 成员额度。Redis 故障时放行。
+func checkRequestQuotaDetailed(userID, orgID, tier string) requestQuotaDecision {
+	ctx := context.Background()
+	day := time.Now().In(quotaLocation()).Format("20060102")
+
+	if orgID == "" {
+		limit := getUserDailyLimit(userID, tier)
+		key := "quota:used:" + userID + ":" + day
+		return reserveRequestQuota(ctx, key, 0, key, limit)
+	}
+
+	memberLimit := 0
+	if configured, exists := getMemberDailyLimit(orgID, userID); exists {
+		memberLimit = configured
+	}
+	orgLimit := int64(tierDailyRequestLimit(tierFree))
+	limits := getOrgQuotaLimits(orgID)
+	if limits.RequestSet {
+		orgLimit = limits.Request
+	}
+	memberKey := "quota:used:org:" + orgID + ":" + userID + ":" + day
+	orgKey := "quota:used:" + orgID + ":" + day
+	return reserveRequestQuota(ctx, memberKey, memberLimit, orgKey, int(orgLimit))
+}
+
+// checkRequestQuota 保留既有内部调用契约；需要向客户端返回已用量和作用域时使用
+// checkRequestQuotaDetailed。
 //
 // 个人租户（orgID 空）：完全沿用旧路径（getUserDailyLimit + quota:used:{user}）。
 // 组织租户：先检查成员个人上限（org_member_quotas 有行才检查；计数键按 (org, user)，
 // 与该用户个人密钥的 quota:used:{user} 互不影响），再检查组织共享池
 // （管理员覆盖 → canonical owner 套餐/基础 tier → Free 默认；计数键按 org）。
 func checkRequestQuota(userID, orgID, tier string) (bool, int) {
-	ctx := context.Background()
-	day := time.Now().In(quotaLocation()).Format("20060102")
-
-	if orgID == "" {
-		limit := getUserDailyLimit(userID, tier)
-		if limit <= 0 {
-			return true, limit
-		}
-		key := "quota:used:" + userID + ":" + day
-		used, err := redisClient.Incr(ctx, key).Result()
-		if err != nil {
-			return true, limit
-		}
-		if used == 1 {
-			redisClient.Expire(ctx, key, 48*time.Hour)
-		}
-		return used <= int64(limit), limit
-	}
-
-	// 成员个人上限：只约束该用户在这个组织内的用量。
-	if memberLimit, exists := getMemberDailyLimit(orgID, userID); exists && memberLimit > 0 {
-		key := "quota:used:org:" + orgID + ":" + userID + ":" + day
-		used, err := redisClient.Incr(ctx, key).Result()
-		if err == nil {
-			if used == 1 {
-				redisClient.Expire(ctx, key, 48*time.Hour)
-			}
-			if used > int64(memberLimit) {
-				return false, memberLimit
-			}
-		}
-	}
-
-	orgLimit := int64(tierDailyRequestLimit(tierFree))
-	limits := getOrgQuotaLimits(orgID)
-	if limits.RequestSet {
-		orgLimit = limits.Request
-	}
-	if orgLimit <= 0 {
-		return true, int(orgLimit)
-	}
-	key := "quota:used:" + orgID + ":" + day
-	used, err := redisClient.Incr(ctx, key).Result()
-	if err != nil {
-		return true, int(orgLimit)
-	}
-	if used == 1 {
-		redisClient.Expire(ctx, key, 48*time.Hour)
-	}
-	return used <= orgLimit, int(orgLimit)
+	decision := checkRequestQuotaDetailed(userID, orgID, tier)
+	return decision.Allowed, decision.Limit
 }

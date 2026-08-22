@@ -1081,16 +1081,28 @@ func authMiddleware() gin.HandlerFunc {
 
 		trustedConsole := isTrustedConsoleRequest(c)
 		if !trustedConsole {
-			if ok, limit := checkRequestQuota(userID, identity.OrgID, tier); !ok {
+			if quota := checkRequestQuotaDetailed(userID, identity.OrgID, tier); !quota.Allowed {
+				now := time.Now()
+				retryAfter := quotaRetryAfterHeader(now)
 				logEvent("quota_rejected",
 					"user_id", userID,
 					"tenant", tenantID,
 					"tier", tier,
 					"path", c.Request.URL.Path,
-					"limit", strconv.Itoa(limit),
+					"used", strconv.FormatInt(quota.Used, 10),
+					"limit", strconv.Itoa(quota.Limit),
+					"scope", quota.Scope,
 				)
-				c.Header("Retry-After", quotaRetryAfterHeader(time.Now()))
-				c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{"error": fmt.Sprintf("daily request quota exceeded (%d/day)", limit)})
+				c.Header("Retry-After", retryAfter)
+				c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{
+					"error":    fmt.Sprintf("daily request quota exceeded (%d/day)", quota.Limit),
+					"code":     "PLAN_QUOTA_EXHAUSTED",
+					"resource": "requests",
+					"scope":    quota.Scope,
+					"used":     quota.Used,
+					"limit":    quota.Limit,
+					"reset_at": quotaResetAt(now).Format(time.RFC3339),
+				})
 				return
 			}
 		}

@@ -142,6 +142,31 @@ func TestCheckRequestQuotaOrgPoolSharedAcrossMembers(t *testing.T) {
 	}
 }
 
+func TestCheckRequestQuotaFullOrgPoolDoesNotChargeMember(t *testing.T) {
+	_, server := withTierQuotaEnv(t, 0, 0, 0, 0)
+	orgID := "full-org"
+	userID := "member-with-room"
+	if err := server.Set(memberQuotaLimitCacheKey(orgID, userID), "10"); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.Set("quota:limit:orgq:"+orgID, "v2,1,0"); err != nil {
+		t.Fatal(err)
+	}
+	day := time.Now().In(quotaLocation()).Format("20060102")
+	if err := server.Set("quota:used:"+orgID+":"+day, "1"); err != nil {
+		t.Fatal(err)
+	}
+
+	decision := checkRequestQuotaDetailed(userID, orgID, tierFree)
+	if decision.Allowed || decision.Scope != "organization" || decision.Used != 1 || decision.Limit != 1 {
+		t.Fatalf("unexpected organization rejection: %+v", decision)
+	}
+	memberKey := "quota:used:org:" + orgID + ":" + userID + ":" + day
+	if server.Exists(memberKey) {
+		t.Fatalf("full organization pool must not charge member key %q", memberKey)
+	}
+}
+
 // 一人多密钥：同一用户同时持有个人密钥与组织密钥时，个人租户计数
 // （quota:used:{user}）与该用户在组织内的计数（quota:used:org:{org}:{user}）
 // 以及组织池计数互不影响。
@@ -174,11 +199,11 @@ func TestCheckRequestQuotaPersonalAndOrgKeysCountIndependently(t *testing.T) {
 	}
 
 	day := time.Now().In(quotaLocation()).Format("20060102")
-	if v, err := server.Get("quota:used:dual-user:" + day); err != nil || v != "3" {
-		t.Fatalf("personal counter = %q (%v), want 3 (2 pass + 1 reject)", v, err)
+	if v, err := server.Get("quota:used:dual-user:" + day); err != nil || v != "2" {
+		t.Fatalf("personal counter = %q (%v), want 2 (rejected requests are not charged)", v, err)
 	}
-	if v, err := server.Get("quota:used:org:org-1:dual-user:" + day); err != nil || v != "6" {
-		t.Fatalf("member counter = %q (%v), want 6 (5 pass + 1 reject)", v, err)
+	if v, err := server.Get("quota:used:org:org-1:dual-user:" + day); err != nil || v != "5" {
+		t.Fatalf("member counter = %q (%v), want 5 (rejected requests are not charged)", v, err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatal(err)
