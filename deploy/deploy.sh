@@ -30,11 +30,18 @@ prune_docker_resources() {
   fi
 
   local keep_storage="${DEPLOY_BUILD_CACHE_KEEP_STORAGE:-5GB}"
+  local build_cache_age="${DEPLOY_BUILD_CACHE_MAX_AGE:-168h}"
   local unused_image_age="${DEPLOY_UNUSED_IMAGE_MAX_AGE:-168h}"
 
-  echo "=== Pruning unused Docker build cache (keep storage: $keep_storage) ==="
-  docker builder prune --force --keep-storage "$keep_storage" || \
-    echo "WARNING: Docker build cache cleanup failed; deployment remains active" >&2
+  if docker buildx prune --help 2>&1 | grep -q -- '--max-used-space'; then
+    echo "=== Pruning unused Docker build cache (max used space: $keep_storage) ==="
+    docker buildx prune --force --max-used-space "$keep_storage" || \
+      echo "WARNING: Docker Buildx cache cleanup failed; deployment remains active" >&2
+  else
+    echo "=== Pruning unused Docker build cache older than $build_cache_age ==="
+    docker builder prune --all --force --filter "until=$build_cache_age" || \
+      echo "WARNING: Docker build cache cleanup failed; deployment remains active" >&2
+  fi
 
   echo "=== Pruning unused Docker images older than $unused_image_age ==="
   docker image prune --all --force --filter "until=$unused_image_age" || \
