@@ -45,6 +45,12 @@ LCE 的多租户远程 MCP 服务。IDE Agent 只需配置一个 Streamable HTTP
 
 使用 `npx -y @anmezing/lce-cloud@latest` 时，npx 会自动下载并运行 npm 客户端，无需全局安装。npm 客户端额外向 Agent 暴露本地执行的 `codebase_git_context` 和 `codebase_review_changes`，并负责文件监听、自动增量索引与分支视图跟踪。直接连接远程 HTTP MCP 不具备这些本地能力，只提供上述 4 个服务端工具。
 
+提示词增强不会自动拦截用户的每条消息。用户需要明确要求 Agent 调用，例如：
+
+> 先调用 `codebase_enhance_prompt`，展示增强结果后再开始实现；原始要求始终优先。任务：修复登录超时并补充回归测试。已知标识：`AuthService`、`sessionTTL`。
+
+Agent 应把完整原始任务放入 `prompt`，把已知符号、文件名或错误码放入可选的 `technical_terms`。返回结果包含目标、实现要求、约束、已验证代码引用、验证步骤和待确认问题，只能作为原始请求的补充，不能删改用户要求。`root_id` 可限定索引分支视图，`output_language` 支持 `auto`、`zh-CN` 和 `en`。
+
 ## 技术栈
 
 - **语言**：Go 1.25

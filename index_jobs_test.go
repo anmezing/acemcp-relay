@@ -248,6 +248,21 @@ func TestPromptEnhancementPolicyHidesTenantAndRejectsCallerOverride(t *testing.T
 		t.Fatal(err)
 	}
 	prompt := tools[2]
+	description, ok := prompt["description"].(string)
+	if !ok {
+		t.Fatal("prompt enhancer must expose an agent-facing description")
+	}
+	for _, phrase := range []string{
+		"Use when the user explicitly asks",
+		"prompt",
+		"technical_terms",
+		"original request remains authoritative",
+		"Do not call automatically",
+	} {
+		if !strings.Contains(description, phrase) {
+			t.Fatalf("prompt enhancer description must explain %q: %s", phrase, description)
+		}
+	}
 	schema := prompt["inputSchema"].(map[string]interface{})
 	properties := schema["properties"].(map[string]interface{})
 	if _, exposed := properties["tenant_id"]; exposed {
