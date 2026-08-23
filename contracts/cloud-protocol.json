@@ -1,6 +1,6 @@
 {
   "$comment": "三仓库（lce / relay / 前端）共享云协议契约的单一源头。relay 与前端提交本文件的精确快照，独立 CI 直接读取快照且缺失即失败；修改本文件必须三仓同步。",
-  "schemaVersion": "1.2",
+  "schemaVersion": "1.3",
   "cloudToolSurface": [
     "codebase-retrieval",
     "codebase_symbol_graph",
@@ -48,6 +48,14 @@
       "responseField": "payload.localKnowledge",
       "textSection": "Local Graphify/OKF evidence",
       "uploadsArtifacts": false,
+      "artifactIndexingPolicy": "default_and_custom_artifact_roots_hard_excluded_from_manifest_and_watch_even_if_gitignore_negates",
+      "uploadAuthorization": "relay_pending_files_must_be_unique_exact_members_of_the_current_client_manifest",
+      "sourcePathPolicy": "repo_sources_must_pass_repository_boundary_gitignore_and_allowed_extension_checks",
+      "rootBinding": "local_evidence_is_fused_only_when_requested_root_id_exactly_matches_current_local_view_root_id",
+      "lineSemantics": {
+        "graphify": "line_range_only_when_in_bounds_and_declared_line_contains_symbol",
+        "okf": "line_range_means_repository_source_range_is_in_bounds_not_semantically_proven"
+      },
       "missingArtifactBehavior": "response_unchanged",
       "malformedArtifactBehavior": "supplemental_diagnostic_without_retrieval_failure"
     }
