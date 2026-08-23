@@ -1,6 +1,6 @@
 {
   "$comment": "三仓库（lce / relay / 前端）共享云协议契约的单一源头。relay 与前端提交本文件的精确快照，独立 CI 直接读取快照且缺失即失败；修改本文件必须三仓同步。",
-  "schemaVersion": "1.1",
+  "schemaVersion": "1.2",
   "cloudToolSurface": [
     "codebase-retrieval",
     "codebase_symbol_graph",
@@ -36,7 +36,21 @@
   "clientRequestHeaders": ["Authorization", "X-LCE-Client-Version"],
   "codebaseRetrieval": {
     "$comment": "codebase-retrieval 经 relay 的可选透传参数。root_id 把检索限定到单个索引根（缺省=全租户，向后兼容）；客户端默认自动注入当前分支视图的 root_id。",
-    "optionalArguments": ["root_id"]
+    "optionalArguments": ["root_id"],
+    "localKnowledgeFusion": {
+      "$comment": "The npm client may add bounded repository-local evidence after Relay retrieval. This does not add Relay arguments and does not upload artifacts.",
+      "client": "@anmezing/lce-cloud",
+      "mode": "post_retrieval_local",
+      "defaultArtifacts": {
+        "graphify": "graphify-out/graph.json",
+        "okf": ".okf"
+      },
+      "responseField": "payload.localKnowledge",
+      "textSection": "Local Graphify/OKF evidence",
+      "uploadsArtifacts": false,
+      "missingArtifactBehavior": "response_unchanged",
+      "malformedArtifactBehavior": "supplemental_diagnostic_without_retrieval_failure"
+    }
   },
   "promptEnhancement": {
     "$comment": "Relay removes tenant_id from the public schema and injects the authenticated tenant. The npm client defaults root_id to the current published branch view. Paths and line ranges in results are derived from retrieved chunks, not generation output.",
