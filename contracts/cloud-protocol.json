@@ -1,6 +1,6 @@
 {
   "$comment": "三仓库（lce / relay / 前端）共享云协议契约的单一源头。relay 与前端提交本文件的精确快照，独立 CI 直接读取快照且缺失即失败；修改本文件必须三仓同步。",
-  "schemaVersion": "1.3",
+  "schemaVersion": "1.4",
   "cloudToolSurface": [
     "codebase-retrieval",
     "codebase_symbol_graph",
@@ -22,8 +22,49 @@
     "limits": {
       "maxFileBytes": 524288,
       "estimatedChunkBytes": 4096,
-      "maxEstimatedChunks": 128
+      "maxEstimatedChunks": 128,
+      "maxManifestFiles": 100000
     }
+  },
+  "rootResolution": {
+    "$comment": "客户端解析项目根的唯一顺序。cwd 只在客户端不提供 roots 时作为兼容回退，且必须经过 Git 仓库、用户家目录和文件系统根校验。每个候选根必须是 git 仓库；否则拒绝并引导用户 git init，而不是退化成路径哈希 root 静默索引。",
+    "order": ["--repo", "roots/list", "validated-cwd", "refuse"],
+    "requiresGitRepository": true,
+    "rejectsHomeDirAndFilesystemRoot": true,
+    "multiRoot": "all_roots_indexed_one_view_each",
+    "defaultQueryRoot": "primary"
+  },
+  "indexReadiness": {
+    "$comment": "检索类工具在索引未就绪时立即返回的结构化状态，不阻塞等待。ready 的充要条件是该视图完成过一次 start -> upload -> complete。failureClass=permanent 表示重试无用（如 manifest 超限、根非 git 仓库、鉴权拒绝），transient 表示可退避重试。",
+    "phases": [
+      "resolving_roots",
+      "not_started",
+      "scanning",
+      "uploading",
+      "publishing",
+      "ready",
+      "failed"
+    ],
+    "readyRequiresCompletedPublish": true,
+    "failureClasses": ["permanent", "transient"],
+    "errorCodes": [
+      "INDEX_NOT_READY",
+      "INDEX_FAILED",
+      "ROOT_NOT_RESOLVED",
+      "ROOT_NOT_A_GIT_REPO"
+    ],
+    "statusFields": [
+      "root_id",
+      "phase",
+      "branch",
+      "revision",
+      "indexed_files",
+      "total_files",
+      "failure_class",
+      "message",
+      "remediation",
+      "available_roots"
+    ]
   },
   "responseEnvelope": {
     "schemaVersion": "1.0",

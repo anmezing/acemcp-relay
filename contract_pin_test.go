@@ -34,6 +34,7 @@ type cloudProtocolContract struct {
 			MaxFileBytes        int `json:"maxFileBytes"`
 			EstimatedChunkBytes int `json:"estimatedChunkBytes"`
 			MaxEstimatedChunks  int `json:"maxEstimatedChunks"`
+			MaxManifestFiles    int `json:"maxManifestFiles"`
 		} `json:"limits"`
 	} `json:"codebaseIndex"`
 	ResponseEnvelope struct {
@@ -149,10 +150,11 @@ func TestContractPinIndexEstimationLimits(t *testing.T) {
 	limits := contract.CodebaseIndex.Limits
 	if limits.MaxFileBytes != maxIndexFileBytes ||
 		limits.EstimatedChunkBytes != estimatedIndexChunkBytes ||
-		limits.MaxEstimatedChunks != maxIndexEstimatedChunks {
-		t.Fatalf("index limits mismatch: relay=(%d,%d,%d) contract=(%d,%d,%d)",
-			maxIndexFileBytes, estimatedIndexChunkBytes, maxIndexEstimatedChunks,
-			limits.MaxFileBytes, limits.EstimatedChunkBytes, limits.MaxEstimatedChunks)
+		limits.MaxEstimatedChunks != maxIndexEstimatedChunks ||
+		limits.MaxManifestFiles != maxIndexManifestFiles {
+		t.Fatalf("index limits mismatch: relay=(%d,%d,%d,%d) contract=(%d,%d,%d,%d)",
+			maxIndexFileBytes, estimatedIndexChunkBytes, maxIndexEstimatedChunks, maxIndexManifestFiles,
+			limits.MaxFileBytes, limits.EstimatedChunkBytes, limits.MaxEstimatedChunks, limits.MaxManifestFiles)
 	}
 }
 
