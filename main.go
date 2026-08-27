@@ -1825,6 +1825,12 @@ func handleMCPPost(c *gin.Context) {
 	}
 }
 
+func handleMCPGet(c *gin.Context) {
+	c.Header("Allow", "POST, DELETE")
+	c.JSON(http.StatusMethodNotAllowed, gin.H{"error": "SSE stream not supported; use POST"})
+	completeRequestLogAsync(getRequestLogEntry(c, http.StatusMethodNotAllowed))
+}
+
 func clientUpdateAvailable(c *gin.Context) bool {
 	if latestClientVersion == "" {
 		return false
@@ -2622,10 +2628,7 @@ func main() {
 	r.DELETE("/mcp", handleMCPDelete)
 	// Streamable HTTP 规范：不提供服务端 SSE 推流时对 GET 回 405，
 	// MCP SDK 客户端会按"无推流"优雅降级；回 404 会被当成连接错误。
-	r.GET("/mcp", func(c *gin.Context) {
-		c.Header("Allow", "POST, DELETE")
-		c.JSON(http.StatusMethodNotAllowed, gin.H{"error": "SSE stream not supported; use POST"})
-	})
+	r.GET("/mcp", handleMCPGet)
 	r.POST("/mcp/clear-index", handleClearIndex)
 	r.GET("/mcp/tenant-stats", handleTenantStats)
 	r.GET("/mcp/roots", handleListRoots)
