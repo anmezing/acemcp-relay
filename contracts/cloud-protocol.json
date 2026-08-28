@@ -1,6 +1,6 @@
 {
   "$comment": "三仓库（lce / relay / 前端）共享云协议契约的单一源头。relay 与前端提交本文件的精确快照，独立 CI 直接读取快照且缺失即失败；修改本文件必须三仓同步。",
-  "schemaVersion": "1.4",
+  "schemaVersion": "1.5",
   "cloudToolSurface": [
     "codebase-retrieval",
     "codebase_symbol_graph",
@@ -28,11 +28,18 @@
   },
   "rootResolution": {
     "$comment": "客户端解析项目根的唯一顺序。cwd 只在客户端不提供 roots 时作为兼容回退，且必须经过 Git 仓库、用户家目录和文件系统根校验。每个候选根必须是 git 仓库；否则拒绝并引导用户 git init，而不是退化成路径哈希 root 静默索引。",
-    "order": ["--repo", "roots/list", "validated-cwd", "refuse"],
+    "order": ["--repo", "roots/list", "validated-cwd", "tool.repo_path", "refuse"],
     "requiresGitRepository": true,
     "rejectsHomeDirAndFilesystemRoot": true,
     "multiRoot": "all_roots_indexed_one_view_each",
-    "defaultQueryRoot": "primary"
+    "defaultQueryRoot": "primary",
+    "dynamicToolRegistration": {
+      "argument": "repo_path",
+      "requiresAbsoluteGitRepository": true,
+      "serializedAndDeduplicated": true,
+      "mutuallyExclusiveWith": "root_id",
+      "forwardedToRelay": false
+    }
   },
   "indexReadiness": {
     "$comment": "检索类工具在索引未就绪时立即返回的结构化状态，不阻塞等待。ready 的充要条件是该视图完成过一次 start -> upload -> complete。failureClass=permanent 表示重试无用（如 manifest 超限、根非 git 仓库、鉴权拒绝），transient 表示可退避重试。",
@@ -78,6 +85,7 @@
   "codebaseRetrieval": {
     "$comment": "codebase-retrieval 经 relay 的可选透传参数。root_id 把检索限定到单个索引根（缺省=全租户，向后兼容）；客户端默认自动注入当前分支视图的 root_id。",
     "optionalArguments": ["root_id"],
+    "clientOnlyArguments": ["repo_path"],
     "localKnowledgeFusion": {
       "$comment": "The npm client may add bounded repository-local evidence after Relay retrieval. This does not add Relay arguments and does not upload artifacts.",
       "client": "@anmezing/lce-cloud",
@@ -107,6 +115,7 @@
     "input": {
       "requiredFields": ["prompt"],
       "optionalFields": ["technical_terms", "root_id", "output_language", "response_format"],
+      "clientOnlyFields": ["repo_path"],
       "relayInjectedFields": ["tenant_id"],
       "defaults": {
         "output_language": "auto",
