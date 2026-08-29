@@ -20,7 +20,7 @@ import (
 )
 
 // ContextKeyMetricsPath 允许 handler 把归一化路径细化后回传给 metrics 中间件
-// （如 /mcp → /mcp/tools/call/<tool>，与 updateRequestPathAsync 的口径一致）。
+// （如 /mcp → /mcp/tools/call/<tool>）；请求日志完成更新复用同一归一化路径。
 const ContextKeyMetricsPath = "metrics_path"
 
 var metricsRegistry = prometheus.NewRegistry()

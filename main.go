@@ -718,12 +718,15 @@ func initDB() error {
 		);
 		CREATE INDEX IF NOT EXISTS idx_leaderboard_date ON leaderboard(date_str);
 
-		-- 检索只通过 MCP 暴露；索引谓词与 updateLeaderboard 的口径保持一致。
+		-- 排行榜直接按上海自然日聚合 request_logs。时间列放在索引首位，
+		-- 并把成功检索条件写入谓词，避免实时刷新时扫描无关 MCP 请求。
 		DROP INDEX IF EXISTS idx_request_logs_codebase_retrieval;
 		DROP INDEX IF EXISTS idx_request_logs_codebase_retrieval_v2;
-		CREATE INDEX IF NOT EXISTS idx_request_logs_codebase_retrieval_v3
-			ON request_logs(user_id, request_timestamp)
-			WHERE request_path = '/mcp/tools/call/codebase-retrieval';
+		DROP INDEX IF EXISTS idx_request_logs_codebase_retrieval_v3;
+		CREATE INDEX IF NOT EXISTS idx_request_logs_codebase_retrieval_v4
+			ON request_logs(request_timestamp, user_id)
+			WHERE request_path = '/mcp/tools/call/codebase-retrieval'
+			  AND status_code = 200;
 	`)
 	if err != nil {
 		return fmt.Errorf("failed to migrate leaderboard table: %w", err)
@@ -1167,6 +1170,7 @@ type RequestLogEntry struct {
 	LogID            string
 	StatusCode       int
 	ResponseDuration time.Duration
+	RequestPath      string
 	InsertDone       <-chan struct{}
 }
 
@@ -1182,9 +1186,13 @@ func completeRequestLogAsync(entry RequestLogEntry) {
 
 		result, err := db.Exec(`
 			UPDATE request_logs
-			SET status = $1, status_code = $2, response_duration_ms = $3, updated_at = NOW()
-			WHERE id = $4
-		`, StatusCompleted, entry.StatusCode, durationMs, entry.LogID)
+			SET status = $1,
+				status_code = $2,
+				response_duration_ms = $3,
+				request_path = CASE WHEN $4 = '' THEN request_path ELSE $4 END,
+				updated_at = NOW()
+			WHERE id = $5
+		`, StatusCompleted, entry.StatusCode, durationMs, entry.RequestPath, entry.LogID)
 
 		if err != nil {
 			log.Printf("[ERROR] Failed to update request log: %v", err)
@@ -1266,28 +1274,16 @@ func getRequestLogEntry(c *gin.Context, statusCode int) RequestLogEntry {
 	}
 
 	logIDVal, _ := logID.(string)
+	requestPath, _ := c.Get(ContextKeyMetricsPath)
+	requestPathVal, _ := requestPath.(string)
 
 	return RequestLogEntry{
 		LogID:            logIDVal,
 		StatusCode:       statusCode,
 		ResponseDuration: time.Since(startTimeVal),
+		RequestPath:      requestPathVal,
 		InsertDone:       getInsertDone(c),
 	}
-}
-
-func updateRequestPathAsync(logID string, newPath string, insertDone <-chan struct{}) {
-	if logID == "" {
-		return
-	}
-	go func() {
-		if insertDone != nil {
-			<-insertDone
-		}
-		_, err := db.Exec(`UPDATE request_logs SET request_path = $1, updated_at = NOW() WHERE id = $2`, newPath, logID)
-		if err != nil {
-			log.Printf("[ERROR] Failed to update request path: %v", err)
-		}
-	}()
 }
 
 // ── MCP 服务端 ──────────────────────────────────────────────────────────────
@@ -1533,6 +1529,33 @@ type jsonRPCRequest struct {
 	Params  json.RawMessage `json:"params,omitempty"`
 }
 
+// normalizedMCPRequestPath maps the JSON-RPC envelope to a bounded route name.
+// It runs before session validation so an expired-session 404 still records the
+// actual operation instead of an opaque /mcp path.
+func normalizedMCPRequestPath(rpc jsonRPCRequest) string {
+	switch rpc.Method {
+	case "initialize":
+		return "/mcp/initialize"
+	case "notifications/initialized":
+		return "/mcp/notifications/initialized"
+	case "tools/list":
+		return "/mcp/tools/list"
+	case "tools/call":
+		var params struct {
+			Name string `json:"name"`
+		}
+		if err := json.Unmarshal(rpc.Params, &params); err == nil {
+			name := strings.TrimSpace(params.Name)
+			if isChatMCPToolAllowed(name) {
+				return "/mcp/tools/call/" + name
+			}
+		}
+		return "/mcp/tools/call"
+	default:
+		return "/mcp"
+	}
+}
+
 type jsonRPCResultResp struct {
 	JSONRPC string          `json:"jsonrpc"`
 	ID      json.RawMessage `json:"id"`
@@ -1740,6 +1763,7 @@ func handleMCPPost(c *gin.Context) {
 		completeRequestLogAsync(getRequestLogEntry(c, http.StatusBadRequest))
 		return
 	}
+	c.Set(ContextKeyMetricsPath, normalizedMCPRequestPath(rpc))
 
 	sessionID := c.GetHeader("Mcp-Session-Id")
 
@@ -1831,6 +1855,7 @@ func handleMCPPost(c *gin.Context) {
 }
 
 func handleMCPGet(c *gin.Context) {
+	c.Set(ContextKeyMetricsPath, "/mcp/session/listen")
 	c.Header("Allow", "POST, DELETE")
 	c.JSON(http.StatusMethodNotAllowed, gin.H{"error": "SSE stream not supported; use POST"})
 	completeRequestLogAsync(getRequestLogEntry(c, http.StatusMethodNotAllowed))
@@ -1882,7 +1907,6 @@ func handleMCPToolsCall(c *gin.Context, id json.RawMessage, params json.RawMessa
 	logIDVal, _ := logIDStr.(string)
 	toolPath := "/mcp/tools/call/" + p.Name
 	c.Set(ContextKeyMetricsPath, toolPath)
-	updateRequestPathAsync(logIDVal, toolPath, getInsertDone(c))
 
 	if p.Arguments == nil {
 		p.Arguments = make(map[string]interface{})
@@ -2212,6 +2236,7 @@ func handleTenantStats(c *gin.Context) {
 }
 
 func handleMCPDelete(c *gin.Context) {
+	c.Set(ContextKeyMetricsPath, "/mcp/session/terminate")
 	userID := c.GetString(ContextKeyUserID)
 	sessionID := c.GetHeader("Mcp-Session-Id")
 	if sessionID == "" {
