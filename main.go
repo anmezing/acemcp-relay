@@ -1371,10 +1371,11 @@ func sortedStringSetKeys(values map[string]struct{}) []string {
 }
 
 func isChatMCPToolAllowed(name string) bool {
-	if strings.TrimSpace(name) == codebaseIndexToolName {
+	name = strings.TrimSpace(name)
+	if name == codebaseIndexToolName || name == codebaseIndexStatusToolName {
 		return true
 	}
-	_, allowed := chatMCPToolPolicies[strings.TrimSpace(name)]
+	_, allowed := chatMCPToolPolicies[name]
 	return allowed
 }
 
@@ -1699,6 +1700,10 @@ func getCachedToolsList(ctx context.Context) (json.RawMessage, error) {
 	if err != nil {
 		return nil, err
 	}
+	tools, err = appendCodebaseIndexStatusTool(tools)
+	if err != nil {
+		return nil, err
+	}
 
 	toolsCacheMu.Lock()
 	toolsCache = tools
@@ -1911,6 +1916,60 @@ func handleMCPToolsCall(c *gin.Context, id json.RawMessage, params json.RawMessa
 		encoded, err := json.Marshal(indexResult)
 		if err != nil {
 			c.JSON(http.StatusOK, rpcError(id, -32000, "encode index response: "+err.Error()))
+			completeRequestLogAsync(getRequestLogEntry(c, http.StatusOK))
+			return
+		}
+		c.JSON(http.StatusOK, rpcResult(id, map[string]interface{}{
+			"content": []map[string]interface{}{{"type": "text", "text": string(encoded)}},
+			"isError": false,
+		}))
+		completeRequestLogAsync(getRequestLogEntry(c, http.StatusOK))
+		return
+	}
+	if p.Name == codebaseIndexStatusToolName {
+		if err := validateCodebaseIndexStatusArgs(p.Arguments); err != nil {
+			c.JSON(http.StatusOK, rpcError(id, -32602, err.Error()))
+			completeRequestLogAsync(getRequestLogEntry(c, http.StatusOK))
+			return
+		}
+		allRoots, err := loadIndexRoots(c.Request.Context(), tenantID)
+		if err != nil {
+			saveErrorDetailsAsync(logIDVal, "relay", err.Error(), getInsertDone(c))
+			encoded, _ := json.Marshal(map[string]interface{}{
+				"error":   "index status unavailable",
+				"message": err.Error(),
+			})
+			c.JSON(http.StatusOK, rpcResult(id, map[string]interface{}{
+				"content": []map[string]interface{}{{"type": "text", "text": string(encoded)}},
+				"isError": true,
+			}))
+			completeRequestLogAsync(getRequestLogEntry(c, http.StatusOK))
+			return
+		}
+		requestedRootID, _ := p.Arguments["root_id"].(string)
+		requestedRootID = strings.TrimSpace(requestedRootID)
+		roots := allRoots
+		if requestedRootID != "" {
+			filtered := make([]indexRootView, 0, 1)
+			for _, root := range allRoots {
+				if root.RootID == requestedRootID {
+					filtered = append(filtered, root)
+					break
+				}
+			}
+			roots = filtered
+		}
+		payload := map[string]interface{}{
+			"roots":             roots,
+			"requested_root_id": requestedRootID,
+			"available_roots":   allRoots,
+		}
+		if requestedRootID != "" && len(roots) == 0 {
+			payload["not_found"] = true
+		}
+		encoded, err := json.Marshal(payload)
+		if err != nil {
+			c.JSON(http.StatusOK, rpcError(id, -32000, "encode index status response: "+err.Error()))
 			completeRequestLogAsync(getRequestLogEntry(c, http.StatusOK))
 			return
 		}

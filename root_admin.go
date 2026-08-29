@@ -96,11 +96,41 @@ type indexRootView struct {
 	IndexedAt      string `json:"indexed_at"`
 	FileCount      int64  `json:"file_count"`
 	TotalSizeBytes int64  `json:"total_size_bytes"`
+	IndexAvailable bool   `json:"index_available"`
+	// revision/cloud_revision 始终表示最后一次已发布、可检索的快照；最近同步
+	// 正在构建或失败时使用 sync_* 字段，避免把不可用的新 revision 冒充成已发布。
+	SyncRevision      string `json:"sync_revision,omitempty"`
+	SyncCloudRevision int64  `json:"sync_cloud_revision,omitempty"`
+	// index_state/index_phase 是该根最近一次索引任务的状态快照。它来自
+	// index_jobs，而不是仅依据 index_workspaces 推断，因此“索引中”和“失败”
+	// 即使尚未发布新版本也能被控制台和 Agent 看到。
+	IndexState      string `json:"index_state"`
+	IndexPhase      string `json:"index_phase,omitempty"`
+	IndexedFiles    int    `json:"indexed_files"`
+	TotalFiles      int    `json:"total_files"`
+	FailedFiles     int    `json:"failed_files"`
+	ProgressPercent int    `json:"progress_percent"`
+	IndexError      string `json:"index_error,omitempty"`
 	// base_root_id / view_branch 是纯派生字段（分组展示用），由 root_id 按最后
 	// 一个 '@' 拆分得到；无 '@' 时 base=root_id、view_branch="default"。
 	// 既有 branch 字段继续携带 start 上报的 Git 分支元数据，语义不变。
 	BaseRootID string `json:"base_root_id"`
 	ViewBranch string `json:"view_branch"`
+}
+
+type latestIndexJobView struct {
+	WorkspaceID   string
+	RootID        string
+	Branch        string
+	Revision      string
+	Phase         string
+	Status        string
+	TotalFiles    int
+	IndexedFiles  int
+	FailedFiles   int
+	Error         string
+	CloudRevision int64
+	StartedAt     time.Time
 }
 
 // splitRootIDView 从 root_id 派生分组视图：按最后一个 '@' 拆成 (base, branch)。
@@ -133,6 +163,7 @@ func loadIndexRoots(ctx context.Context, userID string) ([]indexRootView, error)
 	defer rows.Close()
 
 	roots := make([]indexRootView, 0)
+	rootByKey := make(map[string]int)
 	for rows.Next() {
 		var root indexRootView
 		var indexedAt time.Time
@@ -143,10 +174,134 @@ func loadIndexRoots(ctx context.Context, userID string) ([]indexRootView, error)
 			return nil, err
 		}
 		root.IndexedAt = indexedAt.UTC().Format(time.RFC3339)
+		root.IndexAvailable = true
 		root.BaseRootID, root.ViewBranch = splitRootIDView(root.RootID)
+		root.IndexState = "ready"
+		root.ProgressPercent = 100
+		root.IndexedFiles = int(root.FileCount)
+		root.TotalFiles = int(root.FileCount)
+		rootByKey[root.WorkspaceID+"\x00"+root.RootID] = len(roots)
 		roots = append(roots, root)
 	}
-	return roots, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	jobs, err := loadLatestIndexJobs(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	for _, job := range jobs {
+		key := job.WorkspaceID + "\x00" + job.RootID
+		index, exists := rootByKey[key]
+		if !exists {
+			if job.Status != "running" && job.Status != "failed" && job.Status != "timed_out" {
+				continue
+			}
+			base, viewBranch := splitRootIDView(job.RootID)
+			roots = append(roots, indexRootView{
+				WorkspaceID:       job.WorkspaceID,
+				RootID:            job.RootID,
+				Branch:            job.Branch,
+				SyncRevision:      job.Revision,
+				SyncCloudRevision: job.CloudRevision,
+				IndexState:        indexJobViewState(job.Status),
+				IndexPhase:        job.Phase,
+				IndexedFiles:      job.IndexedFiles,
+				TotalFiles:        job.TotalFiles,
+				FailedFiles:       job.FailedFiles,
+				ProgressPercent:   indexProgressPercent(job.IndexedFiles, job.TotalFiles, job.Status),
+				IndexError:        job.Error,
+				BaseRootID:        base,
+				ViewBranch:        viewBranch,
+			})
+			continue
+		}
+		applyIndexJobToRoot(&roots[index], job)
+	}
+	return roots, nil
+}
+
+func loadLatestIndexJobs(ctx context.Context, userID string) ([]latestIndexJobView, error) {
+	rows, err := db.QueryContext(ctx, `
+		SELECT workspace_id, root_id, COALESCE(branch, ''), COALESCE(revision, ''),
+			COALESCE(phase, ''), status, COALESCE(total_files, 0),
+			COALESCE(indexed_files, 0), COALESCE(failed_files, 0), COALESCE(error, ''),
+			COALESCE(cloud_revision, 0), started_at
+		FROM (
+			SELECT DISTINCT ON (workspace_id, root_id)
+				workspace_id, root_id, branch, revision, phase, status, total_files,
+				indexed_files, failed_files, error, cloud_revision, started_at
+			FROM index_jobs
+			WHERE user_id = $1
+			ORDER BY workspace_id, root_id, started_at DESC, id DESC
+		) latest
+		ORDER BY started_at DESC
+	`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	jobs := make([]latestIndexJobView, 0)
+	for rows.Next() {
+		var job latestIndexJobView
+		if err := rows.Scan(
+			&job.WorkspaceID, &job.RootID, &job.Branch, &job.Revision, &job.Phase,
+			&job.Status, &job.TotalFiles, &job.IndexedFiles, &job.FailedFiles,
+			&job.Error, &job.CloudRevision, &job.StartedAt,
+		); err != nil {
+			return nil, err
+		}
+		jobs = append(jobs, job)
+	}
+	return jobs, rows.Err()
+}
+
+func indexJobViewState(status string) string {
+	switch status {
+	case "running":
+		return "building"
+	case "completed":
+		return "ready"
+	case "failed", "timed_out":
+		return "failed"
+	case "superseded":
+		return "superseded"
+	default:
+		return status
+	}
+}
+
+func indexProgressPercent(indexed, total int, status string) int {
+	if status == "completed" {
+		return 100
+	}
+	if total <= 0 {
+		return 0
+	}
+	percent := indexed * 100 / total
+	if percent < 0 {
+		return 0
+	}
+	if percent > 100 {
+		return 100
+	}
+	return percent
+}
+
+func applyIndexJobToRoot(root *indexRootView, job latestIndexJobView) {
+	root.IndexState = indexJobViewState(job.Status)
+	root.IndexPhase = job.Phase
+	root.IndexedFiles = job.IndexedFiles
+	root.TotalFiles = job.TotalFiles
+	root.FailedFiles = job.FailedFiles
+	root.ProgressPercent = indexProgressPercent(job.IndexedFiles, job.TotalFiles, job.Status)
+	root.IndexError = job.Error
+	root.SyncRevision = job.Revision
+	root.SyncCloudRevision = job.CloudRevision
+	if job.Branch != "" {
+		root.Branch = job.Branch
+	}
 }
 
 func handleListRoots(c *gin.Context) {

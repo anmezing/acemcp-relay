@@ -178,6 +178,12 @@ func TestHandleListRootsAggregatesFilesAndKeepsEmptyWorkspaceZero(t *testing.T) 
 				AddRow("repo-a", "repo-a", "main", "abc", int64(7), indexedAt, int64(42), int64(123456)).
 				AddRow("repo-a@feature-x", "repo-a@feature-x", "feature/x", "def", int64(3), indexedAt.Add(-30*time.Minute), int64(10), int64(999)).
 				AddRow("repo-b", "repo-b", "", "", int64(0), indexedAt.Add(-time.Hour), int64(0), int64(0)))
+		mock.ExpectQuery("FROM index_jobs").
+			WithArgs("user-1").
+			WillReturnRows(sqlmock.NewRows([]string{
+				"workspace_id", "root_id", "branch", "revision", "phase", "status",
+				"total_files", "indexed_files", "failed_files", "error", "cloud_revision", "started_at",
+			}))
 
 		c, recorder := newRootAdminContext(t, "user-1", "GET", "")
 		handleListRoots(c)
@@ -218,6 +224,73 @@ func TestHandleListRootsAggregatesFilesAndKeepsEmptyWorkspaceZero(t *testing.T) 
 	})
 }
 
+func TestLoadIndexRootsMergesLatestProgressAndKeepsUnpublishedFailuresVisible(t *testing.T) {
+	indexedAt := time.Date(2026, 8, 1, 10, 30, 0, 0, time.UTC)
+	withMockDB(t, func(mock sqlmock.Sqlmock) {
+		mock.ExpectQuery("FROM index_workspaces").
+			WithArgs("user-1").
+			WillReturnRows(sqlmock.NewRows([]string{
+				"workspace_id", "root_id", "branch", "revision", "cloud_revision", "indexed_at",
+				"file_count", "total_size",
+			}).AddRow("repo-a", "repo-a", "main", "old", int64(7), indexedAt, int64(42), int64(123456)))
+		mock.ExpectQuery("FROM index_jobs").
+			WithArgs("user-1").
+			WillReturnRows(sqlmock.NewRows([]string{
+				"workspace_id", "root_id", "branch", "revision", "phase", "status",
+				"total_files", "indexed_files", "failed_files", "error", "cloud_revision", "started_at",
+			}).
+				AddRow("repo-a", "repo-a", "main", "next", "uploading", "running", 100, 37, 0, "", int64(8), indexedAt.Add(time.Hour)).
+				AddRow("repo-b", "repo-b@feature", "feature/x", "broken", "scanning", "failed", 12, 3, 1, "manifest rejected", int64(0), indexedAt))
+
+		roots, err := loadIndexRoots(context.Background(), "user-1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(roots) != 2 {
+			t.Fatalf("expected published and unpublished roots, got %#v", roots)
+		}
+		if roots[0].IndexState != "building" || roots[0].IndexPhase != "uploading" ||
+			roots[0].ProgressPercent != 37 || roots[0].IndexedFiles != 37 || roots[0].TotalFiles != 100 ||
+			!roots[0].IndexAvailable || roots[0].Revision != "old" || roots[0].CloudRevision != 7 ||
+			roots[0].SyncRevision != "next" || roots[0].SyncCloudRevision != 8 {
+			t.Fatalf("running progress not merged into published root: %+v", roots[0])
+		}
+		if roots[1].IndexedAt != "" || roots[1].IndexAvailable || roots[1].IndexState != "failed" ||
+			roots[1].IndexError != "manifest rejected" || roots[1].BaseRootID != "repo-b" ||
+			roots[1].ViewBranch != "feature" || roots[1].SyncRevision != "broken" {
+			t.Fatalf("unpublished failed root must remain visible: %+v", roots[1])
+		}
+	})
+}
+
+func TestLoadIndexRootsDoesNotResurrectDeletedCompletedOrSupersededJobs(t *testing.T) {
+	startedAt := time.Date(2026, 8, 1, 10, 30, 0, 0, time.UTC)
+	withMockDB(t, func(mock sqlmock.Sqlmock) {
+		mock.ExpectQuery("FROM index_workspaces").
+			WithArgs("user-1").
+			WillReturnRows(sqlmock.NewRows([]string{
+				"workspace_id", "root_id", "branch", "revision", "cloud_revision", "indexed_at",
+				"file_count", "total_size",
+			}))
+		mock.ExpectQuery("FROM index_jobs").
+			WithArgs("user-1").
+			WillReturnRows(sqlmock.NewRows([]string{
+				"workspace_id", "root_id", "branch", "revision", "phase", "status",
+				"total_files", "indexed_files", "failed_files", "error", "cloud_revision", "started_at",
+			}).
+				AddRow("deleted-a", "deleted-a", "main", "done", "completed", "completed", 10, 10, 0, "", int64(3), startedAt).
+				AddRow("deleted-b", "deleted-b", "main", "old", "superseded", "superseded", 10, 4, 0, "", int64(2), startedAt.Add(-time.Minute)))
+
+		roots, err := loadIndexRoots(context.Background(), "user-1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(roots) != 0 {
+			t.Fatalf("historical terminal jobs must not resurrect deleted roots: %+v", roots)
+		}
+	})
+}
+
 func TestSplitRootIDViewDerivation(t *testing.T) {
 	cases := []struct {
 		rootID string
@@ -249,6 +322,12 @@ func TestHandleListRootsReturnsEmptyArrayNotNull(t *testing.T) {
 			WillReturnRows(sqlmock.NewRows([]string{
 				"workspace_id", "root_id", "branch", "revision", "cloud_revision", "indexed_at",
 				"file_count", "total_size",
+			}))
+		mock.ExpectQuery("FROM index_jobs").
+			WithArgs("user-1").
+			WillReturnRows(sqlmock.NewRows([]string{
+				"workspace_id", "root_id", "branch", "revision", "phase", "status",
+				"total_files", "indexed_files", "failed_files", "error", "cloud_revision", "started_at",
 			}))
 		c, recorder := newRootAdminContext(t, "user-1", "GET", "")
 		handleListRoots(c)

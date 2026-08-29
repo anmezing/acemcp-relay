@@ -5,6 +5,7 @@
     "codebase-retrieval",
     "codebase_symbol_graph",
     "codebase_enhance_prompt",
+    "codebase_index_status",
     "codebase_git_context",
     "codebase_review_changes"
   ],
@@ -54,15 +55,12 @@
     ],
     "readyRequiresCompletedPublish": true,
     "failureClasses": ["permanent", "transient"],
-    "errorCodes": [
-      "INDEX_NOT_READY",
-      "INDEX_FAILED",
-      "ROOT_NOT_RESOLVED",
-      "ROOT_NOT_A_GIT_REPO"
-    ],
+    "errorCodes": ["INDEX_NOT_READY", "INDEX_FAILED", "ROOT_NOT_RESOLVED", "ROOT_NOT_A_GIT_REPO"],
     "statusFields": [
       "root_id",
       "phase",
+      "index_available",
+      "published_revision",
       "branch",
       "revision",
       "indexed_files",

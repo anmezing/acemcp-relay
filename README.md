@@ -30,11 +30,12 @@ LCE 的多租户远程 MCP 服务。IDE Agent 只需配置一个 Streamable HTTP
 
 ### MCP 工具边界
 
-远程 MCP 对模型只暴露 4 个租户安全工具：
+远程 MCP 对模型只暴露 5 个租户安全工具：
 
 - `codebase-retrieval`：在租户服务端索引上执行向量召回与精排；向量空间由 LCE 固定，Relay 只按用户注入可选 rerank 配置。
 - `codebase_symbol_graph`：查询指定 `root_id` 的服务端符号图。
 - `codebase_enhance_prompt`：基于租户索引中检索到的代码上下文增强自然语言任务；管理员必须先配置并启用提示词增强模型。
+- `codebase_index_status`：查询一个或全部项目根的索引可用性、同步阶段、文件进度与失败原因；已有快照可用时会同时标明后台更新状态。
 - `codebase_index`：不依赖 IDE 插件的索引入口。Agent 使用自身文件读取能力提交完整 manifest，再按 `pending_files` 分批上传内容，最后完成任务并收敛符号图。
 
 `codebase_tenant_stats` 是网页控制台的内部统计接口，不会出现在远程 MCP 的 `tools/list` 中。
@@ -43,7 +44,7 @@ LCE 的多租户远程 MCP 服务。IDE Agent 只需配置一个 Streamable HTTP
 
 远端服务无法读取 IDE 所在机器的文件系统或 `.git` 目录。Relay 的 Streamable HTTP `/mcp` 端点保留为 npm 客户端和服务内部调用的传输层；控制台不再把它作为普通用户的独立接入方式，因为直接配置它缺少 npm 客户端的本地 Git 工具、文件监听、自动增量同步和分支视图跟踪。
 
-使用 `npx -y @anmezing/lce-cloud@latest` 时，npx 会自动下载并运行 npm 客户端，无需全局安装。npm 客户端额外向 Agent 暴露本地执行的 `codebase_git_context` 和 `codebase_review_changes`，并负责文件监听、自动增量索引与分支视图跟踪。控制台生成的 npx 配置会提供完整的 5 个工具。
+使用 `npx -y @anmezing/lce-cloud@latest` 时，npx 会自动下载并运行 npm 客户端，无需全局安装。npm 客户端向 Agent 暴露检索、符号图、提示词增强、索引状态以及两个本地 Git 工具，并负责文件监听、自动增量索引与分支视图跟踪。控制台生成的 npx 配置会提供完整的 6 个工具；底层 `codebase_index` 同步协议由客户端自动调用，不作为第七个面向 Agent 的工具暴露。
 
 提示词增强不会自动拦截用户的每条消息。用户需要明确要求 Agent 调用，例如：
 

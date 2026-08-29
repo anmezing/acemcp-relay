@@ -215,7 +215,7 @@ func TestFilterChatMCPToolsRequiresExactRemoteContract(t *testing.T) {
 }
 
 func TestChatMCPToolPolicyKeepsTenantToolsAndRejectsRawManagement(t *testing.T) {
-	for _, allowed := range []string{"codebase-retrieval", "codebase_symbol_graph", "codebase_enhance_prompt", codebaseIndexToolName} {
+	for _, allowed := range []string{"codebase-retrieval", "codebase_symbol_graph", "codebase_enhance_prompt", codebaseIndexToolName, codebaseIndexStatusToolName} {
 		if !isChatMCPToolAllowed(allowed) {
 			t.Fatalf("%q must remain available through chat MCP", allowed)
 		}
