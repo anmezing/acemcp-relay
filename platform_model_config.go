@@ -16,6 +16,12 @@ import (
 
 const maxPlatformModelConfigBody = 64 << 10
 
+var platformModelConfigSections = map[string]struct{}{
+	"embeddings":     {},
+	"rerank":         {},
+	"promptEnhancer": {},
+}
+
 var (
 	platformModelConfigBarrier sync.RWMutex
 	platformModelConfigAdminMu sync.Mutex
@@ -132,12 +138,38 @@ func lceConfigError(data []byte, fallback string) string {
 	return fallback
 }
 
+func parsePlatformModelConfigPatch(section string, raw json.RawMessage) (map[string]interface{}, error) {
+	section = strings.TrimSpace(section)
+	if _, ok := platformModelConfigSections[section]; !ok {
+		return nil, fmt.Errorf("section must be embeddings, rerank, or promptEnhancer")
+	}
+
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &envelope); err != nil || envelope == nil {
+		return nil, fmt.Errorf("config must be a JSON object")
+	}
+	if len(envelope) != 1 {
+		return nil, fmt.Errorf("config must contain exactly one model section")
+	}
+	payload, ok := envelope[section]
+	if !ok {
+		return nil, fmt.Errorf("config section must match section %q", section)
+	}
+
+	var sectionConfig map[string]interface{}
+	if err := json.Unmarshal(payload, &sectionConfig); err != nil || sectionConfig == nil {
+		return nil, fmt.Errorf("config.%s must be a JSON object", section)
+	}
+	return map[string]interface{}{section: sectionConfig}, nil
+}
+
 func handleSavePlatformModelConfig(c *gin.Context) {
 	if !requirePlatformConfigConsole(c) {
 		return
 	}
 	var request struct {
 		Action                string          `json:"action"`
+		Section               string          `json:"section"`
 		Kind                  string          `json:"kind"`
 		Provider              string          `json:"provider"`
 		BaseURL               string          `json:"baseUrl"`
@@ -176,9 +208,13 @@ func handleSavePlatformModelConfig(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 6*time.Minute)
 	defer cancel()
 
-	var config interface{}
-	if err := json.Unmarshal(request.Config, &config); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "config must be valid JSON"})
+	config, err := parsePlatformModelConfigPatch(request.Section, request.Config)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if request.ConfirmEmbeddingReset && request.Section != "embeddings" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "confirmEmbeddingReset is only valid for embeddings"})
 		return
 	}
 	validatedData, validatedStatus, err := callLCEPlatformConfig(ctx, http.MethodPost, map[string]interface{}{
