@@ -299,6 +299,7 @@ func TestClassifyIndexFailure(t *testing.T) {
 		expected indexFailureDiagnostic
 	}{
 		{"heartbeat", indexJobStatusTimedOut, "index job heartbeat timed out", indexFailureDiagnostic{"heartbeat_timeout", "relay", "restart_client"}},
+		{"embedding space changed", indexJobStatusFailed, "LCE cloud index begin failed: cloud embedding space changed; clear the tenant root before starting a new index job", indexFailureDiagnostic{"embedding_space_changed", "remote_index", "reset_root"}},
 		{"cloudflare 502", indexJobStatusFailed, `remote-index 502: {"title":"Error 502: Bad gateway","detail":"origin web server returned an invalid response"}`, indexFailureDiagnostic{"upstream_bad_gateway", "remote_index", "retry_after_service_recovers"}},
 		{"provider billing", indexJobStatusFailed, "embedding provider: insufficient balance", indexFailureDiagnostic{"provider_billing", "provider", "fix_provider_billing"}},
 		{"provider rate limit", indexJobStatusFailed, "remote-index 429: too many requests", indexFailureDiagnostic{"provider_rate_limited", "provider", "retry_later"}},

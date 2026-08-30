@@ -310,6 +310,8 @@ func classifyIndexFailure(status, detail string) indexFailureDiagnostic {
 	switch {
 	case status == indexJobStatusTimedOut || containsAny("heartbeat timed out", "heartbeat timeout"):
 		return indexFailureDiagnostic{"heartbeat_timeout", "relay", "restart_client"}
+	case containsAny("cloud embedding space changed", "embedding space changed", "clear the tenant root before starting a new index job"):
+		return indexFailureDiagnostic{"embedding_space_changed", "remote_index", "reset_root"}
 	case containsAny("remote-index 502", "bad gateway", "cloudflare", "origin web server returned"):
 		return indexFailureDiagnostic{"upstream_bad_gateway", "remote_index", "retry_after_service_recovers"}
 	case containsAny("payment required", "insufficient balance", "insufficient credit", "余额不足", "欠费", "billing", "remote-index 402"):
