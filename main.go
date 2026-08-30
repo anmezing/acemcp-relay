@@ -83,7 +83,7 @@ const (
 	StatusCompleted = "completed"
 
 	LeaderboardUpdateInterval = 30 * time.Minute
-	LeaderboardPath           = "/mcp/tools/call/codebase-retrieval"
+	LeaderboardPathPattern    = "/mcp/tools/call/%"
 	LeaderboardTopN           = 10
 	LeaderboardTimezone       = "Asia/Shanghai"
 
@@ -91,6 +91,18 @@ const (
 	HealthCheckTimeout  = 30 * time.Second
 	maxClientMCPBody    = 32 << 20
 )
+
+const leaderboardAggregationQuery = `
+	SELECT user_id, COUNT(*) as cnt
+	FROM request_logs
+	WHERE request_path LIKE '` + LeaderboardPathPattern + `'
+	  AND request_timestamp >= $1
+	  AND request_timestamp < $2
+	  AND status_code = 200
+	GROUP BY user_id
+	ORDER BY cnt DESC, user_id ASC
+	LIMIT $3
+`
 
 func loadConfig() {
 	_ = godotenv.Load()
@@ -719,13 +731,14 @@ func initDB() error {
 		CREATE INDEX IF NOT EXISTS idx_leaderboard_date ON leaderboard(date_str);
 
 		-- 排行榜直接按上海自然日聚合 request_logs。时间列放在索引首位，
-		-- 并把成功检索条件写入谓词，避免实时刷新时扫描无关 MCP 请求。
+		-- 并把成功 MCP 工具调用条件写入谓词，避免扫描初始化、tools/list 等协议请求。
 		DROP INDEX IF EXISTS idx_request_logs_codebase_retrieval;
 		DROP INDEX IF EXISTS idx_request_logs_codebase_retrieval_v2;
 		DROP INDEX IF EXISTS idx_request_logs_codebase_retrieval_v3;
-		CREATE INDEX IF NOT EXISTS idx_request_logs_codebase_retrieval_v4
+		DROP INDEX IF EXISTS idx_request_logs_codebase_retrieval_v4;
+		CREATE INDEX IF NOT EXISTS idx_request_logs_successful_mcp_tools_v5
 			ON request_logs(request_timestamp, user_id)
-			WHERE request_path = '/mcp/tools/call/codebase-retrieval'
+			WHERE request_path LIKE '/mcp/tools/call/%'
 			  AND status_code = 200;
 	`)
 	if err != nil {
@@ -2435,17 +2448,7 @@ func updateLeaderboard() error {
 
 	log.Printf("[LEADERBOARD] Updating leaderboard for %s", dateStr)
 
-	rows, err := db.Query(`
-		SELECT user_id, COUNT(*) as cnt
-		FROM request_logs
-		WHERE request_path = $1
-		  AND request_timestamp >= $2
-		  AND request_timestamp < $3
-		  AND status_code = 200
-		GROUP BY user_id
-		ORDER BY cnt DESC
-		LIMIT $4
-	`, LeaderboardPath, dayStart, dayEnd, LeaderboardTopN)
+	rows, err := db.Query(leaderboardAggregationQuery, dayStart, dayEnd, LeaderboardTopN)
 	if err != nil {
 		return fmt.Errorf("failed to query leaderboard data: %w", err)
 	}
