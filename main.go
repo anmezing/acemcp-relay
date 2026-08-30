@@ -2477,16 +2477,17 @@ func updateLeaderboard() error {
 		return fmt.Errorf("failed to iterate leaderboard rows: %w", err)
 	}
 
-	if len(results) == 0 {
-		log.Printf("[LEADERBOARD] No data for %s", dateStr)
-		return nil
-	}
-
 	tx, err := db.Begin()
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
 	defer tx.Rollback()
+
+	// Replace the whole day atomically so removed users and an empty result cannot
+	// leave stale rows from a previous aggregation policy or scheduler run.
+	if _, err := tx.Exec(`DELETE FROM leaderboard WHERE date_str = $1`, dateStr); err != nil {
+		return fmt.Errorf("failed to clear leaderboard snapshot: %w", err)
+	}
 
 	datePrefix := now.Format("20060102")
 	for rank, uc := range results {
