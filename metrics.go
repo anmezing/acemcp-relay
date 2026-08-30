@@ -39,7 +39,7 @@ var (
 
 	metricVersionGate = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "relay_client_version_gate_total",
-		Help: "Client version gate outcomes (pass, reject_426, update_hint).",
+		Help: "Client version gate outcomes (pass or reject_426).",
 	}, []string{"result"})
 
 	metricLCEDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
@@ -102,10 +102,14 @@ func metricsHandler() http.Handler {
 // evaluateVersionGate 把版本门禁判定收敛成纯函数：返回 ""（门禁未启用或
 // 客户端未上报版本，不计数）、"pass" 或 "reject_426"。
 func evaluateVersionGate(clientVersion string) string {
-	if minClientVersion == "" || clientVersion == "" {
+	return evaluateVersionGateAgainst(clientVersion, currentMinClientVersion())
+}
+
+func evaluateVersionGateAgainst(clientVersion, minimumVersion string) string {
+	if minimumVersion == "" || clientVersion == "" {
 		return ""
 	}
-	if compareVersions(clientVersion, minClientVersion) < 0 {
+	if compareVersions(clientVersion, minimumVersion) < 0 {
 		return "reject_426"
 	}
 	return "pass"

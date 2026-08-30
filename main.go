@@ -60,7 +60,7 @@ var (
 	debugCapturePaths        map[string]bool
 	debugCaptureMaxBytes     int
 	minClientVersion         string
-	latestClientVersion      string
+	clientVersionPolicyMu    sync.RWMutex
 )
 
 const (
@@ -157,7 +157,6 @@ func loadConfig() {
 	debugCapturePaths = parsePathSet(getEnv("DEBUG_CAPTURE_PATHS", ""))
 	debugCaptureMaxBytes = getEnvInt("DEBUG_CAPTURE_MAX_BYTES", 4096)
 	minClientVersion = strings.TrimSpace(getEnv("MIN_CLIENT_VERSION", ""))
-	latestClientVersion = strings.TrimSpace(getEnv("LATEST_CLIENT_VERSION", ""))
 }
 
 func parsePathSet(value string) map[string]bool {
@@ -220,6 +219,18 @@ func compareVersions(a, b string) int {
 		return -1
 	}
 	return 0
+}
+
+func currentMinClientVersion() string {
+	clientVersionPolicyMu.RLock()
+	defer clientVersionPolicyMu.RUnlock()
+	return minClientVersion
+}
+
+func setMinClientVersion(version string) {
+	clientVersionPolicyMu.Lock()
+	minClientVersion = strings.TrimSpace(version)
+	clientVersionPolicyMu.Unlock()
 }
 
 func previewBytesForLog(data []byte, maxBytes int) string {
@@ -813,6 +824,9 @@ func initDB() error {
 	if err := migrateAccessControlTables(); err != nil {
 		return err
 	}
+	if err := migrateClientVersionPolicy(); err != nil {
+		return fmt.Errorf("failed to migrate client version policy: %w", err)
+	}
 
 	if err := migrateQuotaTables(); err != nil {
 		return err
@@ -1080,18 +1094,19 @@ func authMiddleware() gin.HandlerFunc {
 
 		{
 			clientVersion := strings.TrimSpace(c.GetHeader(clientVersionHeader))
-			gate := evaluateVersionGate(clientVersion)
+			minimumVersion := currentMinClientVersion()
+			gate := evaluateVersionGateAgainst(clientVersion, minimumVersion)
 			recordVersionGate(gate)
 			if gate == "reject_426" {
 				logEvent("client_version_rejected",
 					"user_id", userID,
 					"path", c.Request.URL.Path,
 					"client_version", clientVersion,
-					"min_version", minClientVersion,
+					"min_version", minimumVersion,
 				)
 				c.AbortWithStatusJSON(http.StatusUpgradeRequired, gin.H{
-					"error":       fmt.Sprintf("client version %s is below minimum %s; please update lce-cloud", clientVersion, minClientVersion),
-					"min_version": minClientVersion,
+					"error":       fmt.Sprintf("client version %s is below minimum %s; please update @anmezing/lce-cloud and restart the MCP client", clientVersion, minimumVersion),
+					"min_version": minimumVersion,
 				})
 				return
 			}
@@ -1881,18 +1896,6 @@ func handleMCPGet(c *gin.Context) {
 	completeRequestLogAsync(getRequestLogEntry(c, http.StatusMethodNotAllowed))
 }
 
-func clientUpdateAvailable(c *gin.Context) bool {
-	if latestClientVersion == "" {
-		return false
-	}
-	v := strings.TrimSpace(c.GetHeader(clientVersionHeader))
-	if v != "" && compareVersions(v, latestClientVersion) < 0 {
-		recordVersionGate("update_hint")
-		return true
-	}
-	return false
-}
-
 // requestTenantID 取本请求的租户（org_id ?? user_id）。中间件未设置时（如
 // 单测直接构造 gin.Context）退回 user_id，与组织功能上线前行为一致。
 func requestTenantID(c *gin.Context) string {
@@ -1954,9 +1957,6 @@ func handleMCPToolsCall(c *gin.Context, id json.RawMessage, params json.RawMessa
 			return
 		}
 		indexResult := codebaseIndexEnvelope(true, payload, "")
-		if clientUpdateAvailable(c) {
-			indexResult["_client_update_available"] = true
-		}
 		encoded, err := json.Marshal(indexResult)
 		if err != nil {
 			c.JSON(http.StatusOK, rpcError(id, -32000, "encode index response: "+err.Error()))
@@ -2065,7 +2065,6 @@ func handleMCPToolsCall(c *gin.Context, id json.RawMessage, params json.RawMessa
 			p.Name, len(result.Content), previewBytesForLog(result.Content, debugCaptureMaxBytes))
 	}
 
-	// _client_update_available 与 _index_status 合并注入：同一次 unmarshal/marshal。
 	// _index_status 只注入 codebase-retrieval 的成功 JSON 响应；查询失败只降级为
 	// 不注入（进度可见是 best-effort，不能拖垮检索本身）。
 	var activeJob *activeIndexJob
@@ -2075,7 +2074,7 @@ func handleMCPToolsCall(c *gin.Context, id json.RawMessage, params json.RawMessa
 			activeJob = nil
 		}
 	}
-	contentText := injectRetrievalExtras(result.Content, clientUpdateAvailable(c), activeJob)
+	contentText := injectRetrievalIndexStatus(result.Content, activeJob)
 
 	c.JSON(http.StatusOK, rpcResult(id, map[string]interface{}{
 		"content": []map[string]interface{}{
@@ -2715,6 +2714,8 @@ func main() {
 	// 路由注册在普通 authMiddleware 之前，避免把管理员操作绑定到个人凭据。
 	r.GET("/internal/platform-model-config", handleGetPlatformModelConfig)
 	r.POST("/internal/platform-model-config", handleSavePlatformModelConfig)
+	r.GET("/internal/client-version-policy", handleGetClientVersionPolicy)
+	r.POST("/internal/client-version-policy", handleSaveClientVersionPolicy)
 
 	r.Use(authMiddleware())
 	r.Use(platformModelConfigReadBarrier())

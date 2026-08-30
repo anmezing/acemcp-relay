@@ -168,17 +168,17 @@ func TestCheckIndexStartRateLimitEnforcesPerRootInterval(t *testing.T) {
 }
 
 func TestCheckIndexClientVersionGatesStartArgsLikeHeader(t *testing.T) {
-	previous := minClientVersion
-	t.Cleanup(func() { minClientVersion = previous })
+	previous := currentMinClientVersion()
+	t.Cleanup(func() { setMinClientVersion(previous) })
 
-	minClientVersion = ""
+	setMinClientVersion("")
 	if err := checkIndexClientVersion("0.0.1"); err != nil {
 		t.Fatalf("no minimum configured must not gate, got %v", err)
 	}
 
-	minClientVersion = "1.1.0"
-	if err := checkIndexClientVersion(""); err != nil {
-		t.Fatalf("clients not reporting client_version must stay compatible, got %v", err)
+	setMinClientVersion("1.1.0")
+	if err := checkIndexClientVersion(""); err == nil || !strings.Contains(err.Error(), "client_version is required") {
+		t.Fatalf("clients not reporting client_version must be rejected when a minimum is configured, got %v", err)
 	}
 	if err := checkIndexClientVersion("1.1.0"); err != nil {
 		t.Fatalf("matching version must pass, got %v", err)
@@ -192,9 +192,9 @@ func TestCheckIndexClientVersionGatesStartArgsLikeHeader(t *testing.T) {
 }
 
 func TestHandleCodebaseIndexStartRejectsOutdatedClientVersionArg(t *testing.T) {
-	previous := minClientVersion
-	t.Cleanup(func() { minClientVersion = previous })
-	minClientVersion = "1.1.0"
+	previous := currentMinClientVersion()
+	t.Cleanup(func() { setMinClientVersion(previous) })
+	setMinClientVersion("1.1.0")
 
 	// 版本门禁在文件校验与 DB 访问之前触发，返回工具错误信封所用的 error
 	_, err := handleCodebaseIndex(context.Background(), "tenant-version-gate", map[string]interface{}{
@@ -205,6 +205,21 @@ func TestHandleCodebaseIndexStartRejectsOutdatedClientVersionArg(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "below minimum") {
 		t.Fatalf("start with outdated client_version must fail with upgrade hint, got %v", err)
+	}
+}
+
+func TestHandleCodebaseIndexStartRejectsMissingClientVersionWhenMinimumConfigured(t *testing.T) {
+	previous := currentMinClientVersion()
+	t.Cleanup(func() { setMinClientVersion(previous) })
+	setMinClientVersion("1.1.0")
+
+	_, err := handleCodebaseIndex(context.Background(), "tenant-version-gate", map[string]interface{}{
+		"operation": "start",
+		"root_id":   "root-version-gate",
+		"files":     []interface{}{},
+	})
+	if err == nil || !strings.Contains(err.Error(), "client_version is required") {
+		t.Fatalf("start without client_version must fail when a minimum is configured, got %v", err)
 	}
 }
 

@@ -114,15 +114,12 @@ func TestLoadActiveIndexJobReturnsNilWithoutRunningJob(t *testing.T) {
 	})
 }
 
-func TestInjectRetrievalExtrasAddsIndexStatusAndUpdateFlag(t *testing.T) {
+func TestInjectRetrievalIndexStatusAddsStatus(t *testing.T) {
 	active := &activeIndexJob{RootID: "repo-a", IndexedFiles: 3, TotalFiles: 9, Phase: "indexing"}
-	out := injectRetrievalExtras([]byte(`{"results":[1]}`), true, active)
+	out := injectRetrievalIndexStatus([]byte(`{"results":[1]}`), active)
 	var parsed map[string]interface{}
 	if err := json.Unmarshal([]byte(out), &parsed); err != nil {
 		t.Fatal(err)
-	}
-	if parsed["_client_update_available"] != true {
-		t.Fatal("update flag was not injected")
 	}
 	status, ok := parsed["_index_status"].(map[string]interface{})
 	if !ok {
@@ -140,24 +137,21 @@ func TestInjectRetrievalExtrasAddsIndexStatusAndUpdateFlag(t *testing.T) {
 	}
 }
 
-func TestInjectRetrievalExtrasSkipsNonJSONAndNoOpCases(t *testing.T) {
+func TestInjectRetrievalIndexStatusSkipsNonJSONAndNoOpCases(t *testing.T) {
 	active := &activeIndexJob{RootID: "repo-a"}
 	for _, raw := range []string{"plain text result", `[1,2,3]`, `"scalar"`} {
-		if got := injectRetrievalExtras([]byte(raw), true, active); got != raw {
+		if got := injectRetrievalIndexStatus([]byte(raw), active); got != raw {
 			t.Fatalf("non-object response must pass through unchanged: %q -> %q", raw, got)
 		}
 	}
 	original := `{"results":[]}`
-	if got := injectRetrievalExtras([]byte(original), false, nil); got != original {
+	if got := injectRetrievalIndexStatus([]byte(original), nil); got != original {
 		t.Fatalf("nothing to inject must return original bytes: %q", got)
 	}
-	out := injectRetrievalExtras([]byte(original), false, active)
+	out := injectRetrievalIndexStatus([]byte(original), active)
 	var parsed map[string]interface{}
 	if err := json.Unmarshal([]byte(out), &parsed); err != nil {
 		t.Fatal(err)
-	}
-	if _, exists := parsed["_client_update_available"]; exists {
-		t.Fatal("update flag must not appear when the client is current")
 	}
 	if _, exists := parsed["_index_status"]; !exists {
 		t.Fatal("_index_status missing when a job is running")

@@ -229,15 +229,15 @@ func TestCompareVersionsOrdersNumericSegmentsAndPrereleases(t *testing.T) {
 // TestVersionGateMetrics 挂在 compareVersions 测试旁：验证门禁判定与
 // relay_client_version_gate_total 计数联动。
 func TestVersionGateMetrics(t *testing.T) {
-	previousMin := minClientVersion
-	defer func() { minClientVersion = previousMin }()
+	previousMin := currentMinClientVersion()
+	defer setMinClientVersion(previousMin)
 
-	minClientVersion = ""
+	setMinClientVersion("")
 	if got := evaluateVersionGate("0.0.1"); got != "" {
 		t.Errorf("gate disabled: got %q, want empty", got)
 	}
 
-	minClientVersion = "1.2.0"
+	setMinClientVersion("1.2.0")
 	if got := evaluateVersionGate(""); got != "" {
 		t.Errorf("no client version reported: got %q, want empty", got)
 	}
@@ -253,21 +253,16 @@ func TestVersionGateMetrics(t *testing.T) {
 
 	passBefore := testutil.ToFloat64(metricVersionGate.WithLabelValues("pass"))
 	rejectBefore := testutil.ToFloat64(metricVersionGate.WithLabelValues("reject_426"))
-	hintBefore := testutil.ToFloat64(metricVersionGate.WithLabelValues("update_hint"))
 
 	recordVersionGate(evaluateVersionGate("1.3.0")) // pass
 	recordVersionGate(evaluateVersionGate("1.0.0")) // reject_426
 	recordVersionGate(evaluateVersionGate(""))      // 不计数
-	recordVersionGate("update_hint")
 
 	if got := testutil.ToFloat64(metricVersionGate.WithLabelValues("pass")) - passBefore; got != 1 {
 		t.Errorf("pass counter delta = %v, want 1", got)
 	}
 	if got := testutil.ToFloat64(metricVersionGate.WithLabelValues("reject_426")) - rejectBefore; got != 1 {
 		t.Errorf("reject_426 counter delta = %v, want 1", got)
-	}
-	if got := testutil.ToFloat64(metricVersionGate.WithLabelValues("update_hint")) - hintBefore; got != 1 {
-		t.Errorf("update_hint counter delta = %v, want 1", got)
 	}
 }
 

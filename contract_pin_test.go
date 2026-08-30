@@ -64,7 +64,16 @@ type cloudProtocolContract struct {
 	} `json:"responseEnvelope"`
 	ManifestEntryFields  []string `json:"manifestEntryFields"`
 	ClientRequestHeaders []string `json:"clientRequestHeaders"`
-	PromptEnhancement    struct {
+	ClientCompatibility  struct {
+		Package                                              string `json:"package"`
+		LatestVersionSource                                  string `json:"latestVersionSource"`
+		MinimumVersionSource                                 string `json:"minimumVersionSource"`
+		MinimumVersionAdminConfigurable                      bool   `json:"minimumVersionAdminConfigurable"`
+		IndexStartRequiresClientVersionWhenMinimumConfigured bool   `json:"indexStartRequiresClientVersionWhenMinimumConfigured"`
+		UpgradeCommand                                       string `json:"upgradeCommand"`
+		RestartRequiredAfterUpgrade                          bool   `json:"restartRequiredAfterUpgrade"`
+	} `json:"clientCompatibility"`
+	PromptEnhancement struct {
 		ToolName string `json:"toolName"`
 		Input    struct {
 			RequiredFields      []string `json:"requiredFields"`
@@ -178,8 +187,8 @@ func TestContractPinIndexEstimationLimits(t *testing.T) {
 
 func TestContractPinIndexStartOutcomes(t *testing.T) {
 	contract := loadCloudProtocolContract(t)
-	if contract.SchemaVersion != "1.6" {
-		t.Fatalf("cloud protocol schema version: got %q, want 1.6", contract.SchemaVersion)
+	if contract.SchemaVersion != "1.7" {
+		t.Fatalf("cloud protocol schema version: got %q, want 1.7", contract.SchemaVersion)
 	}
 	outcomes := contract.CodebaseIndex.StartOutcomes
 	if !reflect.DeepEqual(outcomes.Created.RequiredFields, []string{"job"}) ||
@@ -285,6 +294,20 @@ func TestContractPinClientRequestHeaders(t *testing.T) {
 	if !headers["Authorization"] {
 		t.Errorf("contract clientRequestHeaders %v missing Authorization used by relay auth",
 			contract.ClientRequestHeaders)
+	}
+}
+
+func TestContractPinClientCompatibilityPolicy(t *testing.T) {
+	contract := loadCloudProtocolContract(t)
+	policy := contract.ClientCompatibility
+	if policy.Package != cloudClientPackageName ||
+		policy.LatestVersionSource != "npm_dist_tag_latest" ||
+		policy.MinimumVersionSource != "relay_persistent_runtime_policy_with_env_bootstrap" ||
+		!policy.MinimumVersionAdminConfigurable ||
+		!policy.IndexStartRequiresClientVersionWhenMinimumConfigured ||
+		policy.UpgradeCommand != "npm install -g @anmezing/lce-cloud@latest" ||
+		!policy.RestartRequiredAfterUpgrade {
+		t.Fatalf("client compatibility policy drifted: %+v", policy)
 	}
 }
 

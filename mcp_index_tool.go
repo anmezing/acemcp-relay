@@ -70,15 +70,20 @@ func checkIndexStartRateLimit(userID, rootID string, now time.Time) int {
 	return 0
 }
 
-// checkIndexClientVersion 用与 X-LCE-Client-Version 头相同的 MIN_CLIENT_VERSION
-// 逻辑门禁经 start args 上报的版本。空版本不拒绝：不上报该字段的老客户端兼容。
+// checkIndexClientVersion 用最低安全版本门禁 start args 上报的客户端版本。
+// 一旦管理员配置最低版本，缺少 client_version 的旧客户端也必须拒绝；否则旧版
+// 可以绕过版本门禁并继续触发已修复的重复索引/供应商消耗问题。
 func checkIndexClientVersion(clientVersion string) error {
 	clientVersion = strings.TrimSpace(clientVersion)
-	if clientVersion == "" || minClientVersion == "" {
+	minimumVersion := currentMinClientVersion()
+	if minimumVersion == "" {
 		return nil
 	}
-	if compareVersions(clientVersion, minClientVersion) < 0 {
-		return fmt.Errorf("client version %s is below minimum %s; please update lce-cloud", clientVersion, minClientVersion)
+	if clientVersion == "" {
+		return fmt.Errorf("client_version is required; minimum supported version is %s; update @anmezing/lce-cloud and restart the MCP client", minimumVersion)
+	}
+	if compareVersions(clientVersion, minimumVersion) < 0 {
+		return fmt.Errorf("client version %s is below minimum %s; update @anmezing/lce-cloud and restart the MCP client", clientVersion, minimumVersion)
 	}
 	return nil
 }

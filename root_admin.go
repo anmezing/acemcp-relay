@@ -61,23 +61,17 @@ func (j *activeIndexJob) activeJobPayload() map[string]interface{} {
 	}
 }
 
-// injectRetrievalExtras 在一次 unmarshal/marshal 里把 _client_update_available
-// 与 _index_status 注入 JSON 对象顶层。响应不是 JSON 对象、或没有要注入的
-// 字段时原样返回。
-func injectRetrievalExtras(content []byte, updateAvailable bool, active *activeIndexJob) string {
-	if !updateAvailable && active == nil {
+// injectRetrievalIndexStatus 把 _index_status 注入 JSON 对象顶层。响应不是
+// JSON 对象、或没有运行中的索引任务时原样返回。
+func injectRetrievalIndexStatus(content []byte, active *activeIndexJob) string {
+	if active == nil {
 		return string(content)
 	}
 	var parsed map[string]interface{}
 	if json.Unmarshal(content, &parsed) != nil || parsed == nil {
 		return string(content)
 	}
-	if updateAvailable {
-		parsed["_client_update_available"] = true
-	}
-	if active != nil {
-		parsed["_index_status"] = active.indexStatusPayload()
-	}
+	parsed["_index_status"] = active.indexStatusPayload()
 	reEncoded, err := json.Marshal(parsed)
 	if err != nil {
 		return string(content)

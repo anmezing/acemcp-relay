@@ -46,6 +46,7 @@ func isTrustedConsoleRequest(c *gin.Context) bool {
 	method := c.Request.Method
 	allowed := (method == http.MethodGet && path == "/mcp/tenant-stats") ||
 		(method == http.MethodPost && path == "/mcp/clear-index") ||
+		((method == http.MethodGet || method == http.MethodPost) && path == "/internal/client-version-policy") ||
 		((method == http.MethodGet || method == http.MethodPost) && path == "/internal/platform-model-config")
 	if !allowed {
 		return false
