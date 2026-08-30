@@ -83,7 +83,8 @@ const (
 	StatusCompleted = "completed"
 
 	LeaderboardUpdateInterval = 30 * time.Minute
-	LeaderboardPathPattern    = "/mcp/tools/call/%"
+	LeaderboardRetrievalPath  = "/mcp/tools/call/codebase-retrieval"
+	LeaderboardEnhancePath    = "/mcp/tools/call/codebase_enhance_prompt"
 	LeaderboardTopN           = 10
 	LeaderboardTimezone       = "Asia/Shanghai"
 
@@ -95,7 +96,10 @@ const (
 const leaderboardAggregationQuery = `
 	SELECT user_id, COUNT(*) as cnt
 	FROM request_logs
-	WHERE request_path LIKE '` + LeaderboardPathPattern + `'
+	WHERE request_path IN (
+		'` + LeaderboardRetrievalPath + `',
+		'` + LeaderboardEnhancePath + `'
+	)
 	  AND request_timestamp >= $1
 	  AND request_timestamp < $2
 	  AND status_code = 200
@@ -731,15 +735,18 @@ func initDB() error {
 		CREATE INDEX IF NOT EXISTS idx_leaderboard_date ON leaderboard(date_str);
 
 		-- 排行榜直接按上海自然日聚合 request_logs。时间列放在索引首位，
-		-- 并把成功 MCP 工具调用条件写入谓词，避免扫描初始化、tools/list 等协议请求。
+		-- 只统计实际检索和提示词增强调用；索引、索引状态、符号图和协议请求不计入。
 		DROP INDEX IF EXISTS idx_request_logs_codebase_retrieval;
 		DROP INDEX IF EXISTS idx_request_logs_codebase_retrieval_v2;
 		DROP INDEX IF EXISTS idx_request_logs_codebase_retrieval_v3;
 		DROP INDEX IF EXISTS idx_request_logs_codebase_retrieval_v4;
-		CREATE INDEX IF NOT EXISTS idx_request_logs_successful_mcp_tools_v5
+		DROP INDEX IF EXISTS idx_request_logs_successful_mcp_tools_v5;
+		CREATE INDEX IF NOT EXISTS idx_request_logs_leaderboard_tools_v6
 			ON request_logs(request_timestamp, user_id)
-			WHERE request_path LIKE '/mcp/tools/call/%'
-			  AND status_code = 200;
+			WHERE request_path IN (
+				'/mcp/tools/call/codebase-retrieval',
+				'/mcp/tools/call/codebase_enhance_prompt'
+			) AND status_code = 200;
 	`)
 	if err != nil {
 		return fmt.Errorf("failed to migrate leaderboard table: %w", err)

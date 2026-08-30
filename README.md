@@ -11,7 +11,7 @@ LCE 的多租户远程 MCP 服务。IDE Agent 只需配置一个 Streamable HTTP
 - **请求日志**：自动记录每个请求的状态、耗时、来源 IP 等信息到 PostgreSQL
 - **错误追踪**：异步记录代理层和上游服务的错误详情
 - **任务回收**：索引任务完成或失败后删除暂存文件；运行任务心跳超时后自动标记并回收
-- **使用排行榜**：定时统计成功的 LCE MCP 工具调用量（每 30 分钟更新，不含初始化、`tools/list` 等协议请求）
+- **使用排行榜**：定时统计成功的 `codebase-retrieval` 与 `codebase_enhance_prompt` 调用量（每 30 分钟更新，不含索引、符号图和协议请求）
 - **健康检查**：每 2 分钟调用 LCE MCP `tools/list`，将可用性和延迟写入 `health_checks`
 - **请求/响应压缩**：对上游请求体使用 zstd 压缩（`SpeedFastest` 等级，小于 1024 字节的 payload 跳过压缩）；响应按客户端 `Accept-Encoding` 协商编码（`br` / `gzip` / `deflate` / `identity`，brotli 等级 4），压缩失败时回退到 identity
 - **性能观测**：内置 pprof 服务（仅监听 `127.0.0.1:6060`），用于运行时 CPU / 内存 profiling
@@ -162,7 +162,7 @@ Relay 的进程内认证缓存最多保留 30 秒；客户端身份只由 API Ke
 
 - **`request_logs`**：请求日志，记录每个请求的用户、路径、状态码、耗时等；日志 INSERT 为异步写入（channel 协调，确保后续 UPDATE / 外键操作等待 INSERT 完成），并在 `(user_id, request_timestamp)` 上建有复合索引
 - **`error_details`**：错误详情，关联到 request_logs，区分代理层（proxy）和上游（upstream）错误
-- **`leaderboard`**：每日用户成功 MCP 工具调用量排行榜快照
+- **`leaderboard`**：每日用户代码检索与提示词增强调用量排行榜快照
 - **`health_checks`**：LCE MCP 健康检查历史，记录状态、延迟、错误信息及下次检查时间
 - **`index_workspaces`**：用户工作区最近一次完成索引的分支、代码 revision、LCE cloud revision 和时间
 - **`index_jobs`**：索引任务状态、固定 `root_id`、阶段、文件/chunk 进度、心跳和错误；完成状态只在符号图收敛成功后提交
