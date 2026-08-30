@@ -30,14 +30,19 @@ func withMockDB(t *testing.T, fn func(mock sqlmock.Sqlmock)) {
 		t.Fatalf("sqlmock.New: %v", err)
 	}
 	previousDB := db
-	previousAcquire := acquireDeleteRootOperation
+	previousAcquireDelete := acquireDeleteRootOperation
+	previousAcquireDismiss := acquireDismissRootFailureOperation
 	db = mockDB
 	acquireDeleteRootOperation = func(ctx context.Context, tenantID string) (deleteRootOperationLease, error) {
 		return noopDeleteRootLease{ctx: ctx}, nil
 	}
+	acquireDismissRootFailureOperation = func(ctx context.Context, tenantID string) (deleteRootOperationLease, error) {
+		return noopDeleteRootLease{ctx: ctx}, nil
+	}
 	defer func() {
 		db = previousDB
-		acquireDeleteRootOperation = previousAcquire
+		acquireDeleteRootOperation = previousAcquireDelete
+		acquireDismissRootFailureOperation = previousAcquireDismiss
 		mockDB.Close()
 	}()
 	fn(mock)
@@ -250,8 +255,9 @@ func TestLoadIndexRootsMergesLatestProgressAndKeepsUnpublishedFailuresVisible(t 
 			t.Fatalf("running progress not merged into published root: %+v", roots[0])
 		}
 		if roots[1].IndexedAt != "" || roots[1].IndexAvailable || roots[1].IndexState != "failed" ||
-			roots[1].IndexError != "manifest rejected" || roots[1].BaseRootID != "repo-b" ||
-			roots[1].ViewBranch != "feature" || roots[1].SyncRevision != "broken" {
+			roots[1].IndexError != "manifest rejected" || roots[1].IndexErrorCode != "index_failed" ||
+			roots[1].IndexErrorOrigin != "unknown" || roots[1].IndexRecovery != "inspect_logs" ||
+			roots[1].BaseRootID != "repo-b" || roots[1].ViewBranch != "feature" || roots[1].SyncRevision != "broken" {
 			t.Fatalf("unpublished failed root must remain visible: %+v", roots[1])
 		}
 	})
@@ -283,6 +289,34 @@ func TestLoadIndexRootsDoesNotResurrectDeletedCompletedOrSupersededJobs(t *testi
 			t.Fatalf("historical terminal jobs must not resurrect deleted roots: %+v", roots)
 		}
 	})
+}
+
+func TestClassifyIndexFailure(t *testing.T) {
+	cases := []struct {
+		name     string
+		status   string
+		detail   string
+		expected indexFailureDiagnostic
+	}{
+		{"heartbeat", indexJobStatusTimedOut, "index job heartbeat timed out", indexFailureDiagnostic{"heartbeat_timeout", "relay", "restart_client"}},
+		{"cloudflare 502", indexJobStatusFailed, `remote-index 502: {"title":"Error 502: Bad gateway","detail":"origin web server returned an invalid response"}`, indexFailureDiagnostic{"upstream_bad_gateway", "remote_index", "retry_after_service_recovers"}},
+		{"provider billing", indexJobStatusFailed, "embedding provider: insufficient balance", indexFailureDiagnostic{"provider_billing", "provider", "fix_provider_billing"}},
+		{"provider rate limit", indexJobStatusFailed, "remote-index 429: too many requests", indexFailureDiagnostic{"provider_rate_limited", "provider", "retry_later"}},
+		{"file count", indexJobStatusFailed, "manifest exceeds 100000 files", indexFailureDiagnostic{"repository_file_limit", "client", "reduce_repository"}},
+		{"file size", indexJobStatusFailed, "file exceeds the 524288 byte limit: generated/data.json", indexFailureDiagnostic{"repository_file_size_limit", "client", "reduce_repository"}},
+		{"manifest file size", indexJobStatusFailed, "manifest file size is invalid: generated/data.json", indexFailureDiagnostic{"repository_file_size_limit", "client", "reduce_repository"}},
+		{"quota", indexJobStatusFailed, "index quota exceeded", indexFailureDiagnostic{"index_quota_exceeded", "relay", "wait_for_quota_reset"}},
+		{"credentials", indexJobStatusFailed, "remote-index 401: invalid api key", indexFailureDiagnostic{"provider_authentication", "provider", "fix_credentials"}},
+		{"network", indexJobStatusFailed, "dial tcp: connection refused", indexFailureDiagnostic{"network_unavailable", "network", "restart_client"}},
+		{"unknown", indexJobStatusFailed, "manifest rejected", indexFailureDiagnostic{"index_failed", "unknown", "inspect_logs"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := classifyIndexFailure(tc.status, tc.detail); got != tc.expected {
+				t.Fatalf("classifyIndexFailure(%q, %q) = %+v, want %+v", tc.status, tc.detail, got, tc.expected)
+			}
+		})
+	}
 }
 
 func TestSplitRootIDViewDerivation(t *testing.T) {
@@ -327,6 +361,68 @@ func TestHandleListRootsReturnsEmptyArrayNotNull(t *testing.T) {
 		handleListRoots(c)
 		if recorder.Code != 200 || !strings.Contains(recorder.Body.String(), `"roots":[]`) {
 			t.Fatalf("expected empty roots array, got %d %s", recorder.Code, recorder.Body.String())
+		}
+	})
+}
+
+// ── POST /mcp/dismiss-root-failure ─────────────────────────────────────────
+
+func expectDismissRootFailureTx(mock sqlmock.Sqlmock, userID, rootID string, dismissed int64) {
+	mock.ExpectBegin()
+	mock.ExpectExec("pg_advisory_xact_lock").
+		WithArgs(userID).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec("DELETE FROM index_jobs").
+		WithArgs(userID, rootID, indexJobStatusFailed, indexJobStatusTimedOut).
+		WillReturnResult(sqlmock.NewResult(0, dismissed))
+	mock.ExpectCommit()
+}
+
+func TestHandleDismissRootFailurePreservesPublishedIndexState(t *testing.T) {
+	withMockDB(t, func(mock sqlmock.Sqlmock) {
+		mock.ExpectQuery("SELECT EXISTS").
+			WithArgs("user-1", "repo-a").
+			WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
+		expectDismissRootFailureTx(mock, "user-1", "repo-a", 2)
+
+		c, recorder := newRootAdminContext(t, "user-1", "POST", `{"root_id":"repo-a"}`)
+		handleDismissRootFailure(c)
+		if recorder.Code != 200 {
+			t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+		}
+		if !strings.Contains(recorder.Body.String(), `"dismissed_jobs":2`) {
+			t.Fatalf("unexpected response: %s", recorder.Body.String())
+		}
+		// sqlmock 未配置 indexed_files/index_workspaces DELETE；若实现误删已发布快照，
+		// ExpectationsWereMet 会失败。
+	})
+}
+
+func TestHandleDismissRootFailureIsIdempotent(t *testing.T) {
+	withMockDB(t, func(mock sqlmock.Sqlmock) {
+		mock.ExpectQuery("SELECT EXISTS").
+			WithArgs("user-1", "repo-a").
+			WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
+		expectDismissRootFailureTx(mock, "user-1", "repo-a", 0)
+
+		c, recorder := newRootAdminContext(t, "user-1", "POST", `{"root_id":"repo-a"}`)
+		handleDismissRootFailure(c)
+		if recorder.Code != 200 || !strings.Contains(recorder.Body.String(), `"dismissed":true`) {
+			t.Fatalf("idempotent dismiss should succeed, got %d %s", recorder.Code, recorder.Body.String())
+		}
+	})
+}
+
+func TestHandleDismissRootFailureConflictsWithRunningJob(t *testing.T) {
+	withMockDB(t, func(mock sqlmock.Sqlmock) {
+		mock.ExpectQuery("SELECT EXISTS").
+			WithArgs("user-1", "repo-a").
+			WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
+
+		c, recorder := newRootAdminContext(t, "user-1", "POST", `{"root_id":"repo-a"}`)
+		handleDismissRootFailure(c)
+		if recorder.Code != 409 {
+			t.Fatalf("status = %d, want 409, body = %s", recorder.Code, recorder.Body.String())
 		}
 	})
 }
@@ -483,7 +579,7 @@ func expectDeleteRootTx(mock sqlmock.Sqlmock, userID, rootID string, deletedFile
 	mock.ExpectExec("pg_advisory_xact_lock").
 		WithArgs(userID).
 		WillReturnResult(sqlmock.NewResult(0, 0))
-	mock.ExpectExec("DELETE FROM index_jobs AS jobs").
+	mock.ExpectExec("DELETE FROM index_jobs").
 		WithArgs(userID, rootID).
 		WillReturnResult(sqlmock.NewResult(0, 2))
 	mock.ExpectExec("DELETE FROM indexed_files AS files").

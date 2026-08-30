@@ -2728,6 +2728,7 @@ func main() {
 	r.POST("/mcp/clear-index", handleClearIndex)
 	r.GET("/mcp/tenant-stats", handleTenantStats)
 	r.GET("/mcp/roots", handleListRoots)
+	r.POST("/mcp/dismiss-root-failure", handleDismissRootFailure)
 	r.POST("/mcp/delete-root", handleDeleteRoot)
 
 	r.NoRoute(func(c *gin.Context) {

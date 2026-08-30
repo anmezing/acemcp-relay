@@ -1406,17 +1406,16 @@ func clearUserIndexState(ctx context.Context, userID string) error {
 	return tx.Commit()
 }
 
-// clearRootIndexStateTx 删除该 root 对应 workspace 的所有 relay 侧行，
-// 返回 indexed_files 的删除行数（供 delete-root 上报 deleted_files）。
+// clearRootIndexStateTx 删除该 root 的所有 relay 侧行，返回 indexed_files 的删除
+// 行数（供 delete-root 上报 deleted_files）。index_jobs 必须直接按 jobs.root_id
+// 匹配：首次索引失败时还没有 index_workspaces 行，若通过 workspace JOIN 删除会
+// 留下无法从控制台清掉的失败任务。
 func clearRootIndexStateTx(ctx context.Context, tx *sql.Tx, userID, rootID string) (int64, error) {
 	normalizedRootID := lceIndexRootID(rootID)
 	statements := []string{
-		`DELETE FROM index_jobs AS jobs
-		 USING index_workspaces AS workspaces
-		 WHERE jobs.user_id = $1
-		   AND jobs.workspace_id = workspaces.workspace_id
-		   AND workspaces.user_id = $1
-		   AND CASE WHEN BTRIM(workspaces.root_id) = '' THEN 'default' ELSE BTRIM(workspaces.root_id) END = $2`,
+		`DELETE FROM index_jobs
+		 WHERE user_id = $1
+		   AND CASE WHEN BTRIM(root_id) = '' THEN 'default' ELSE BTRIM(root_id) END = $2`,
 		`DELETE FROM indexed_files AS files
 		 USING index_workspaces AS workspaces
 		 WHERE files.user_id = $1

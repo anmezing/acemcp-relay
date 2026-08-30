@@ -98,13 +98,16 @@ type indexRootView struct {
 	// index_state/index_phase 是该根最近一次索引任务的状态快照。它来自
 	// index_jobs，而不是仅依据 index_workspaces 推断，因此“索引中”和“失败”
 	// 即使尚未发布新版本也能被控制台和 Agent 看到。
-	IndexState      string `json:"index_state"`
-	IndexPhase      string `json:"index_phase,omitempty"`
-	IndexedFiles    int    `json:"indexed_files"`
-	TotalFiles      int    `json:"total_files"`
-	FailedFiles     int    `json:"failed_files"`
-	ProgressPercent int    `json:"progress_percent"`
-	IndexError      string `json:"index_error,omitempty"`
+	IndexState       string `json:"index_state"`
+	IndexPhase       string `json:"index_phase,omitempty"`
+	IndexedFiles     int    `json:"indexed_files"`
+	TotalFiles       int    `json:"total_files"`
+	FailedFiles      int    `json:"failed_files"`
+	ProgressPercent  int    `json:"progress_percent"`
+	IndexError       string `json:"index_error,omitempty"`
+	IndexErrorCode   string `json:"index_error_code,omitempty"`
+	IndexErrorOrigin string `json:"index_error_origin,omitempty"`
+	IndexRecovery    string `json:"index_recovery,omitempty"`
 	// base_root_id / view_branch 是纯派生字段（分组展示用），由 root_id 按最后
 	// 一个 '@' 拆分得到；无 '@' 时 base=root_id、view_branch="default"。
 	// 既有 branch 字段继续携带 start 上报的 Git 分支元数据，语义不变。
@@ -193,7 +196,7 @@ func loadIndexRoots(ctx context.Context, userID string) ([]indexRootView, error)
 				continue
 			}
 			base, viewBranch := splitRootIDView(job.RootID)
-			roots = append(roots, indexRootView{
+			root := indexRootView{
 				WorkspaceID:       job.WorkspaceID,
 				RootID:            job.RootID,
 				Branch:            job.Branch,
@@ -208,7 +211,9 @@ func loadIndexRoots(ctx context.Context, userID string) ([]indexRootView, error)
 				IndexError:        job.Error,
 				BaseRootID:        base,
 				ViewBranch:        viewBranch,
-			})
+			}
+			applyIndexFailureDiagnostic(&root, job.Status, job.Error)
+			roots = append(roots, root)
 			continue
 		}
 		applyIndexJobToRoot(&roots[index], job)
@@ -283,6 +288,59 @@ func indexProgressPercent(indexed, total int, status string) int {
 	return percent
 }
 
+type indexFailureDiagnostic struct {
+	Code     string
+	Origin   string
+	Recovery string
+}
+
+// classifyIndexFailure 把原始错误归为稳定、可国际化的诊断代码。原始错误仍通过
+// index_error 返回用于排障；控制台不再需要解析 Cloudflare JSON 或供应商文案。
+func classifyIndexFailure(status, detail string) indexFailureDiagnostic {
+	lower := strings.ToLower(strings.TrimSpace(detail))
+	containsAny := func(values ...string) bool {
+		for _, value := range values {
+			if strings.Contains(lower, value) {
+				return true
+			}
+		}
+		return false
+	}
+
+	switch {
+	case status == indexJobStatusTimedOut || containsAny("heartbeat timed out", "heartbeat timeout"):
+		return indexFailureDiagnostic{"heartbeat_timeout", "relay", "restart_client"}
+	case containsAny("remote-index 502", "bad gateway", "cloudflare", "origin web server returned"):
+		return indexFailureDiagnostic{"upstream_bad_gateway", "remote_index", "retry_after_service_recovers"}
+	case containsAny("payment required", "insufficient balance", "insufficient credit", "余额不足", "欠费", "billing", "remote-index 402"):
+		return indexFailureDiagnostic{"provider_billing", "provider", "fix_provider_billing"}
+	case containsAny("too many requests", "rate limit", "rate-limit", "remote-index 429"):
+		return indexFailureDiagnostic{"provider_rate_limited", "provider", "retry_later"}
+	case containsAny("manifest exceeds", "unreadable file list exceeds", "too many files", "file count limit", "maximum file count", "100,000 files", "100000 files", "文件数量", "文件数超过"):
+		return indexFailureDiagnostic{"repository_file_limit", "client", "reduce_repository"}
+	case containsAny("manifest file size is invalid", "file exceeds the", "byte limit", "file too large", "file size limit", "maximum file size", "512 kib", "524288", "文件大小超过", "单文件过大"):
+		return indexFailureDiagnostic{"repository_file_size_limit", "client", "reduce_repository"}
+	case containsAny("quota exceeded", "quota exhausted", "配额不足", "配额已用尽", "超出配额"):
+		return indexFailureDiagnostic{"index_quota_exceeded", "relay", "wait_for_quota_reset"}
+	case containsAny("unauthorized", "invalid api key", "invalid token", "authentication failed", "remote-index 401", "remote-index 403"):
+		return indexFailureDiagnostic{"provider_authentication", "provider", "fix_credentials"}
+	case containsAny("connection refused", "connection reset", "network is unreachable", "no such host", "i/o timeout", "context deadline exceeded", "unexpected eof", "socket hang up"):
+		return indexFailureDiagnostic{"network_unavailable", "network", "restart_client"}
+	default:
+		return indexFailureDiagnostic{"index_failed", "unknown", "inspect_logs"}
+	}
+}
+
+func applyIndexFailureDiagnostic(root *indexRootView, status, detail string) {
+	if status != indexJobStatusFailed && status != indexJobStatusTimedOut {
+		return
+	}
+	diagnostic := classifyIndexFailure(status, detail)
+	root.IndexErrorCode = diagnostic.Code
+	root.IndexErrorOrigin = diagnostic.Origin
+	root.IndexRecovery = diagnostic.Recovery
+}
+
 func applyIndexJobToRoot(root *indexRootView, job latestIndexJobView) {
 	root.IndexState = indexJobViewState(job.Status)
 	root.IndexPhase = job.Phase
@@ -291,6 +349,7 @@ func applyIndexJobToRoot(root *indexRootView, job latestIndexJobView) {
 	root.FailedFiles = job.FailedFiles
 	root.ProgressPercent = indexProgressPercent(job.IndexedFiles, job.TotalFiles, job.Status)
 	root.IndexError = job.Error
+	applyIndexFailureDiagnostic(root, job.Status, job.Error)
 	root.SyncRevision = job.Revision
 	root.SyncCloudRevision = job.CloudRevision
 	if job.Branch != "" {
@@ -351,24 +410,32 @@ func checkDeleteRootRateLimit(tenantID, rootID string, now time.Time) int {
 	return 0
 }
 
-// rejectNonOwnerIndexDeletion 对组织密钥的删除类操作做角色门禁：
-// 只有 org_role='owner' 可以删除组织共享索引；member（或角色缺失/脏值，
+// rejectNonOwnerIndexManagement 对组织密钥的索引管理操作做角色门禁：
+// 只有 org_role='owner' 可以修改组织共享索引状态；member（或角色缺失/脏值，
 // fail-closed）一律 403。个人密钥（org_id 空）不受影响。
 // 返回 true 表示已写出 403 响应，调用方直接 return。
-func rejectNonOwnerIndexDeletion(c *gin.Context) bool {
+func rejectNonOwnerIndexManagement(c *gin.Context, event, message string) bool {
 	orgID := c.GetString(ContextKeyOrgID)
 	if orgID == "" || c.GetString(ContextKeyOrgRole) == orgRoleOwner {
 		return false
 	}
-	logEvent("org_delete_forbidden",
+	logEvent(event,
 		"user_id", c.GetString(ContextKeyUserID),
 		"tenant", orgID,
 		"role", c.GetString(ContextKeyOrgRole),
 		"path", c.Request.URL.Path,
 	)
-	c.JSON(http.StatusForbidden, gin.H{"error": "仅组织所有者可删除索引"})
+	c.JSON(http.StatusForbidden, gin.H{"error": message})
 	completeRequestLogAsync(getRequestLogEntry(c, http.StatusForbidden))
 	return true
+}
+
+func rejectNonOwnerIndexDeletion(c *gin.Context) bool {
+	return rejectNonOwnerIndexManagement(c, "org_delete_forbidden", "仅组织所有者可删除索引")
+}
+
+func rejectNonOwnerFailureDismissal(c *gin.Context) bool {
+	return rejectNonOwnerIndexManagement(c, "org_dismiss_failure_forbidden", "仅组织所有者可清理索引失败记录")
 }
 
 // hasRunningJobForRoot 判断该用户是否有对应此 root 的 running 任务。
@@ -400,6 +467,10 @@ type deleteRootOperationLease interface {
 
 var acquireDeleteRootOperation = func(ctx context.Context, tenantID string) (deleteRootOperationLease, error) {
 	return acquireExclusiveIndexOperation(ctx, tenantID, "delete-root")
+}
+
+var acquireDismissRootFailureOperation = func(ctx context.Context, tenantID string) (deleteRootOperationLease, error) {
+	return acquireExclusiveIndexOperation(ctx, tenantID, "dismiss-root-failure")
 }
 
 // extractLCEDeletedFiles 尽力从 LCE clear 响应里取删除文件数。LCE 代码不在本仓库，
@@ -449,6 +520,83 @@ func deleteRootIndexState(ctx context.Context, userID, rootID string) (int64, er
 		return 0, err
 	}
 	return deletedFiles, tx.Commit()
+}
+
+// dismissRootFailureState 只清理该 root 的失败/超时任务和级联的暂存文件，保留
+// 已发布 workspace、indexed_files 与 LCE 云端快照。这样“更新失败但旧索引可用”
+// 的场景可以隐藏失败记录，而不会误删仍可检索的数据。
+func dismissRootFailureState(ctx context.Context, userID, rootID string) (int64, error) {
+	tx, err := beginLockedIndexUserTx(ctx, userID)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `
+		DELETE FROM index_jobs
+		WHERE user_id = $1
+		  AND CASE WHEN BTRIM(root_id) = '' THEN 'default' ELSE BTRIM(root_id) END = $2
+		  AND status IN ($3, $4)
+	`, userID, lceIndexRootID(rootID), indexJobStatusFailed, indexJobStatusTimedOut)
+	if err != nil {
+		return 0, err
+	}
+	dismissed, _ := result.RowsAffected()
+	return dismissed, tx.Commit()
+}
+
+func handleDismissRootFailure(c *gin.Context) {
+	userID := c.GetString(ContextKeyUserID)
+	if userID == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+		completeRequestLogAsync(getRequestLogEntry(c, http.StatusUnauthorized))
+		return
+	}
+	tenantID := requestTenantID(c)
+
+	var req struct {
+		RootID string `json:"root_id"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || strings.TrimSpace(req.RootID) == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "root_id is required"})
+		completeRequestLogAsync(getRequestLogEntry(c, http.StatusBadRequest))
+		return
+	}
+	rootID := normalizeIndexRootID(req.RootID)
+
+	if rejectNonOwnerFailureDismissal(c) {
+		return
+	}
+
+	lease, err := acquireDismissRootFailureOperation(c.Request.Context(), tenantID)
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "索引正在执行其他操作: " + err.Error()})
+		completeRequestLogAsync(getRequestLogEntry(c, http.StatusServiceUnavailable))
+		return
+	}
+	defer lease.Release()
+	opCtx := lease.Context()
+
+	running, err := hasRunningJobForRoot(opCtx, tenantID, rootID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "检查运行中任务失败: " + err.Error()})
+		completeRequestLogAsync(getRequestLogEntry(c, http.StatusInternalServerError))
+		return
+	}
+	if running {
+		c.JSON(http.StatusConflict, gin.H{"error": "该 root 有正在运行的索引任务，请等待其结束后再清理失败记录"})
+		completeRequestLogAsync(getRequestLogEntry(c, http.StatusConflict))
+		return
+	}
+
+	dismissed, err := dismissRootFailureState(opCtx, tenantID, rootID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "清理索引失败记录失败: " + err.Error()})
+		completeRequestLogAsync(getRequestLogEntry(c, http.StatusInternalServerError))
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"dismissed": true, "dismissed_jobs": dismissed})
+	completeRequestLogAsync(getRequestLogEntry(c, http.StatusOK))
+	log.Printf("[DISMISS_ROOT_FAILURE] user=%s tenant=%s root=%s dismissed_jobs=%d", userID, tenantID, rootID, dismissed)
 }
 
 func handleDeleteRoot(c *gin.Context) {

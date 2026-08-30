@@ -351,6 +351,35 @@ func TestHandleDeleteRootOrgMemberForbidden(t *testing.T) {
 	})
 }
 
+func TestHandleDismissRootFailureOrgMemberForbidden(t *testing.T) {
+	withMockDB(t, func(mock sqlmock.Sqlmock) {
+		// owner 门禁必须发生在运行中任务查询和任何 DELETE 之前。
+		c, recorder := newOrgContext(t, "member-1", "org-1", "member", "POST", `{"root_id":"repo-a"}`)
+		handleDismissRootFailure(c)
+		if recorder.Code != 403 {
+			t.Fatalf("status = %d, want 403, body = %s", recorder.Code, recorder.Body.String())
+		}
+		if !strings.Contains(recorder.Body.String(), "仅组织所有者可清理索引失败记录") {
+			t.Fatalf("403 body must explain the cleanup permission: %s", recorder.Body.String())
+		}
+	})
+}
+
+func TestHandleDismissRootFailureOrgOwnerUsesOrgTenant(t *testing.T) {
+	withMockDB(t, func(mock sqlmock.Sqlmock) {
+		mock.ExpectQuery("SELECT EXISTS").
+			WithArgs("org-1", "repo-a").
+			WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
+		expectDismissRootFailureTx(mock, "org-1", "repo-a", 1)
+
+		c, recorder := newOrgContext(t, "owner-1", "org-1", "owner", "POST", `{"root_id":"repo-a"}`)
+		handleDismissRootFailure(c)
+		if recorder.Code != 200 || !strings.Contains(recorder.Body.String(), `"dismissed_jobs":1`) {
+			t.Fatalf("unexpected response: %d %s", recorder.Code, recorder.Body.String())
+		}
+	})
+}
+
 func TestHandleDeleteRootOrgUnknownRoleFailsClosed(t *testing.T) {
 	resetDeleteRootRateLimit()
 	withMockDB(t, func(mock sqlmock.Sqlmock) {

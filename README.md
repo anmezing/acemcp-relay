@@ -24,7 +24,10 @@ LCE 的多租户远程 MCP 服务。IDE Agent 只需配置一个 Streamable HTTP
 | `DELETE /mcp` | 关闭当前 MCP session |
 | `GET /mcp` | 返回 405；服务不提供 SSE 推流 |
 | `GET /mcp/tenant-stats` | 网页控制台内部索引统计接口；要求控制台内部凭据 |
-| `POST /mcp/clear-index` | 网页控制台内部清理接口；要求控制台内部凭据及冷却校验 |
+| `GET /mcp/roots` | 网页控制台内部 root/分支索引状态接口；返回已发布快照、最近任务进度及结构化失败诊断 |
+| `POST /mcp/dismiss-root-failure` | 清理指定 root 的 `failed` / `timed_out` 任务记录；保留已发布云端快照，仅组织 owner 可操作组织索引 |
+| `POST /mcp/delete-root` | 删除指定 root 的 LCE 已发布快照和 Relay 状态；首次索引失败且尚无 workspace 的任务也可完整清理 |
+| `POST /mcp/clear-index` | 网页控制台内部全量清理接口；要求控制台内部凭据及冷却校验 |
 
 索引和检索均只走 MCP；不保留插件专用的 `/relay/*` REST 数据面，也不提供旧 Augment `/find-missing`、`/batch-upload`、`/checkpoint-blobs` 协议。
 
@@ -41,6 +44,8 @@ LCE 的多租户远程 MCP 服务。IDE Agent 只需配置一个 Streamable HTTP
 `codebase_tenant_stats` 是网页控制台的内部统计接口，不会出现在远程 MCP 的 `tools/list` 中。
 
 `codebase_index` 的操作顺序为 `start -> upload -> complete`，可用 `status` 同步续期 Relay 与 LCE 的任务租约并查询进度，失败时调用 `fail` 回收任务。服务端负责注入 `tenant_id`，并强制执行 SHA-256 内容匹配、路径过滤、manifest/批次上限、每日索引字节配额、root 隔离和删除检测。Relay 使用同一个 job UUID 调用 LCE 的内部 `begin -> stage/renew -> publish/abort` 协议；首次 full job 以 `replace_root=true` 发布完整根快照，能够清除仅存在于云端的旧文件。PostgreSQL 中的词法、精确、向量和经编译器细化的符号图数据只在 publish 时原子可见。`codebase_remote_index` 和 `codebase_clear_index` 是内部控制面，不能由模型直接调用。
+
+任务一旦进入 `failed` 或 `timed_out` 就是终态，Relay 不会在网络恢复后续跑同一个 job。重新建立索引必须由能读取本地仓库的 npm/MCP 客户端创建新任务；修复根因后应重新加载 VS Code 窗口或重启客户端。刷新网页控制台、调用 `codebase_index_status` 或再次发起普通自然语言检索都不是可靠的整任务重试触发器。`dismiss-root-failure` 只清理失败记录，不会触发重建，也不会删除仍可检索的已发布快照。
 
 远端服务无法读取 IDE 所在机器的文件系统或 `.git` 目录。Relay 的 Streamable HTTP `/mcp` 端点保留为 npm 客户端和服务内部调用的传输层；控制台不再把它作为普通用户的独立接入方式，因为直接配置它缺少 npm 客户端的本地 Git 工具、文件监听、自动增量同步和分支视图跟踪。
 

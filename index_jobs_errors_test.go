@@ -110,7 +110,7 @@ func TestClearUserIndexStateExecutesPortableSingleStatements(t *testing.T) {
 
 func TestClearRootIndexStateMapsLegacyDefaultAndExecutesPortableSingleStatements(t *testing.T) {
 	withMockTx(t, func(mock sqlmock.Sqlmock) {
-		mock.ExpectExec("DELETE FROM index_jobs AS jobs").
+		mock.ExpectExec("DELETE FROM index_jobs").
 			WithArgs("user-1", defaultLCEIndexRootID).
 			WillReturnResult(sqlmock.NewResult(0, 1))
 		mock.ExpectExec("DELETE FROM indexed_files AS files").
