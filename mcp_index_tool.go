@@ -413,10 +413,6 @@ func handleCodebaseIndex(ctx context.Context, userID string, raw map[string]inte
 		if len(workspaceName) > 256 || len(input.Branch) > 512 || len(input.Revision) > 512 {
 			return nil, fmt.Errorf("workspace_name, branch, or revision exceeds its size limit")
 		}
-		// 频率限制放在参数校验之后：畸形请求不占用 (user, root) 的时间窗。
-		if wait := checkIndexStartRateLimit(userID, rootID, time.Now()); wait > 0 {
-			return nil, fmt.Errorf("start was called for this root less than %s ago; retry after %d seconds", indexStartMinInterval, wait)
-		}
 		return createIndexJob(ctx, userID, indexStartRequest{
 			ProtocolVersion: indexProtocolVersion,
 			WorkspaceID:     rootID,

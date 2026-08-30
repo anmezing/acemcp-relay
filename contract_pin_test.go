@@ -30,7 +30,25 @@ type cloudProtocolContract struct {
 	CodebaseIndex    struct {
 		Operations     []string            `json:"operations"`
 		RequiredFields map[string][]string `json:"requiredFields"`
-		Limits         struct {
+		StartOutcomes  struct {
+			Created struct {
+				RequiredFields []string `json:"requiredFields"`
+				OptionalFields []string `json:"optionalFields"`
+				ProviderWork   string   `json:"providerWork"`
+			} `json:"created"`
+			Unchanged struct {
+				RequiredFields []string `json:"requiredFields"`
+				ProviderWork   string   `json:"providerWork"`
+			} `json:"unchanged"`
+			Busy struct {
+				RequiredFields []string `json:"requiredFields"`
+				OptionalFields []string `json:"optionalFields"`
+				Reasons        []string `json:"reasons"`
+				ProviderWork   string   `json:"providerWork"`
+			} `json:"busy"`
+			BusyRetryPolicy string `json:"busyRetryPolicy"`
+		} `json:"startOutcomes"`
+		Limits struct {
 			MaxFileBytes        int `json:"maxFileBytes"`
 			EstimatedChunkBytes int `json:"estimatedChunkBytes"`
 			MaxEstimatedChunks  int `json:"maxEstimatedChunks"`
@@ -155,6 +173,31 @@ func TestContractPinIndexEstimationLimits(t *testing.T) {
 		t.Fatalf("index limits mismatch: relay=(%d,%d,%d,%d) contract=(%d,%d,%d,%d)",
 			maxIndexFileBytes, estimatedIndexChunkBytes, maxIndexEstimatedChunks, maxIndexManifestFiles,
 			limits.MaxFileBytes, limits.EstimatedChunkBytes, limits.MaxEstimatedChunks, limits.MaxManifestFiles)
+	}
+}
+
+func TestContractPinIndexStartOutcomes(t *testing.T) {
+	contract := loadCloudProtocolContract(t)
+	if contract.SchemaVersion != "1.6" {
+		t.Fatalf("cloud protocol schema version: got %q, want 1.6", contract.SchemaVersion)
+	}
+	outcomes := contract.CodebaseIndex.StartOutcomes
+	if !reflect.DeepEqual(outcomes.Created.RequiredFields, []string{"job"}) ||
+		!reflect.DeepEqual(outcomes.Created.OptionalFields, []string{"pending_files", "deleted_files"}) ||
+		outcomes.Created.ProviderWork != "allowed" {
+		t.Fatalf("created start outcome drifted: %+v", outcomes.Created)
+	}
+	if !reflect.DeepEqual(outcomes.Unchanged.RequiredFields, []string{"unchanged"}) || outcomes.Unchanged.ProviderWork != "forbidden" {
+		t.Fatalf("unchanged start outcome drifted: %+v", outcomes.Unchanged)
+	}
+	if !reflect.DeepEqual(outcomes.Busy.RequiredFields, []string{"busy", "busy_reason", "retry_after_seconds"}) ||
+		!reflect.DeepEqual(outcomes.Busy.OptionalFields, []string{"active_job"}) ||
+		!reflect.DeepEqual(outcomes.Busy.Reasons, []string{indexStartBusyActiveJob, indexStartBusyRateLimited}) ||
+		outcomes.Busy.ProviderWork != "forbidden" {
+		t.Fatalf("busy start outcome drifted: %+v", outcomes.Busy)
+	}
+	if outcomes.BusyRetryPolicy != "client_waits_without_consuming_failure_retry_budget" {
+		t.Fatalf("busy retry policy drifted: %q", outcomes.BusyRetryPolicy)
 	}
 }
 

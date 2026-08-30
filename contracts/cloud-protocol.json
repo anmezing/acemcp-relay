@@ -1,6 +1,6 @@
 {
   "$comment": "三仓库（lce / relay / 前端）共享云协议契约的单一源头。relay 与前端提交本文件的精确快照，独立 CI 直接读取快照且缺失即失败；修改本文件必须三仓同步。",
-  "schemaVersion": "1.5",
+  "schemaVersion": "1.6",
   "cloudToolSurface": [
     "codebase-retrieval",
     "codebase_symbol_graph",
@@ -19,6 +19,24 @@
     },
     "optionalFields": {
       "start": ["client_version", "branch", "revision"]
+    },
+    "startOutcomes": {
+      "created": {
+        "requiredFields": ["job"],
+        "optionalFields": ["pending_files", "deleted_files"],
+        "providerWork": "allowed"
+      },
+      "unchanged": {
+        "requiredFields": ["unchanged"],
+        "providerWork": "forbidden"
+      },
+      "busy": {
+        "requiredFields": ["busy", "busy_reason", "retry_after_seconds"],
+        "optionalFields": ["active_job"],
+        "reasons": ["active_job", "rate_limited"],
+        "providerWork": "forbidden"
+      },
+      "busyRetryPolicy": "client_waits_without_consuming_failure_retry_budget"
     },
     "limits": {
       "maxFileBytes": 524288,

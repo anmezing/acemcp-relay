@@ -102,10 +102,20 @@ type indexJobView struct {
 }
 
 type createIndexJobResponse struct {
-	Job          indexJobView `json:"job"`
-	PendingFiles []string     `json:"pending_files"`
-	DeletedFiles []string     `json:"deleted_files"`
+	Job               *indexJobView `json:"job,omitempty"`
+	ActiveJob         *indexJobView `json:"active_job,omitempty"`
+	PendingFiles      []string      `json:"pending_files,omitempty"`
+	DeletedFiles      []string      `json:"deleted_files,omitempty"`
+	Unchanged         bool          `json:"unchanged,omitempty"`
+	Busy              bool          `json:"busy,omitempty"`
+	BusyReason        string        `json:"busy_reason,omitempty"`
+	RetryAfterSeconds int           `json:"retry_after_seconds,omitempty"`
 }
+
+const (
+	indexStartBusyActiveJob   = "active_job"
+	indexStartBusyRateLimited = "rate_limited"
+)
 
 func migrateIndexingTables() error {
 	// 租户归并说明：本文件所有表的 user_id 列（index_workspaces / index_jobs /
@@ -398,6 +408,96 @@ func resetWorkspaceRootBinding(ctx context.Context, userID, workspaceID, oldRoot
 	return nil
 }
 
+type expiredActiveIndexJob struct {
+	id            string
+	rootID        string
+	cloudRevision int64
+}
+
+// inspectActiveIndexJob makes start idempotent across client processes and relay
+// instances. A healthy running job owns the workspace until it completes or its
+// heartbeat expires; a repeated start must never supersede it and create another
+// provider-consuming LCE job. Expired jobs are reclaimed under the same database
+// lock before a replacement is allowed.
+func inspectActiveIndexJob(
+	ctx context.Context,
+	userID string,
+	workspaceID string,
+) (*indexJobView, error) {
+	tx, err := beginLockedIndexUserTx(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	rows, err := tx.QueryContext(ctx, `
+		SELECT id::text, root_id, cloud_revision, heartbeat_at
+		FROM index_jobs
+		WHERE user_id = $1 AND workspace_id = $2 AND status = $3
+		ORDER BY started_at DESC
+		FOR UPDATE
+	`, userID, workspaceID, indexJobStatusRunning)
+	if err != nil {
+		return nil, err
+	}
+	cutoff := time.Now().Add(-indexJobHeartbeatTimeout)
+	var activeJobID string
+	var expired []expiredActiveIndexJob
+	for rows.Next() {
+		var job expiredActiveIndexJob
+		var heartbeatAt time.Time
+		if err := rows.Scan(&job.id, &job.rootID, &job.cloudRevision, &heartbeatAt); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		if !heartbeatAt.Before(cutoff) {
+			if activeJobID == "" {
+				activeJobID = job.id
+			}
+			continue
+		}
+		expired = append(expired, job)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	if activeJobID != "" {
+		job, err := loadIndexJobFrom(ctx, tx, userID, activeJobID)
+		if err != nil {
+			return nil, err
+		}
+		return &job, nil
+	}
+
+	for _, job := range expired {
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE index_jobs
+			SET status = $1, phase = 'done', failed_files = total_files - indexed_files,
+				error = 'index job heartbeat timed out', completed_at = NOW()
+			WHERE id = $2 AND user_id = $3 AND status = $4
+		`, indexJobStatusTimedOut, job.id, userID, indexJobStatusRunning); err != nil {
+			return nil, err
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM index_job_files WHERE job_id = $1`, job.id); err != nil {
+			return nil, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	for _, job := range expired {
+		if job.cloudRevision > 0 {
+			continue
+		}
+		if abortErr := abortLCEIndexJob(context.Background(), userID, job.id, job.rootID); abortErr != nil {
+			log.Printf("[INDEX] cloud abort cleanup failed for expired job %s: %v", job.id, abortErr)
+		}
+	}
+	return nil, nil
+}
+
 func createIndexJob(ctx context.Context, userID string, req indexStartRequest) (createIndexJobResponse, error) {
 	if req.ProtocolVersion != indexProtocolVersion {
 		return createIndexJobResponse{}, fmt.Errorf(
@@ -430,6 +530,18 @@ func createIndexJob(ctx context.Context, userID string, req indexStartRequest) (
 	}
 	defer lease.Release()
 	opCtx := lease.Context()
+	activeJob, err := inspectActiveIndexJob(opCtx, userID, req.WorkspaceID)
+	if err != nil {
+		return createIndexJobResponse{}, err
+	}
+	if activeJob != nil {
+		return createIndexJobResponse{
+			ActiveJob:         activeJob,
+			Busy:              true,
+			BusyReason:        indexStartBusyActiveJob,
+			RetryAfterSeconds: int(indexJobSweepInterval / time.Second),
+		}, nil
+	}
 	storedRootID, workspaceExistsBeforeReset, err := loadIndexedWorkspaceRoot(opCtx, userID, req.WorkspaceID)
 	if err != nil {
 		return createIndexJobResponse{}, err
@@ -451,50 +563,6 @@ func createIndexJob(ctx context.Context, userID string, req indexStartRequest) (
 		return createIndexJobResponse{}, err
 	}
 	defer tx.Rollback()
-	type supersededJob struct {
-		id     string
-		rootID string
-	}
-	var supersededJobs []supersededJob
-	rows, err := tx.QueryContext(opCtx, `
-		SELECT id::text, root_id FROM index_jobs
-		WHERE user_id = $1 AND workspace_id = $2 AND status = $3
-	`, userID, req.WorkspaceID, indexJobStatusRunning)
-	if err != nil {
-		return createIndexJobResponse{}, err
-	}
-	for rows.Next() {
-		var job supersededJob
-		if err := rows.Scan(&job.id, &job.rootID); err != nil {
-			rows.Close()
-			return createIndexJobResponse{}, err
-		}
-		supersededJobs = append(supersededJobs, job)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return createIndexJobResponse{}, err
-	}
-
-	_, err = tx.ExecContext(opCtx, `
-		DELETE FROM index_job_files
-		WHERE job_id IN (
-			SELECT id FROM index_jobs
-			WHERE user_id = $1 AND workspace_id = $2 AND status = $3
-		)
-	`, userID, req.WorkspaceID, indexJobStatusRunning)
-	if err != nil {
-		return createIndexJobResponse{}, err
-	}
-	_, err = tx.ExecContext(opCtx, `
-		UPDATE index_jobs
-		SET status = $1, phase = 'done', error = 'superseded by a newer workspace scan',
-			completed_at = NOW(), heartbeat_at = NOW()
-		WHERE user_id = $2 AND workspace_id = $3 AND status = $4
-	`, indexJobStatusSuperseded, userID, req.WorkspaceID, indexJobStatusRunning)
-	if err != nil {
-		return createIndexJobResponse{}, err
-	}
 
 	previous, err := loadIndexedSnapshot(opCtx, tx, userID, req.WorkspaceID)
 	if err != nil {
@@ -516,6 +584,26 @@ func createIndexJob(ctx context.Context, userID string, req indexStartRequest) (
 	}
 
 	pending, deleted, estimatedChunks := diffManifest(previous, files)
+	if workspaceExists && len(pending) == 0 && len(deleted) == 0 {
+		if _, err := tx.ExecContext(opCtx, `
+			UPDATE index_workspaces
+			SET workspace_name = $3, root_id = $4, branch = $5, revision = $6
+			WHERE user_id = $1 AND workspace_id = $2
+		`, userID, req.WorkspaceID, req.WorkspaceName, req.RootID, req.Branch, req.Revision); err != nil {
+			return createIndexJobResponse{}, err
+		}
+		if err := tx.Commit(); err != nil {
+			return createIndexJobResponse{}, err
+		}
+		return createIndexJobResponse{Unchanged: true}, nil
+	}
+	if wait := checkIndexStartRateLimit(userID, req.RootID, time.Now()); wait > 0 {
+		return createIndexJobResponse{
+			Busy:              true,
+			BusyReason:        indexStartBusyRateLimited,
+			RetryAfterSeconds: wait,
+		}, nil
+	}
 	pendingSet := make(map[string]bool, len(pending))
 	for _, filePath := range pending {
 		pendingSet[filePath] = true
@@ -562,11 +650,6 @@ func createIndexJob(ctx context.Context, userID string, req indexStartRequest) (
 	if err := tx.Commit(); err != nil {
 		return createIndexJobResponse{}, err
 	}
-	for _, superseded := range supersededJobs {
-		if abortErr := abortLCEIndexJob(context.Background(), userID, superseded.id, superseded.rootID); abortErr != nil {
-			log.Printf("[INDEX] cloud abort cleanup failed for superseded job %s: %v", superseded.id, abortErr)
-		}
-	}
 	if err := beginLCEIndexJob(opCtx, userID, jobID, req.RootID, mode == "full"); err != nil {
 		if abortErr := abortLCEIndexJob(context.Background(), userID, jobID, req.RootID); abortErr != nil {
 			log.Printf("[INDEX] cloud abort cleanup failed after begin error for job %s: %v", jobID, abortErr)
@@ -584,7 +667,7 @@ func createIndexJob(ctx context.Context, userID string, req indexStartRequest) (
 		return createIndexJobResponse{}, err
 	}
 	return createIndexJobResponse{
-		Job:          job,
+		Job:          &job,
 		PendingFiles: pending,
 		DeletedFiles: deleted,
 	}, nil
