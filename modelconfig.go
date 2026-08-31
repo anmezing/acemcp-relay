@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"time"
 )
 
 // ── 按用户 Rerank 配置────────────────────────────────────────────────────
@@ -21,7 +22,10 @@ import (
 //
 // MODEL_CONFIG_SECRET 未设置时整个特性关闭（不查表、不注入）。
 
-const modelConfigNoRowValue = "0"
+const (
+	modelConfigCacheTTL   = 5 * time.Minute
+	modelConfigNoRowValue = "0"
+)
 
 var modelConfigKey []byte // nil = 特性关闭
 

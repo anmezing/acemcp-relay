@@ -37,7 +37,7 @@ func TestUpdateLeaderboardAggregatesConfiguredUsageTools(t *testing.T) {
 	defer func() { db = oldDB }()
 
 	mock.ExpectQuery(regexp.QuoteMeta(leaderboardAggregationQuery)).
-		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), leaderboardTopN).
+		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), LeaderboardTopN).
 		WillReturnRows(sqlmock.NewRows([]string{"user_id", "cnt"}).AddRow("user-1", int64(7)))
 	mock.ExpectBegin()
 	mock.ExpectExec("DELETE FROM leaderboard").
@@ -68,7 +68,7 @@ func TestUpdateLeaderboardClearsStaleSnapshotWhenNoUsageCallsExist(t *testing.T)
 	defer func() { db = oldDB }()
 
 	mock.ExpectQuery(regexp.QuoteMeta(leaderboardAggregationQuery)).
-		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), leaderboardTopN).
+		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), LeaderboardTopN).
 		WillReturnRows(sqlmock.NewRows([]string{"user_id", "cnt"}))
 	mock.ExpectBegin()
 	mock.ExpectExec("DELETE FROM leaderboard").

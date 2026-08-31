@@ -2,9 +2,9 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-LCE_DIR="${DEPLOY_LCE_DIR:-$SCRIPT_DIR/../../lce}"
-FRONTEND_DIR="${DEPLOY_FRONTEND_DIR:-$SCRIPT_DIR/../../acemcp-relay-frontend}"
-RELAY_DIR="${DEPLOY_RELAY_DIR:-$SCRIPT_DIR/..}"
+LCE_DIR="$SCRIPT_DIR/../../lce"
+FRONTEND_DIR="$SCRIPT_DIR/../../acemcp-relay-frontend"
+RELAY_DIR="$SCRIPT_DIR/.."
 
 # 可选锁定部署版本：DEPLOY_REF_LCE / DEPLOY_REF_RELAY / DEPLOY_REF_FRONTEND
 # 指定 tag 或 commit 时按该版本部署；不指定则跟随远端分支（开发期默认）。
@@ -41,13 +41,6 @@ verify_contract_snapshots() {
   done
 }
 
-verify_deployment_configuration() {
-  (
-    cd "$SCRIPT_DIR"
-    docker compose config >/dev/null
-  )
-}
-
 prune_docker_resources() {
   if [ "${DEPLOY_PRUNE_DOCKER_RESOURCES:-true}" != "true" ]; then
     echo "=== Docker resource cleanup disabled ==="
@@ -81,14 +74,11 @@ update_repo "$FRONTEND_DIR" "${DEPLOY_REF_FRONTEND:-}" "${DEPLOY_BRANCH_FRONTEND
 echo "=== Verifying cross-repository contracts ==="
 verify_contract_snapshots
 
-echo "=== Verifying deployment configuration ==="
-verify_deployment_configuration
-
 echo "=== Applying host capacity settings ==="
 "$SCRIPT_DIR/tune-host.sh"
 
 # cloud 客户端不在服务器上构建：它经 lce 仓库的 publish-cloud workflow
-# 发布本地客户端包；用户侧启动方式由控制台部署配置生成。
+# 发布到 npm（@anmezing/lce-cloud），用户侧 npx 直接获取。
 
 echo "=== Rebuilding Docker containers ==="
 cd "$SCRIPT_DIR"

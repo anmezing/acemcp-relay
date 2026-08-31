@@ -25,11 +25,11 @@ var (
 )
 
 // quotaCacheTTL 是配额上限缓存的独立 TTL，避免封禁缓存配置影响配额生效延迟。
-// 具体时长由运行策略统一加载。
+const quotaCacheTTL = 5 * time.Minute
 
 func quotaLocation() *time.Location {
 	quotaLocOnce.Do(func() {
-		loc, err := time.LoadLocation(leaderboardTimezone)
+		loc, err := time.LoadLocation(LeaderboardTimezone)
 		if err != nil {
 			log.Printf("[QUOTA] load timezone failed, falling back to UTC: %v", err)
 			loc = time.UTC
@@ -239,7 +239,7 @@ func planCacheTTL(expiresAt time.Time) time.Duration {
 
 // getUserDailyLimit 返回该用户生效的每日上限（<=0 表示不限）。
 // tier 只影响无按用户覆盖时的默认值；缓存存的是解析后的最终值，
-// tier 变更的生效延迟受运行策略中的 quotaCacheTTL 约束。
+// tier 变更的生效延迟受 quotaCacheTTL 约束（≤5 分钟）。
 func getUserDailyLimit(userID, tier string) int {
 	ctx := context.Background()
 	cacheKey := "quota:limit:" + userID
@@ -589,7 +589,7 @@ func chargeIndexBytesQuota(tenantID, orgID, tier string, bytes int64) indexQuota
 		end
 		return {1, used}
 	`
-	value, err := redisClient.Eval(ctx, chargeScript, []string{key}, bytes, limit, int64(quotaCounterTTL/time.Second)).Result()
+	value, err := redisClient.Eval(ctx, chargeScript, []string{key}, bytes, limit, int64((48*time.Hour)/time.Second)).Result()
 	if err != nil {
 		log.Printf("[QUOTA] index byte accounting failed (tenant=%s): %v", tenantID, err)
 		return indexQuotaDecision{Unavailable: true, Limit: limit}
@@ -631,7 +631,7 @@ func chargeIndexFiles(tenantID, orgID, tier, rootID string, files []indexQuotaFi
 	}
 
 	args := make([]interface{}, 0, 3+len(files)*2)
-	args = append(args, limit, int64(quotaCounterTTL/time.Second), len(files))
+	args = append(args, limit, int64((48*time.Hour)/time.Second), len(files))
 	for _, file := range files {
 		bytes := max(file.Bytes, 0)
 		identity := strings.Join([]string{
@@ -781,7 +781,7 @@ func reserveRequestQuota(
 		[]string{memberKey, poolKey},
 		memberLimit,
 		poolLimit,
-		int64(quotaCounterTTL/time.Second),
+		int64((48*time.Hour)/time.Second),
 	).Result()
 	if err != nil {
 		log.Printf("[QUOTA] request accounting failed: %v", err)
