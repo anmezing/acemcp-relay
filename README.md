@@ -307,7 +307,11 @@ API key 撤销语义：前端封禁账号、删除或重置密钥后，旧 key �
 
 部署脚本不再假设三个仓库位于固定的兄弟目录；可通过 `DEPLOY_LCE_DIR`、`DEPLOY_RELAY_DIR`、`DEPLOY_FRONTEND_DIR` 指向实际检出位置，分支、版本与 Docker 清理策略也都由 `DEPLOY_*` 变量控制。`deploy/.env.example` 列出了 Compose 使用的全部应用运行策略，避免必须修改编排文件才能调整地址、限额、重试或客户端节奏。
 
+`deploy/deploy.sh` 会先执行 `docker compose config`，只有环境变量插值和 Compose 配置完整后才修改主机容量或重建容器。升级旧部署时，未设置 `NEXT_PUBLIC_SITE_URL` 会继承 `BETTER_AUTH_URL`；客户端包运行器和全局可执行程序都是可选能力，二者均未配置时控制台仍可运行，但会禁用客户端配置复制并提示管理员补充启动策略。
+
 Nginx 配置使用 `deploy/nginx.conf.template`，域名、证书、上游、上传大小和代理超时由专用 `deploy/nginx.env` 提供。先复制 `deploy/nginx.env.example` 并按目标主机修改，再运行 `deploy/render-nginx-config.sh` 生成忽略提交的 `deploy/nginx.conf.rendered`。渲染器只替换明确列出的部署变量，不会误替换 Nginx 自身的 `$host`、`$request_uri` 等变量。
+
+主机调优前会检查 Nginx 配置。如果同一公网主机名同时出现在多个启用的 `server` 块中，部署会停止，因为 Nginx 会忽略其中一个站点。使用 `sudo nginx -T` 查看实际加载的文件，在 `/etc/nginx/sites-enabled`、`/etc/nginx/conf.d` 等目录中保留唯一生效配置后，再执行 `sudo nginx -t` 和部署脚本；脚本不会自动删除运维人员管理的站点文件。
 
 `deploy/tune-host.sh` 的 sysctl 文件位置、Nginx/PostgreSQL 服务身份以及容量参数同样由 `DEPLOY_*` 变量覆盖。脚本会在写入主机配置前验证正整数和端口/连接数关系；这些默认值是可审查的运维基线，不是散落在业务代码里的固定策略。
 

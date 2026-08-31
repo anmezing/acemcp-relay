@@ -41,6 +41,13 @@ verify_contract_snapshots() {
   done
 }
 
+verify_deployment_configuration() {
+  (
+    cd "$SCRIPT_DIR"
+    docker compose config >/dev/null
+  )
+}
+
 prune_docker_resources() {
   if [ "${DEPLOY_PRUNE_DOCKER_RESOURCES:-true}" != "true" ]; then
     echo "=== Docker resource cleanup disabled ==="
@@ -73,6 +80,9 @@ update_repo "$FRONTEND_DIR" "${DEPLOY_REF_FRONTEND:-}" "${DEPLOY_BRANCH_FRONTEND
 
 echo "=== Verifying cross-repository contracts ==="
 verify_contract_snapshots
+
+echo "=== Verifying deployment configuration ==="
+verify_deployment_configuration
 
 echo "=== Applying host capacity settings ==="
 "$SCRIPT_DIR/tune-host.sh"
