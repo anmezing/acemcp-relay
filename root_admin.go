@@ -324,7 +324,10 @@ func classifyIndexFailure(status, detail string) indexFailureDiagnostic {
 		return indexFailureDiagnostic{"repository_file_limit", "client", "reduce_repository"}
 	case containsAny("manifest file size is invalid", "file exceeds the", "byte limit", "file too large", "file size limit", "maximum file size", "文件大小超过", "单文件过大"):
 		return indexFailureDiagnostic{"repository_file_size_limit", "client", "reduce_repository"}
-	case containsAny("quota exceeded", "quota exhausted", "配额不足", "配额已用尽", "超出配额"):
+	// Only Relay's platform index quota may use the wait-for-reset recovery.
+	// Bare provider messages such as "embedding provider quota exceeded" must
+	// not be mislabeled as Relay quota, otherwise clients wait for the wrong reset.
+	case containsAny("daily index quota exceeded", "index quota exceeded", "index_quota_exceeded", "每日索引配额", "索引配额已用尽", "超出索引配额"):
 		return indexFailureDiagnostic{"index_quota_exceeded", "relay", "wait_for_quota_reset"}
 	case containsAny("unauthorized", "invalid api key", "invalid token", "authentication failed", "remote-index 401", "remote-index 403"):
 		return indexFailureDiagnostic{"provider_authentication", "provider", "fix_credentials"}

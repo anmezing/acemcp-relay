@@ -465,15 +465,31 @@ func parseOrgQuotaCache(value string) (orgQuotaLimits, bool) {
 // codebase_index 的每个 MCP 调用都会计入常规请求数配额，但请求数无法反映
 // embedding 成本：同样一次 upload 可以携带几字节，也可以携带一整批源码。
 //
-// 因此索引还要单独按"当日累计上传字节"计费，计的是实际送进 LCE 的内容长度，
-// 正常增量扫描只传变更文件、消耗很小，而批量灌数据会立刻撞上限。
-// DAILY_INDEX_BYTES_LIMIT=0 表示不限（仅建议在自用部署上这么配）。
+// 索引配额按“当日首次提交的 root/路径/内容”累计。计费预约仍发生在上游调用前，
+// 以便成本保护 fail closed；但同一文件内容因网络、provider 或任务重建而重放时，
+// Redis 会原子去重，不会再次挤占日配额。DAILY_INDEX_BYTES_LIMIT=0 表示不限。
 
 // indexBytesKey 按租户计：个人租户 tenantID = userID（key 与旧版完全一致），
 // 组织租户天然共享同一个池。
 func indexBytesKey(tenantID string) string {
-	day := time.Now().In(quotaLocation()).Format("20060102")
+	return indexBytesKeyAt(tenantID, time.Now())
+}
+
+func indexBytesKeyAt(tenantID string, now time.Time) string {
+	day := now.In(quotaLocation()).Format("20060102")
 	return "quota:indexbytes:" + tenantID + ":" + day
+}
+
+// indexFileChargesKey 保存一个 root 当天已经计费的逻辑文件内容。job_id 和批次边界
+// 故意不参与身份计算：失败后新建 job、重新分批仍应命中同一条计费记录。
+func indexFileChargesKey(tenantID, rootID string) string {
+	return indexFileChargesKeyAt(tenantID, rootID, time.Now())
+}
+
+func indexFileChargesKeyAt(tenantID, rootID string, now time.Time) string {
+	day := now.In(quotaLocation()).Format("20060102")
+	rootDigest := sha256.Sum256([]byte(rootID))
+	return fmt.Sprintf("quota:indexfiles:%s:%s:%x", tenantID, day, rootDigest)
 }
 
 func quotaRetryAfterHeader(now time.Time) string {
@@ -501,17 +517,34 @@ type indexQuotaDecision struct {
 	Unavailable bool
 	Used        int64
 	Limit       int64
+	// Charged 是本次真正新增到日配额的字节数；幂等重放允许为 0。
+	Charged int64
 }
 
-// chargeIndexBytes 累加当日已索引字节并判断是否超限。
-// 只有 Redis 原子记账成功的字节才累加 relay_index_bytes_total；Redis 故障时
-// fail closed，避免日索引成本上限随基础设施故障一起失效。
-// 个人租户优先用 user_quotas 的字节覆盖；组织租户使用已解析的 owner 最终权益。
-// 组织成员个人上限仍只约束请求数。
+type indexQuotaFile struct {
+	Path  string
+	Hash  string
+	Bytes int64
+}
+
+func resolveIndexBytesLimit(tenantID, orgID, tier string) int64 {
+	if orgID == "" {
+		return getUserIndexBytesLimit(tenantID, tier)
+	}
+	limit := tierIndexBytesLimit(tierFree)
+	limits := getOrgQuotaLimits(orgID)
+	if limits.IndexBytesSet {
+		limit = limits.IndexBytes
+	}
+	return limit
+}
+
+// chargeIndexBytes 保留给非文件级调用和配额单元测试；上传路径使用下面的
+// chargeIndexFiles，以便跨任务、跨批次对相同文件内容做幂等计费。
 func chargeIndexBytes(tenantID, orgID, tier string, bytes int64) indexQuotaDecision {
 	decision := chargeIndexBytesQuota(tenantID, orgID, tier, bytes)
-	if decision.Allowed && bytes > 0 {
-		metricIndexBytes.Add(float64(bytes))
+	if decision.Allowed && decision.Charged > 0 {
+		metricIndexBytes.Add(float64(decision.Charged))
 	}
 	if decision.Unavailable {
 		logEvent("index_quota_unavailable",
@@ -536,18 +569,9 @@ func chargeIndexBytes(tenantID, orgID, tier string, bytes int64) indexQuotaDecis
 }
 
 func chargeIndexBytesQuota(tenantID, orgID, tier string, bytes int64) indexQuotaDecision {
-	limit := tierIndexBytesLimit(tier)
-	if orgID == "" {
-		limit = getUserIndexBytesLimit(tenantID, tier)
-	} else {
-		limit = tierIndexBytesLimit(tierFree)
-		limits := getOrgQuotaLimits(orgID)
-		if limits.IndexBytesSet {
-			limit = limits.IndexBytes
-		}
-	}
+	limit := resolveIndexBytesLimit(tenantID, orgID, tier)
 	if limit <= 0 || bytes <= 0 {
-		return indexQuotaDecision{Allowed: true, Limit: limit}
+		return indexQuotaDecision{Allowed: true, Limit: limit, Charged: max(bytes, 0)}
 	}
 
 	ctx := context.Background()
@@ -581,7 +605,122 @@ func chargeIndexBytesQuota(tenantID, orgID, tier string, bytes int64) indexQuota
 		log.Printf("[QUOTA] invalid index byte accounting values (tenant=%s): %#v", tenantID, parts)
 		return indexQuotaDecision{Unavailable: true, Limit: limit}
 	}
-	return indexQuotaDecision{Allowed: allowed == 1, Used: used, Limit: limit}
+	charged := int64(0)
+	if allowed == 1 {
+		charged = bytes
+	}
+	return indexQuotaDecision{Allowed: allowed == 1, Used: used, Limit: limit, Charged: charged}
+}
+
+// chargeIndexFiles 原子检查配额并记录当天已计费的文件身份。相同 root、路径和
+// 内容哈希的失败重试只会得到 Charged=0；内容改变后会作为新的 embedding 输入计费。
+func chargeIndexFiles(tenantID, orgID, tier, rootID string, files []indexQuotaFile) indexQuotaDecision {
+	requested := int64(0)
+	for _, file := range files {
+		if file.Bytes > 0 {
+			requested += file.Bytes
+		}
+	}
+	limit := resolveIndexBytesLimit(tenantID, orgID, tier)
+	if requested <= 0 {
+		return indexQuotaDecision{Allowed: true, Limit: limit}
+	}
+	if limit <= 0 {
+		metricIndexBytes.Add(float64(requested))
+		return indexQuotaDecision{Allowed: true, Limit: limit, Charged: requested}
+	}
+
+	args := make([]interface{}, 0, 3+len(files)*2)
+	args = append(args, limit, int64(quotaCounterTTL/time.Second), len(files))
+	for _, file := range files {
+		bytes := max(file.Bytes, 0)
+		identity := strings.Join([]string{
+			normalizeIndexPath(file.Path),
+			strings.ToLower(strings.TrimSpace(file.Hash)),
+			strconv.FormatInt(bytes, 10),
+		}, "\x00")
+		token := sha256.Sum256([]byte(identity))
+		args = append(args, fmt.Sprintf("%x", token), bytes)
+	}
+
+	const reserveFilesScript = `
+		local current = tonumber(redis.call('GET', KEYS[1]) or '0')
+		local limit = tonumber(ARGV[1])
+		local ttl = tonumber(ARGV[2])
+		local count = tonumber(ARGV[3])
+		local newly_charged = 0
+		local unseen = {}
+		for i = 1, count do
+			local token_index = 4 + (i - 1) * 2
+			local token = ARGV[token_index]
+			local bytes = tonumber(ARGV[token_index + 1])
+			if bytes > 0 and unseen[token] == nil and redis.call('HEXISTS', KEYS[2], token) == 0 then
+				unseen[token] = bytes
+				newly_charged = newly_charged + bytes
+			end
+		end
+		if current + newly_charged > limit then
+			return {0, current, 0}
+		end
+		if newly_charged > 0 then
+			for token, bytes in pairs(unseen) do
+				redis.call('HSET', KEYS[2], token, bytes)
+			end
+			current = redis.call('INCRBY', KEYS[1], newly_charged)
+			if redis.call('TTL', KEYS[1]) < 0 then redis.call('EXPIRE', KEYS[1], ttl) end
+			if redis.call('TTL', KEYS[2]) < 0 then redis.call('EXPIRE', KEYS[2], ttl) end
+		end
+		return {1, current, newly_charged}
+	`
+	now := time.Now()
+	value, err := redisClient.Eval(
+		context.Background(),
+		reserveFilesScript,
+		[]string{indexBytesKeyAt(tenantID, now), indexFileChargesKeyAt(tenantID, rootID, now)},
+		args...,
+	).Result()
+	if err != nil {
+		log.Printf("[QUOTA] idempotent index byte accounting failed (tenant=%s root=%s): %v", tenantID, rootID, err)
+		return indexQuotaDecision{Unavailable: true, Limit: limit}
+	}
+	parts, ok := value.([]interface{})
+	if !ok || len(parts) != 3 {
+		log.Printf("[QUOTA] invalid idempotent index byte accounting response (tenant=%s root=%s): %#v", tenantID, rootID, value)
+		return indexQuotaDecision{Unavailable: true, Limit: limit}
+	}
+	allowed, allowedOK := parts[0].(int64)
+	used, usedOK := parts[1].(int64)
+	charged, chargedOK := parts[2].(int64)
+	if !allowedOK || !usedOK || !chargedOK {
+		log.Printf("[QUOTA] invalid idempotent index byte accounting values (tenant=%s root=%s): %#v", tenantID, rootID, parts)
+		return indexQuotaDecision{Unavailable: true, Limit: limit}
+	}
+	decision := indexQuotaDecision{Allowed: allowed == 1, Used: used, Limit: limit, Charged: charged}
+	if decision.Allowed && decision.Charged > 0 {
+		metricIndexBytes.Add(float64(decision.Charged))
+	}
+	if !decision.Allowed {
+		logEvent("index_quota_rejected",
+			"user_id", tenantID,
+			"tenant", tenantID,
+			"org", orgID,
+			"tier", normalizeTier(tier),
+			"root_id", rootID,
+			"bytes", strconv.FormatInt(requested, 10),
+			"used", strconv.FormatInt(decision.Used, 10),
+			"limit", strconv.FormatInt(decision.Limit, 10),
+		)
+	} else if decision.Charged < requested {
+		logEvent("index_quota_replay_deduplicated",
+			"user_id", tenantID,
+			"tenant", tenantID,
+			"org", orgID,
+			"root_id", rootID,
+			"bytes", strconv.FormatInt(requested, 10),
+			"charged", strconv.FormatInt(decision.Charged, 10),
+		)
+	}
+	return decision
 }
 
 type requestQuotaDecision struct {

@@ -806,14 +806,17 @@ func uploadIndexBatch(ctx context.Context, userID string, req indexUploadRequest
 	if err := tx.Commit(); err != nil {
 		return indexBatchResponse{}, err
 	}
-	batchBytes, err := validateIndexBatchSize(staged)
-	if err != nil {
+	if _, err := validateIndexBatchSize(staged); err != nil {
 		return indexBatchResponse{}, err
 	}
 	filesArg := make([]map[string]interface{}, 0, len(staged))
+	quotaFiles := make([]indexQuotaFile, 0, len(staged))
 	for _, file := range staged {
 		filesArg = append(filesArg, map[string]interface{}{
 			"path": file.Path, "content": file.Content,
+		})
+		quotaFiles = append(quotaFiles, indexQuotaFile{
+			Path: file.Path, Hash: file.Hash, Bytes: int64(len([]byte(file.Content))),
 		})
 	}
 	args := lceIndexJobArgs(userID, job.ID, req.RootID, "stage")
@@ -825,17 +828,19 @@ func uploadIndexBatch(ctx context.Context, userID string, req indexUploadRequest
 		return indexBatchResponse{}, err
 	}
 	// 字节配额按租户池计（uploadIndexBatch 的 userID 参数即租户）；org 归属
-	// 从认证中间件放进 request context 的身份里取，缺失时按个人租户处理。
+	// 从认证中间件放进 request context 的身份里取。文件身份不包含 job/batch，
+	// 因此上游失败后创建新任务或改变分批方式，也不会重复消耗同一内容的配额。
 	callerIdentity := authIdentityFromContext(ctx)
-	quota := chargeIndexBytes(userID, callerIdentity.OrgID, userTierFromContext(ctx), batchBytes)
+	quota := chargeIndexFiles(userID, callerIdentity.OrgID, userTierFromContext(ctx), req.RootID, quotaFiles)
 	if quota.Unavailable {
 		return indexBatchResponse{}, fmt.Errorf("index quota accounting temporarily unavailable; retry later")
 	}
 	if !quota.Allowed {
 		return indexBatchResponse{}, fmt.Errorf(
-			"daily index quota exceeded (%d/%d bytes); retry after %s seconds",
+			"daily index quota exceeded (used=%d, limit=%d, remaining=%d bytes); retry after %s seconds",
 			quota.Used,
 			quota.Limit,
+			max(quota.Limit-quota.Used, 0),
 			quotaRetryAfterHeader(time.Now()),
 		)
 	}
@@ -855,8 +860,8 @@ func uploadIndexBatch(ctx context.Context, userID string, req indexUploadRequest
 	}
 	// 事务B：重新加锁提交进度。commitIndexBatch 内部会 SELECT...FOR UPDATE
 	// 复查 job 状态、并对每个文件的 UPDATE 断言 rows==1，因此事务A提交后到
-	// 这里之间发生的 supersede/清除/重放都会被拒绝。配额按已发起的上游
-	// embedding 工作计费，即使后续提交失败也不回退，避免重放绕过成本上限。
+	// 这里之间发生的 supersede/清除/重放都会被拒绝。配额在上游调用前预约，
+	// 后续提交失败不回退；但相同 root/路径/内容的重放由 Redis 幂等记录去重。
 	tx2, err := beginLockedIndexUserTx(opCtx, userID)
 	if err != nil {
 		return indexBatchResponse{}, err

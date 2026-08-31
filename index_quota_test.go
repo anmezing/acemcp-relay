@@ -215,6 +215,99 @@ func TestChargeIndexBytesIsAtomicUnderConcurrency(t *testing.T) {
 	}
 }
 
+func TestChargeIndexFilesDeduplicatesRetriesAcrossJobsAndBatches(t *testing.T) {
+	server := withTestIndexQuota(t, 1_000)
+	userID := "idempotent-index-user"
+	rootID := "repo@main"
+	fileA := indexQuotaFile{Path: "src/a.go", Hash: strings.Repeat("a", 64), Bytes: 60}
+	fileB := indexQuotaFile{Path: "src/b.go", Hash: strings.Repeat("b", 64), Bytes: 20}
+
+	first := chargeIndexFiles(userID, "", tierFree, rootID, []indexQuotaFile{fileA})
+	if !first.Allowed || first.Used != 60 || first.Charged != 60 {
+		t.Fatalf("first file reservation = %+v, want used/charged 60", first)
+	}
+	// job_id and batch grouping are intentionally absent from the API. Replaying
+	// the same content in a later job or alongside another file must only charge B.
+	replayed := chargeIndexFiles(userID, "", tierFree, rootID, []indexQuotaFile{fileA, fileB})
+	if !replayed.Allowed || replayed.Used != 80 || replayed.Charged != 20 {
+		t.Fatalf("replayed reservation = %+v, want used 80 and charged 20", replayed)
+	}
+	unchanged := chargeIndexFiles(userID, "", tierFree, rootID, []indexQuotaFile{fileB, fileA})
+	if !unchanged.Allowed || unchanged.Used != 80 || unchanged.Charged != 0 {
+		t.Fatalf("fully replayed reservation = %+v, want unchanged used 80", unchanged)
+	}
+	changed := fileA
+	changed.Hash = strings.Repeat("c", 64)
+	changedResult := chargeIndexFiles(userID, "", tierFree, rootID, []indexQuotaFile{changed})
+	if !changedResult.Allowed || changedResult.Used != 140 || changedResult.Charged != 60 {
+		t.Fatalf("changed content reservation = %+v, want used 140 and charged 60", changedResult)
+	}
+	otherRoot := chargeIndexFiles(userID, "", tierFree, "repo@feature", []indexQuotaFile{fileA})
+	if !otherRoot.Allowed || otherRoot.Used != 200 || otherRoot.Charged != 60 {
+		t.Fatalf("other root reservation = %+v, want used 200 and charged 60", otherRoot)
+	}
+	if keys, err := server.HKeys(indexFileChargesKey(userID, rootID)); err != nil || len(keys) != 3 {
+		t.Fatalf("root dedupe entries = %d (%v), want 3 unique path/content identities", len(keys), err)
+	}
+}
+
+func TestChargeIndexFilesRejectsAtomicallyWithoutMarkingFilesSeen(t *testing.T) {
+	server := withTestIndexQuota(t, 100)
+	userID := "atomic-file-quota-user"
+	rootID := "repo@main"
+	fileA := indexQuotaFile{Path: "a.ts", Hash: strings.Repeat("a", 64), Bytes: 60}
+	fileB := indexQuotaFile{Path: "b.ts", Hash: strings.Repeat("b", 64), Bytes: 50}
+
+	if first := chargeIndexFiles(userID, "", tierFree, rootID, []indexQuotaFile{fileA}); !first.Allowed {
+		t.Fatalf("first reservation rejected: %+v", first)
+	}
+	rejected := chargeIndexFiles(userID, "", tierFree, rootID, []indexQuotaFile{fileB})
+	if rejected.Allowed || rejected.Used != 60 || rejected.Charged != 0 {
+		t.Fatalf("over-limit reservation = %+v, want denied with unchanged usage", rejected)
+	}
+	if keys, err := server.HKeys(indexFileChargesKey(userID, rootID)); err != nil || len(keys) != 1 {
+		t.Fatalf("rejected file was marked as charged; dedupe entries=%d (%v), want 1", len(keys), err)
+	}
+
+	// Once the configured limit is raised, the previously rejected file must be
+	// charged normally; a rejected reservation cannot poison the idempotency set.
+	dailyIndexBytesLimit = 150
+	accepted := chargeIndexFiles(userID, "", tierFree, rootID, []indexQuotaFile{fileB})
+	if !accepted.Allowed || accepted.Used != 110 || accepted.Charged != 50 {
+		t.Fatalf("reservation after limit increase = %+v, want used 110 and charged 50", accepted)
+	}
+}
+
+func TestChargeIndexFilesConcurrentReplayChargesOnce(t *testing.T) {
+	server := withTestIndexQuota(t, 100)
+	userID := "concurrent-file-replay-user"
+	file := indexQuotaFile{Path: "same.go", Hash: strings.Repeat("d", 64), Bytes: 10}
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	charged := int64(0)
+	for range 20 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			decision := chargeIndexFiles(userID, "", tierFree, "repo@main", []indexQuotaFile{file})
+			if !decision.Allowed {
+				t.Errorf("concurrent replay unexpectedly rejected: %+v", decision)
+				return
+			}
+			mu.Lock()
+			charged += decision.Charged
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+	if charged != 10 {
+		t.Fatalf("concurrent replay charged %d bytes, want exactly 10", charged)
+	}
+	if stored, err := server.Get(indexBytesKey(userID)); err != nil || stored != "10" {
+		t.Fatalf("stored usage = %q (%v), want 10", stored, err)
+	}
+}
+
 func TestQuotaRetryAfterUsesShanghaiDayBoundary(t *testing.T) {
 	loc := quotaLocation()
 	now := time.Date(2026, 7, 31, 23, 59, 59, 500_000_000, loc)
