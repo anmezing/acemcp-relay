@@ -20,6 +20,25 @@ func TestCodebaseIndexDefinitionKeepsTenantAndControlFieldsServerManaged(t *test
 	if tool["name"] != codebaseIndexToolName {
 		t.Fatalf("unexpected tool name: %#v", tool["name"])
 	}
+	metadata, ok := tool["_meta"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("codebase_index must publish effective limit metadata: %#v", tool["_meta"])
+	}
+	limits, ok := metadata[codebaseIndexLimitsMetadataKey].(map[string]interface{})
+	if !ok {
+		t.Fatalf("codebase_index limit metadata missing: %#v", metadata)
+	}
+	for field, want := range map[string]int{
+		"maxFileBytes": maxIndexFileBytes, "maxBatchFiles": maxIndexBatchFiles,
+		"maxBatchBytes": maxIndexBatchBytes, "estimatedChunkBytes": estimatedIndexChunkBytes,
+		"maxEstimatedChunks": maxIndexEstimatedChunks, "maxManifestFiles": maxIndexManifestFiles,
+		"maxPathBytes": maxIndexPathBytes,
+	} {
+		got, ok := limits[field].(float64)
+		if !ok || int(got) != want {
+			t.Fatalf("unexpected %s metadata: got %#v want %d", field, limits[field], want)
+		}
+	}
 	encoded := string(raw)
 	for _, forbidden := range []string{"tenant_id", "model_config", "deleted_files", "protocol_version"} {
 		if strings.Contains(encoded, forbidden) {

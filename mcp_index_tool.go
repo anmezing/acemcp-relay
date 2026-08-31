@@ -15,8 +15,9 @@ import (
 )
 
 const (
-	codebaseIndexToolName = "codebase_index"
-	maxIndexPathBytes     = 4096
+	codebaseIndexToolName          = "codebase_index"
+	codebaseIndexLimitsMetadataKey = "com.anmezing.lce/index-limits"
+	maxIndexPathBytes              = 4096
 	// 云客户端按每 4 KiB 估算一个分块；单文件上限为 512 KiB，因此 manifest
 	// 中的 estimated_chunks 最大为 128。两个值由 cloud-protocol.json 钉住。
 	estimatedIndexChunkBytes = 4096
@@ -149,6 +150,18 @@ func codebaseIndexEnvelope(ok bool, payload interface{}, errMessage string) map[
 	return envelope
 }
 
+func codebaseIndexLimitMetadata() map[string]interface{} {
+	return map[string]interface{}{
+		"maxFileBytes":        maxIndexFileBytes,
+		"maxBatchFiles":       maxIndexBatchFiles,
+		"maxBatchBytes":       maxIndexBatchBytes,
+		"estimatedChunkBytes": estimatedIndexChunkBytes,
+		"maxEstimatedChunks":  maxIndexEstimatedChunks,
+		"maxManifestFiles":    maxIndexManifestFiles,
+		"maxPathBytes":        maxIndexPathBytes,
+	}
+}
+
 func codebaseIndexToolDefinition() (json.RawMessage, error) {
 	manifestFile := map[string]interface{}{
 		"type":                 "object",
@@ -187,6 +200,9 @@ func codebaseIndexToolDefinition() (json.RawMessage, error) {
 	}
 	definition := map[string]interface{}{
 		"name": codebaseIndexToolName,
+		"_meta": map[string]interface{}{
+			codebaseIndexLimitsMetadataKey: codebaseIndexLimitMetadata(),
+		},
 		"description": "Synchronize the current local workspace into the authenticated tenant index without an IDE plugin. " +
 			"The Agent must read the workspace with its native file tools, exclude secrets/binaries/generated dependencies, and call operations in order: " +
 			"start with the complete UTF-8 file manifest and stable root_id; upload only pending_files in bounded batches; " +
