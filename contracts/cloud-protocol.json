@@ -1,6 +1,6 @@
 {
   "$comment": "三仓库（lce / relay / 前端）共享云协议契约的单一源头。relay 与前端提交本文件的精确快照，独立 CI 直接读取快照且缺失即失败；修改本文件必须三仓同步。",
-  "schemaVersion": "1.7",
+  "schemaVersion": "1.8",
   "cloudToolSurface": [
     "codebase-retrieval",
     "codebase_symbol_graph",
@@ -10,44 +10,111 @@
     "codebase_review_changes"
   ],
   "codebaseIndex": {
-    "operations": ["start", "upload", "status", "complete", "fail"],
+    "operations": [
+      "start",
+      "upload",
+      "status",
+      "complete",
+      "fail"
+    ],
     "requiredFields": {
-      "start": ["operation", "root_id", "files"],
-      "upload": ["operation", "job_id", "root_id", "files"],
-      "complete": ["operation", "job_id"],
-      "fail": ["operation", "job_id", "error"]
+      "start": [
+        "operation",
+        "root_id",
+        "files"
+      ],
+      "upload": [
+        "operation",
+        "job_id",
+        "root_id",
+        "files"
+      ],
+      "complete": [
+        "operation",
+        "job_id"
+      ],
+      "fail": [
+        "operation",
+        "job_id",
+        "error"
+      ]
     },
     "optionalFields": {
-      "start": ["client_version", "branch", "revision"]
+      "start": [
+        "client_version",
+        "branch",
+        "revision"
+      ]
     },
     "startOutcomes": {
       "created": {
-        "requiredFields": ["job"],
-        "optionalFields": ["pending_files", "deleted_files"],
+        "requiredFields": [
+          "job"
+        ],
+        "optionalFields": [
+          "pending_files",
+          "deleted_files"
+        ],
         "providerWork": "allowed"
       },
       "unchanged": {
-        "requiredFields": ["unchanged"],
+        "requiredFields": [
+          "unchanged"
+        ],
         "providerWork": "forbidden"
       },
       "busy": {
-        "requiredFields": ["busy", "busy_reason", "retry_after_seconds"],
-        "optionalFields": ["active_job"],
-        "reasons": ["active_job", "rate_limited"],
+        "requiredFields": [
+          "busy",
+          "busy_reason",
+          "retry_after_seconds"
+        ],
+        "optionalFields": [
+          "active_job"
+        ],
+        "reasons": [
+          "active_job",
+          "rate_limited"
+        ],
         "providerWork": "forbidden"
       },
       "busyRetryPolicy": "client_waits_without_consuming_failure_retry_budget"
     },
-    "limits": {
+    "limitNegotiation": {
+      "$comment": "Relay publishes the effective deployment limits on the codebase_index tool. Clients read them before scanning so deployment configuration and client batching cannot drift. Missing metadata is supported only for older relays through the compatibility fallback; malformed metadata fails before a manifest is sent.",
+      "toolMetadataField": "_meta",
+      "metadataKey": "com.anmezing.lce/index-limits",
+      "requiredFields": [
+        "maxFileBytes",
+        "maxBatchFiles",
+        "maxBatchBytes",
+        "estimatedChunkBytes",
+        "maxEstimatedChunks",
+        "maxManifestFiles",
+        "maxPathBytes"
+      ],
+      "missingMetadataBehavior": "use_compatibility_fallback",
+      "invalidMetadataBehavior": "fail_before_manifest_scan"
+    },
+    "compatibilityFallbackLimits": {
       "maxFileBytes": 524288,
+      "maxBatchFiles": 50,
+      "maxBatchBytes": 524288,
       "estimatedChunkBytes": 4096,
       "maxEstimatedChunks": 128,
-      "maxManifestFiles": 100000
+      "maxManifestFiles": 100000,
+      "maxPathBytes": 4096
     }
   },
   "rootResolution": {
     "$comment": "客户端解析项目根的唯一顺序。cwd 只在客户端不提供 roots 时作为兼容回退，且必须经过 Git 仓库、用户家目录和文件系统根校验。每个候选根必须是 git 仓库；否则拒绝并引导用户 git init，而不是退化成路径哈希 root 静默索引。",
-    "order": ["--repo", "roots/list", "validated-cwd", "tool.repo_path", "refuse"],
+    "order": [
+      "--repo",
+      "roots/list",
+      "validated-cwd",
+      "tool.repo_path",
+      "refuse"
+    ],
     "requiresGitRepository": true,
     "rejectsHomeDirAndFilesystemRoot": true,
     "multiRoot": "all_roots_indexed_one_view_each",
@@ -72,8 +139,16 @@
       "failed"
     ],
     "readyRequiresCompletedPublish": true,
-    "failureClasses": ["permanent", "transient"],
-    "errorCodes": ["INDEX_NOT_READY", "INDEX_FAILED", "ROOT_NOT_RESOLVED", "ROOT_NOT_A_GIT_REPO"],
+    "failureClasses": [
+      "permanent",
+      "transient"
+    ],
+    "errorCodes": [
+      "INDEX_NOT_READY",
+      "INDEX_FAILED",
+      "ROOT_NOT_RESOLVED",
+      "ROOT_NOT_A_GIT_REPO"
+    ],
     "statusFields": [
       "root_id",
       "phase",
@@ -91,13 +166,29 @@
   },
   "responseEnvelope": {
     "schemaVersion": "1.0",
-    "required": ["ok"],
-    "onSuccess": ["payload"],
-    "onError": ["error"],
-    "errorShape": ["message"]
+    "required": [
+      "ok"
+    ],
+    "onSuccess": [
+      "payload"
+    ],
+    "onError": [
+      "error"
+    ],
+    "errorShape": [
+      "message"
+    ]
   },
-  "manifestEntryFields": ["path", "hash", "size", "estimated_chunks"],
-  "clientRequestHeaders": ["Authorization", "X-LCE-Client-Version"],
+  "manifestEntryFields": [
+    "path",
+    "hash",
+    "size",
+    "estimated_chunks"
+  ],
+  "clientRequestHeaders": [
+    "Authorization",
+    "X-LCE-Client-Version"
+  ],
   "clientCompatibility": {
     "$comment": "当前发布版本以 npm dist-tag latest 为唯一可信来源；管理员只维护最低允许版本。配置最低版本后，索引请求必须携带客户端版本且不得低于下限。",
     "package": "@anmezing/lce-cloud",
@@ -105,15 +196,19 @@
     "minimumVersionSource": "relay_persistent_runtime_policy_with_env_bootstrap",
     "minimumVersionAdminConfigurable": true,
     "indexStartRequiresClientVersionWhenMinimumConfigured": true,
-    "upgradeCommand": "npm install -g @anmezing/lce-cloud@latest",
-    "restartRequiredAfterUpgrade": true
+    "restartRequiredAfterUpgrade": true,
+    "upgradeMechanism": "runtime_or_client_package_manager"
   },
   "codebaseRetrieval": {
     "$comment": "codebase-retrieval 经 relay 的可选透传参数。root_id 把检索限定到单个索引根（缺省=全租户，向后兼容）；客户端默认自动注入当前分支视图的 root_id。",
-    "optionalArguments": ["root_id"],
-    "clientOnlyArguments": ["repo_path"],
+    "optionalArguments": [
+      "root_id"
+    ],
+    "clientOnlyArguments": [
+      "repo_path"
+    ],
     "localKnowledgeFusion": {
-      "$comment": "The npm client may add bounded repository-local evidence after Relay retrieval. This does not add Relay arguments and does not upload artifacts.",
+      "$comment": "The local client may add bounded repository-local evidence after Relay retrieval. This does not add Relay arguments and does not upload artifacts.",
       "client": "@anmezing/lce-cloud",
       "mode": "post_retrieval_local",
       "defaultArtifacts": {
@@ -136,22 +231,45 @@
     }
   },
   "promptEnhancement": {
-    "$comment": "Relay removes tenant_id from the public schema and injects the authenticated tenant. The npm client defaults root_id to the current published branch view. Paths and line ranges in results are derived from retrieved chunks, not generation output.",
+    "$comment": "Relay removes tenant_id from the public schema and injects the authenticated tenant. The local client defaults root_id to the current published branch view. Paths and line ranges in results are derived from retrieved chunks, not generation output.",
     "toolName": "codebase_enhance_prompt",
     "input": {
-      "requiredFields": ["prompt"],
-      "optionalFields": ["technical_terms", "root_id", "output_language", "response_format"],
-      "clientOnlyFields": ["repo_path"],
-      "relayInjectedFields": ["tenant_id"],
+      "requiredFields": [
+        "prompt"
+      ],
+      "optionalFields": [
+        "technical_terms",
+        "root_id",
+        "output_language",
+        "response_format"
+      ],
+      "clientOnlyFields": [
+        "repo_path"
+      ],
+      "relayInjectedFields": [
+        "tenant_id"
+      ],
       "defaults": {
         "output_language": "auto",
         "response_format": "text"
       }
     },
-    "verifiedReferenceFields": ["rootId", "path", "startLine", "endLine", "breadcrumb"],
+    "verifiedReferenceFields": [
+      "rootId",
+      "path",
+      "startLine",
+      "endLine",
+      "breadcrumb"
+    ],
     "jsonEnvelope": {
       "schemaVersion": "1.0",
-      "requiredFields": ["schemaVersion", "toolName", "ok", "tool", "responseFormat"],
+      "requiredFields": [
+        "schemaVersion",
+        "toolName",
+        "ok",
+        "tool",
+        "responseFormat"
+      ],
       "successFields": [
         "payload.originalPrompt",
         "payload.enhancedPrompt",
@@ -159,8 +277,15 @@
         "payload.warnings",
         "payload.retrieval"
       ],
-      "errorFields": ["error.message", "error.code"],
-      "errorCodes": ["PROMPT_ENHANCER_NOT_CONFIGURED", "INVALID_ARGUMENTS", "TENANT_ACCESS_DENIED"]
+      "errorFields": [
+        "error.message",
+        "error.code"
+      ],
+      "errorCodes": [
+        "PROMPT_ENHANCER_NOT_CONFIGURED",
+        "INVALID_ARGUMENTS",
+        "TENANT_ACCESS_DENIED"
+      ]
     },
     "costs": {
       "readOnly": true,
@@ -177,6 +302,9 @@
     "separator": "@",
     "defaultView": "default",
     "maxRootIdLength": 128,
-    "rootsDerivedFields": ["base_root_id", "view_branch"]
+    "rootsDerivedFields": [
+      "base_root_id",
+      "view_branch"
+    ]
   }
 }

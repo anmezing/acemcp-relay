@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -13,8 +14,6 @@ import (
 
 	"github.com/gin-gonic/gin"
 )
-
-const maxPlatformModelConfigBody = 64 << 10
 
 var platformModelConfigSections = map[string]struct{}{
 	"embeddings":     {},
@@ -68,7 +67,7 @@ func callLCEPlatformConfig(ctx context.Context, method string, body interface{})
 		return nil, 0, err
 	}
 	defer resp.Body.Close()
-	data, err := io.ReadAll(io.LimitReader(resp.Body, maxPlatformModelConfigBody+1))
+	data, err := io.ReadAll(io.LimitReader(resp.Body, int64(maxPlatformModelConfigBody)+1))
 	if err != nil {
 		return nil, resp.StatusCode, err
 	}
@@ -82,7 +81,7 @@ func handleGetPlatformModelConfig(c *gin.Context) {
 	if !requirePlatformConfigConsole(c) {
 		return
 	}
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(c.Request.Context(), platformModelConfigReadTimeout)
 	defer cancel()
 	data, status, err := callLCEPlatformConfig(ctx, http.MethodGet, nil)
 	if err != nil {
@@ -138,6 +137,28 @@ func lceConfigError(data []byte, fallback string) string {
 	return fallback
 }
 
+func platformModelConfigTimedOut(ctx context.Context, err error) bool {
+	return errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded)
+}
+
+func acquirePlatformModelConfigWriteBarrier(ctx context.Context) error {
+	if platformModelConfigBarrier.TryLock() {
+		return nil
+	}
+	ticker := time.NewTicker(platformModelConfigLockPollInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			if platformModelConfigBarrier.TryLock() {
+				return nil
+			}
+		}
+	}
+}
+
 func parsePlatformModelConfigPatch(section string, raw json.RawMessage) (map[string]interface{}, error) {
 	section = strings.TrimSpace(section)
 	if _, ok := platformModelConfigSections[section]; !ok {
@@ -182,7 +203,7 @@ func handleSavePlatformModelConfig(c *gin.Context) {
 		return
 	}
 	if request.Action == "models" {
-		ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
+		ctx, cancel := context.WithTimeout(c.Request.Context(), platformModelDiscoveryTimeout)
 		defer cancel()
 		data, status, err := callLCEPlatformConfig(ctx, http.MethodPost, map[string]interface{}{
 			"action":   "models",
@@ -203,11 +224,6 @@ func handleSavePlatformModelConfig(c *gin.Context) {
 		return
 	}
 
-	platformModelConfigAdminMu.Lock()
-	defer platformModelConfigAdminMu.Unlock()
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 6*time.Minute)
-	defer cancel()
-
 	config, err := parsePlatformModelConfigPatch(request.Section, request.Config)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -217,16 +233,39 @@ func handleSavePlatformModelConfig(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "confirmEmbeddingReset is only valid for embeddings"})
 		return
 	}
-	validatedData, validatedStatus, err := callLCEPlatformConfig(ctx, http.MethodPost, map[string]interface{}{
+	if !platformModelConfigAdminMu.TryLock() {
+		c.JSON(http.StatusConflict, gin.H{
+			"code":  "MODEL_CONFIG_SAVE_IN_PROGRESS",
+			"error": "另一项模型配置正在验证或保存，请等待其结束后重试",
+		})
+		return
+	}
+	defer platformModelConfigAdminMu.Unlock()
+
+	validationCtx, cancelValidation := context.WithTimeout(c.Request.Context(), platformModelConfigValidationTimeout)
+	validatedData, validatedStatus, err := callLCEPlatformConfig(validationCtx, http.MethodPost, map[string]interface{}{
 		"action": "validate",
 		"config": config,
 	})
+	validationTimedOut := platformModelConfigTimedOut(validationCtx, err)
+	cancelValidation()
 	if err != nil {
+		if validationTimedOut {
+			c.JSON(http.StatusGatewayTimeout, gin.H{
+				"code":  "MODEL_CONFIG_VALIDATION_TIMEOUT",
+				"error": "模型连接验证超时；请检查供应商地址、网络、余额或服务状态后重试",
+			})
+			return
+		}
 		c.JSON(http.StatusBadGateway, gin.H{"error": "LCE 模型连接验证失败"})
 		return
 	}
 	if validatedStatus < 200 || validatedStatus >= 300 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": lceConfigError(validatedData, "模型配置验证失败")})
+		status := validatedStatus
+		if status < 400 || status > 599 {
+			status = http.StatusBadRequest
+		}
+		c.JSON(status, gin.H{"error": lceConfigError(validatedData, "模型配置验证失败")})
 		return
 	}
 	var validated struct {
@@ -245,36 +284,77 @@ func handleSavePlatformModelConfig(c *gin.Context) {
 		return
 	}
 
-	platformModelConfigBarrier.Lock()
-	defer platformModelConfigBarrier.Unlock()
 	clearedRelay := clearedRelayIndexes{}
 	if validated.EmbeddingChanged {
-		clearedRelay, err = clearAllRelayIndexState(ctx)
+		barrierCtx, cancelBarrier := context.WithTimeout(c.Request.Context(), platformModelConfigBarrierWait)
+		err = acquirePlatformModelConfigWriteBarrier(barrierCtx)
+		barrierTimedOut := errors.Is(barrierCtx.Err(), context.DeadlineExceeded)
+		cancelBarrier()
 		if err != nil {
+			if barrierTimedOut {
+				c.JSON(http.StatusConflict, gin.H{
+					"code":  "EMBEDDING_SWITCH_BUSY",
+					"error": "当前仍有索引或检索请求在执行，暂时不能切换 Embedding；请等待任务结束后重试",
+				})
+				return
+			}
+			return
+		}
+		defer platformModelConfigBarrier.Unlock()
+
+		clearCtx, cancelClear := context.WithTimeout(c.Request.Context(), platformModelConfigRelayClearTimeout)
+		clearedRelay, err = clearAllRelayIndexState(clearCtx)
+		clearTimedOut := platformModelConfigTimedOut(clearCtx, err)
+		cancelClear()
+		if err != nil {
+			if clearTimedOut {
+				c.JSON(http.StatusGatewayTimeout, gin.H{
+					"code":  "RELAY_INDEX_CLEAR_TIMEOUT",
+					"error": "清理 Relay 旧索引状态超时，配置未切换；请稍后重试",
+				})
+				return
+			}
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "清理旧索引失败，配置未切换"})
 			return
 		}
 	}
-	savedData, savedStatus, err := callLCEPlatformConfig(ctx, http.MethodPost, map[string]interface{}{
+
+	saveTimeout := platformModelConfigSimpleSaveTimeout
+	if validated.EmbeddingChanged {
+		saveTimeout = platformModelConfigResetSaveTimeout
+	}
+	saveCtx, cancelSave := context.WithTimeout(c.Request.Context(), saveTimeout)
+	savedData, savedStatus, err := callLCEPlatformConfig(saveCtx, http.MethodPost, map[string]interface{}{
 		"action":                "save",
 		"config":                config,
 		"confirmEmbeddingReset": request.ConfirmEmbeddingReset,
 		"validationTicket":      validated.ValidationTicket,
 	})
+	saveTimedOut := platformModelConfigTimedOut(saveCtx, err)
+	cancelSave()
 	if err != nil {
 		message := "LCE 未切换模型配置；请重试保存"
 		if validated.EmbeddingChanged {
 			message = "Relay 索引状态已清理，但 LCE 未切换配置；请重试保存"
 		}
-		c.JSON(http.StatusBadGateway, gin.H{
-			"error": message,
-		})
+		if saveTimedOut {
+			message = "保存 LCE 模型配置超时；请确认配置是否已生效，刷新后再决定是否重试"
+			if validated.EmbeddingChanged {
+				message = "Relay 索引状态已清理，但保存 LCE 配置超时；请刷新确认配置状态后再重试"
+			}
+			c.JSON(http.StatusGatewayTimeout, gin.H{
+				"code":  "MODEL_CONFIG_SAVE_TIMEOUT",
+				"error": message,
+			})
+			return
+		}
+		c.JSON(http.StatusBadGateway, gin.H{"error": message})
 		return
 	}
 	if savedStatus < 200 || savedStatus >= 300 {
 		message := lceConfigError(savedData, "保存模型配置失败")
 		if validated.EmbeddingChanged {
-			message = "Relay 索引状态已清理，但 LCE 未切换配置；请重试保存"
+			message = "Relay 索引状态已清理，但 LCE 未切换配置：" + message
 		}
 		c.JSON(savedStatus, gin.H{"error": message})
 		return

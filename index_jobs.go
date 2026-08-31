@@ -25,25 +25,7 @@ const (
 	indexJobStatusSuperseded = "superseded"
 	indexJobStatusTimedOut   = "timed_out"
 
-	indexJobHeartbeatTimeout = 10 * time.Minute
-	indexJobSweepInterval    = time.Minute
-	indexJobRenewCallTimeout = 15 * time.Second
-	maxIndexManifestFiles    = 100000
-	maxIndexBatchFiles       = 50
-	// 单个文件的内容上限。源码文件极少接近这个量级，而 embedding 本身也有
-	// token 上限——超过这个大小的"源码"要么是生成物要么是灌进来的负载。
-	maxIndexFileBytes = 512 << 10 // 512 KiB
-	// 单批内容总量上限。它也决定 Agent 报告进度和失败重试的粒度。
-	maxIndexBatchBytes = 512 << 10 // 512 KiB
-	// LCE's container entry point accepts a 4 MiB complete JSON-RPC body. Raw
-	// source is capped much lower because JSON escaping can expand a byte to a
-	// six-byte \\u00xx sequence. The serialized-body check below remains the
-	// authoritative guard for paths, model config, and all other envelope data.
-	maxLCEMCPRequestBodyBytes = 4 << 20 // 4 MiB
-	// 每用户每日索引字节的默认上限。正常项目首次全量索引通常在百 MB 量级，
-	// 之后只传变更；这个默认值对真实使用足够宽松，但能挡住批量灌数据。
-	defaultDailyIndexBytes = 2 << 30 // 2 GiB
-	indexProtocolVersion   = 1
+	indexProtocolVersion = 1
 )
 
 type indexUpstreamError struct {
@@ -770,12 +752,12 @@ func validateIndexBatchSize(files []indexManifestFile) (int64, error) {
 	var total int64
 	for _, file := range files {
 		size := int64(len(file.Content))
-		if size > maxIndexFileBytes {
+		if size > int64(maxIndexFileBytes) {
 			return 0, fmt.Errorf("file exceeds the %d byte limit: %s", maxIndexFileBytes, file.Path)
 		}
 		total += size
 	}
-	if total > maxIndexBatchBytes {
+	if total > int64(maxIndexBatchBytes) {
 		return 0, fmt.Errorf("index batch exceeds the %d byte limit", maxIndexBatchBytes)
 	}
 	return total, nil
@@ -1323,8 +1305,8 @@ func failIndexJob(ctx context.Context, userID, jobID, failure string) (indexJobV
 		return indexJobView{}, fmt.Errorf("index job id is required")
 	}
 	failure = strings.TrimSpace(failure)
-	if len(failure) > 2000 {
-		failure = truncateUTF8(failure, 2000)
+	if len(failure) > maxIndexFailureBytes {
+		failure = truncateUTF8(failure, maxIndexFailureBytes)
 	}
 	if failure == "" {
 		failure = "client reported indexing failure"

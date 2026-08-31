@@ -14,10 +14,6 @@ type indexOperationMode string
 const (
 	indexOperationShared    indexOperationMode = "shared"
 	indexOperationExclusive indexOperationMode = "exclusive"
-
-	indexOperationLeaseDuration = 2 * time.Minute
-	indexOperationRenewInterval = 30 * time.Second
-	indexOperationAcquirePoll   = 100 * time.Millisecond
 )
 
 type indexOperationLease struct {
@@ -38,7 +34,7 @@ func (l *indexOperationLease) Release() {
 	l.release.Do(func() {
 		close(l.stop)
 		<-l.done
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), indexOperationDBTimeout)
 		defer cancel()
 		_, _ = db.ExecContext(ctx,
 			`DELETE FROM index_operation_leases WHERE user_id = $1 AND lease_token = $2`,
@@ -148,7 +144,7 @@ func (l *indexOperationLease) renew() {
 		case <-l.ctx.Done():
 			return
 		case <-ticker.C:
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), indexOperationDBTimeout)
 			result, err := db.ExecContext(ctx, `
 				UPDATE index_operation_leases
 				SET lease_expires_at = NOW() + ($3 * INTERVAL '1 millisecond')

@@ -38,29 +38,14 @@ import (
 // ── 配置 ──────────────────────────────────────────────────────────────────
 
 var (
-	serverAddr               string
-	lceMCPURL                string
-	lceHealthURL             string
-	lcePlatformConfigURL     string
-	lcePlatformConfigToken   string
-	tenantAssertions         *tenantAssertionSigner
-	dbHost                   string
-	dbPort                   int
-	dbUser                   string
-	dbPassword               string
-	dbName                   string
-	redisHost                string
-	redisPort                int
-	trustedProxies           []string
-	bannedCacheTTL           time.Duration
-	defaultDailyRequestLimit int
-	dailyIndexBytesLimit     int64
-	proDailyRequestLimit     int
-	proDailyIndexBytesLimit  int64
-	debugCapturePaths        map[string]bool
-	debugCaptureMaxBytes     int
-	minClientVersion         string
-	clientVersionPolicyMu    sync.RWMutex
+	lceHealthURL           string
+	lcePlatformConfigURL   string
+	lcePlatformConfigToken string
+	tenantAssertions       *tenantAssertionSigner
+	trustedProxies         []string
+	debugCapturePaths      map[string]bool
+	minClientVersion       string
+	clientVersionPolicyMu  sync.RWMutex
 )
 
 const (
@@ -82,15 +67,8 @@ const (
 	StatusPending   = "pending"
 	StatusCompleted = "completed"
 
-	LeaderboardUpdateInterval = 30 * time.Minute
-	LeaderboardRetrievalPath  = "/mcp/tools/call/codebase-retrieval"
-	LeaderboardEnhancePath    = "/mcp/tools/call/codebase_enhance_prompt"
-	LeaderboardTopN           = 10
-	LeaderboardTimezone       = "Asia/Shanghai"
-
-	HealthCheckInterval = 2 * time.Minute
-	HealthCheckTimeout  = 30 * time.Second
-	maxClientMCPBody    = 32 << 20
+	LeaderboardRetrievalPath = "/mcp/tools/call/codebase-retrieval"
+	LeaderboardEnhancePath   = "/mcp/tools/call/codebase_enhance_prompt"
 )
 
 const leaderboardAggregationQuery = `
@@ -111,8 +89,9 @@ const leaderboardAggregationQuery = `
 func loadConfig() {
 	_ = godotenv.Load()
 
-	serverAddr = getEnv("SERVER_ADDR", "127.0.0.1:8080")
-	lceMCPURL = getEnv("LCE_MCP_URL", "http://127.0.0.1:3000/mcp")
+	loadRuntimePolicy()
+	configureMCPHTTPTransportPolicy()
+
 	// LCE 的存活探针：不建 session、不占并发额度，因此可以高频探测。
 	// 它只说明进程活着，功能性判断仍由 tools/list 负责。
 	// TrimRight 防止 LCE_MCP_URL 带尾斜杠时拼出 "…//health"。
@@ -136,26 +115,13 @@ func loadConfig() {
 		}
 		log.Println("[CONFIG] LCE_TENANT_ASSERTION_SECRET 未配置：不签发租户断言。若 LCE 已开启校验，租户调用会被拒绝")
 	}
-	dbHost = getEnv("DB_HOST", "localhost")
-	dbPort = getEnvInt("DB_PORT", 5432)
-	dbUser = getEnv("DB_USER", "postgres")
-	dbPassword = getEnv("DB_PASSWORD", "")
-	dbName = getEnv("DB_NAME", "postgres")
-	redisHost = getEnv("REDIS_HOST", "localhost")
-	redisPort = getEnvInt("REDIS_PORT", 6379)
 	trustedProxies = parseTrustedProxies(getEnv("TRUSTED_PROXIES", ""))
-	bannedCacheTTL = getEnvDuration("BANNED_CACHE_TTL", 5*time.Minute)
 	configureTrustedConsole(getEnv("CONSOLE_API_SECRET", ""))
-	defaultDailyRequestLimit = getEnvInt("DEFAULT_DAILY_REQUEST_LIMIT", 0)
 	// 索引通道除常规请求数配额外，还按上传字节计费：同样一次 upload 可以只带
 	// 几字节，也可以携带一整批源码，请求数无法反映实际 embedding 成本。
-	dailyIndexBytesLimit = getEnvInt64("DAILY_INDEX_BYTES_LIMIT", defaultDailyIndexBytes)
 	// pro 档限额：与前端并行开发的分层配额契约。缺省 0 = 不限。
-	proDailyRequestLimit = getEnvInt("PRO_DAILY_REQUEST_LIMIT", 0)
-	proDailyIndexBytesLimit = getEnvInt64("PRO_DAILY_INDEX_BYTES_LIMIT", 0)
 	initModelConfigKey()
 	debugCapturePaths = parsePathSet(getEnv("DEBUG_CAPTURE_PATHS", ""))
-	debugCaptureMaxBytes = getEnvInt("DEBUG_CAPTURE_MAX_BYTES", 4096)
 	minClientVersion = strings.TrimSpace(getEnv("MIN_CLIENT_VERSION", ""))
 }
 
@@ -267,27 +233,6 @@ func getEnv(key, defaultValue string) string {
 	return defaultValue
 }
 
-func getEnvInt(key string, defaultValue int) int {
-	if value := os.Getenv(key); value != "" {
-		if intVal, err := strconv.Atoi(value); err == nil {
-			return intVal
-		}
-	}
-	return defaultValue
-}
-
-// getEnvInt64 用于字节数这类可能超出 32 位 int 的配置：Atoi 在 32 位平台上
-// 解析 2GiB 会失败并静默退回默认值，那种降级在配额上是危险的。
-func getEnvInt64(key string, defaultValue int64) int64 {
-	if value := os.Getenv(key); value != "" {
-		if intVal, err := strconv.ParseInt(value, 10, 64); err == nil {
-			return intVal
-		}
-		log.Printf("[CONFIG] invalid %s=%q, falling back to %d", key, value, defaultValue)
-	}
-	return defaultValue
-}
-
 func getEnvDuration(key string, defaultValue time.Duration) time.Duration {
 	if value := os.Getenv(key); value != "" {
 		if duration, err := time.ParseDuration(value); err == nil {
@@ -307,19 +252,19 @@ type mcpClient struct {
 }
 
 var lce = &mcpClient{
-	http: &http.Client{
-		Transport: &http.Transport{
-			MaxIdleConns:        50,
-			MaxIdleConnsPerHost: 50,
-			IdleConnTimeout:     90 * time.Second,
-		},
-	},
+	http: &http.Client{Transport: &http.Transport{}},
 }
 
-const (
-	defaultMCPCallTimeout     = 120 * time.Second
-	remoteIndexMCPCallTimeout = 330 * time.Second
-)
+func configureMCPHTTPTransportPolicy() {
+	transport, ok := lce.http.Transport.(*http.Transport)
+	if !ok || transport == nil {
+		transport = &http.Transport{}
+		lce.http.Transport = transport
+	}
+	transport.MaxIdleConns = mcpHTTPMaxIdleConns
+	transport.MaxIdleConnsPerHost = mcpHTTPMaxIdlePerHost
+	transport.IdleConnTimeout = mcpHTTPIdleConnTimeout
+}
 
 func (m *mcpClient) ensureSession(ctx context.Context) (string, error) {
 	m.mu.RLock()
@@ -331,11 +276,9 @@ func (m *mcpClient) ensureSession(ctx context.Context) (string, error) {
 	return m.initSession(ctx)
 }
 
-// initSessionTimeout 限制 initSession 持写锁期间两次网络调用的总时长。
+// mcpInitSessionTimeout 限制 initSession 持写锁期间两次网络调用的总时长。
 // 这里所有并发请求的 ensureSession 都会阻塞在写锁上，不能让调用方自带的
 // 120s 超时决定锁的持有时间。
-const initSessionTimeout = 10 * time.Second
-
 func (m *mcpClient) initSession(ctx context.Context) (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -343,7 +286,7 @@ func (m *mcpClient) initSession(ctx context.Context) (string, error) {
 		return m.sessionID, nil
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, initSessionTimeout)
+	ctx, cancel := context.WithTimeout(ctx, mcpInitSessionTimeout)
 	defer cancel()
 
 	initBody, _ := json.Marshal(map[string]interface{}{
@@ -423,7 +366,7 @@ func (m *mcpClient) deleteRemoteSession(sid string) {
 	if sid == "" {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), initSessionTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), mcpInitSessionTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, lceMCPURL, nil)
 	if err != nil {
@@ -475,7 +418,7 @@ func validateMCPToolCallBody(name string, args map[string]interface{}) (int, err
 }
 
 func (m *mcpClient) callTool(ctx context.Context, name string, args map[string]interface{}) (*mcpToolResult, error) {
-	return m.callToolWithTimeout(ctx, name, args, defaultMCPCallTimeout)
+	return m.callToolWithTimeout(ctx, name, args, mcpCallTimeout)
 }
 
 func (m *mcpClient) callToolWithTimeout(ctx context.Context, name string, args map[string]interface{}, timeout time.Duration) (result *mcpToolResult, err error) {
@@ -702,10 +645,10 @@ func initDB() error {
 		return err
 	}
 
-	db.SetMaxOpenConns(40)
-	db.SetMaxIdleConns(40)
-	db.SetConnMaxLifetime(30 * time.Minute)
-	db.SetConnMaxIdleTime(5 * time.Minute)
+	db.SetMaxOpenConns(dbMaxOpenConns)
+	db.SetMaxIdleConns(dbMaxIdleConns)
+	db.SetConnMaxLifetime(dbConnMaxLifetime)
+	db.SetConnMaxIdleTime(dbConnMaxIdleTime)
 
 	if err = db.Ping(); err != nil {
 		return err
@@ -854,9 +797,9 @@ func initRedis() error {
 // ── 认证 ──────────────────────────────────────────────────────────────────
 //
 // api key 认证走一层进程内缓存（单实例设计，横向扩展前需外置到 Redis）：
-//   - 正缓存 TTL 30s：封禁 / 删除 / 重置 key 的撤销延迟最多 30 秒，产品上可接受，
-//     不做跨进程失效机制。
-//   - 负缓存 TTL 5s：查无此 key 也短暂缓存，防止爆破流量打穿 PostgreSQL。
+//   - 正缓存 TTL：封禁 / 删除 / 重置 key 的撤销延迟由运行策略控制，
+//     当前不做跨进程失效机制。
+//   - 负缓存 TTL：查无此 key 也短暂缓存，防止爆破流量打穿 PostgreSQL。
 //   - 容量上限 authCacheMaxEntries，写入时若已满先惰性清理过期条目；仍满则
 //     跳过缓存（请求本身仍走 DB 认证，fail-open 只影响缓存不影响正确性）。
 //
@@ -865,10 +808,6 @@ func initRedis() error {
 // 因此前端切换写入算法时 relay 无需改动。
 
 const (
-	authCachePositiveTTL = 30 * time.Second
-	authCacheNegativeTTL = 5 * time.Second
-	authCacheMaxEntries  = 10000
-
 	// tier 取值契约（与前端并行开发，已定死）：'free' | 'pro'，
 	// 未知值按 free 处理（fail-safe：不给未知档位放开限额）。
 	tierFree = "free"
@@ -1237,8 +1176,6 @@ func completeRequestLogAsync(entry RequestLogEntry) {
 	}()
 }
 
-const staleRequestLogAfter = 15 * time.Minute
-
 // Requests are initially inserted as pending so the log is visible while an
 // MCP call is running. A process restart or a database outage can otherwise
 // leave that marker forever; only records older than the stale threshold are
@@ -1247,8 +1184,8 @@ func reconcileStaleRequestLogs() {
 	result, err := db.Exec(`
 		UPDATE request_logs
 		SET status = $1, status_code = $2, response_duration_ms = EXTRACT(EPOCH FROM (NOW() - request_timestamp) * 1000)::bigint, updated_at = NOW()
-		WHERE status = $3 AND request_timestamp < NOW() - INTERVAL '15 minutes'
-	`, StatusCompleted, 499, StatusPending)
+		WHERE status = $3 AND request_timestamp < NOW() - ($4 * INTERVAL '1 millisecond')
+	`, StatusCompleted, 499, StatusPending, staleRequestLogAfter.Milliseconds())
 	if err != nil {
 		log.Printf("[REQUEST_LOG] Failed to reconcile stale pending logs: %v", err)
 		return
@@ -1260,7 +1197,7 @@ func reconcileStaleRequestLogs() {
 
 func startRequestLogReconciler(ctx context.Context) {
 	reconcileStaleRequestLogs()
-	ticker := time.NewTicker(5 * time.Minute)
+	ticker := time.NewTicker(requestLogReconcileInterval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -1324,17 +1261,9 @@ func getRequestLogEntry(c *gin.Context, statusCode int) RequestLogEntry {
 // ── MCP 服务端 ──────────────────────────────────────────────────────────────
 
 const (
-	mcpProtocolVersion      = "2025-03-26"
-	mcpServerName           = "lce"
-	mcpServerVersion        = "2.0.0"
-	mcpSessionTTL           = 30 * time.Minute
-	mcpSessionSweepInterval = 60 * time.Second
-	toolsCacheTTL           = 5 * time.Minute
-)
-
-var (
-	mcpMaxSessions        = max(1, getEnvInt("MCP_MAX_SESSIONS", 1000))
-	mcpMaxSessionsPerUser = max(1, getEnvInt("MCP_MAX_SESSIONS_PER_USER", 16))
+	mcpProtocolVersion = "2025-03-26"
+	mcpServerName      = "lce"
+	mcpServerVersion   = "2.0.0"
 )
 
 type chatMCPToolPolicy struct {
@@ -1774,14 +1703,14 @@ func getCachedToolsList(ctx context.Context) (json.RawMessage, error) {
 func handleMCPPost(c *gin.Context) {
 	userID := c.GetString(ContextKeyUserID)
 
-	body, err := io.ReadAll(io.LimitReader(c.Request.Body, maxClientMCPBody+1))
+	body, err := io.ReadAll(io.LimitReader(c.Request.Body, int64(maxClientMCPBody)+1))
 	if err != nil {
 		c.JSON(http.StatusBadRequest, rpcError(nil, -32700, "failed to read request body"))
 		completeRequestLogAsync(getRequestLogEntry(c, http.StatusBadRequest))
 		return
 	}
 	if len(body) > maxClientMCPBody {
-		c.JSON(http.StatusRequestEntityTooLarge, rpcError(nil, -32600, "MCP request body exceeds 32 MiB"))
+		c.JSON(http.StatusRequestEntityTooLarge, rpcError(nil, -32600, byteLimitMessage("MCP request body", maxClientMCPBody)))
 		completeRequestLogAsync(getRequestLogEntry(c, http.StatusRequestEntityTooLarge))
 		return
 	}
@@ -2087,8 +2016,6 @@ func handleMCPToolsCall(c *gin.Context, id json.RawMessage, params json.RawMessa
 
 // ── 清除索引（冷却 + 日志清理）──────────────────────────────────────────
 
-const clearIndexCooldownSeconds = 72 * 60 * 60 // 72 hours
-
 // clearIndexCooldownKey 按租户计冷却：组织索引是共享数据，冷却也共享。
 func clearIndexCooldownKey(tenantID string) string {
 	return "clear_cooldown:" + tenantID
@@ -2111,7 +2038,7 @@ func setClearIndexCooldown(ctx context.Context, tenantID string) {
 	if redisClient == nil {
 		return
 	}
-	redisClient.Set(ctx, clearIndexCooldownKey(tenantID), "1", time.Duration(clearIndexCooldownSeconds)*time.Second)
+	redisClient.Set(ctx, clearIndexCooldownKey(tenantID), "1", clearIndexCooldown)
 }
 
 func deleteUserLogsAsync(userID string) {
@@ -2442,7 +2369,7 @@ func compressResponse(data []byte, encoding string) ([]byte, string) {
 // ── 排行榜 ────────────────────────────────────────────────────────────────
 
 func updateLeaderboard() error {
-	loc, err := time.LoadLocation(LeaderboardTimezone)
+	loc, err := time.LoadLocation(leaderboardTimezone)
 	if err != nil {
 		return fmt.Errorf("failed to load timezone: %w", err)
 	}
@@ -2450,11 +2377,11 @@ func updateLeaderboard() error {
 	now := time.Now().In(loc)
 	dateStr := now.Format("2006-01-02")
 	dayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc)
-	dayEnd := dayStart.Add(24 * time.Hour)
+	dayEnd := dayStart.AddDate(0, 0, 1)
 
 	log.Printf("[LEADERBOARD] Updating leaderboard for %s", dateStr)
 
-	rows, err := db.Query(leaderboardAggregationQuery, dayStart, dayEnd, LeaderboardTopN)
+	rows, err := db.Query(leaderboardAggregationQuery, dayStart, dayEnd, leaderboardTopN)
 	if err != nil {
 		return fmt.Errorf("failed to query leaderboard data: %w", err)
 	}
@@ -2513,7 +2440,7 @@ func updateLeaderboard() error {
 }
 
 func startLeaderboardScheduler(ctx context.Context) {
-	ticker := time.NewTicker(LeaderboardUpdateInterval)
+	ticker := time.NewTicker(leaderboardUpdateInterval)
 	defer ticker.Stop()
 
 	for {
@@ -2561,7 +2488,7 @@ func formatNullMs(value sql.NullInt64) string {
 }
 
 func runHealthProbe() {
-	ctx, cancel := context.WithTimeout(context.Background(), HealthCheckTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), healthCheckTimeout)
 	defer cancel()
 
 	var livenessMs sql.NullInt64
@@ -2570,7 +2497,7 @@ func runHealthProbe() {
 	status := "success"
 
 	defer func() {
-		nextCheckAt := time.Now().Add(HealthCheckInterval)
+		nextCheckAt := time.Now().Add(healthCheckInterval)
 		// 列名是历史遗留：tcp_ping_ms 现在写的是 HTTP 存活探针耗时，
 		// codebase_retrieval_ms 写的是 tools/list 耗时。改列名需要迁移且
 		// 前端面板按旧列名取数，这里只以注释说明语义。
@@ -2614,7 +2541,7 @@ func startHealthScheduler(ctx context.Context) {
 		case <-ctx.Done():
 			log.Println("[HEALTH] Scheduler stopped")
 			return
-		case <-time.After(HealthCheckInterval):
+		case <-time.After(healthCheckInterval):
 		}
 	}
 }
@@ -2670,8 +2597,8 @@ func main() {
 		// /metrics 默认只在这个 loopback 内部端口暴露：nginx 只向 relay 转发
 		// /mcp 前缀，主端口不注册 /metrics（除非配置 METRICS_TOKEN）。
 		pprofMux.Handle("/metrics", metricsHandler())
-		log.Println("[PPROF] Listening on 127.0.0.1:6060 (pprof + /metrics)")
-		if err := http.ListenAndServe("127.0.0.1:6060", pprofMux); err != nil {
+		log.Printf("[PPROF] Listening on %s (pprof + /metrics)", pprofAddr)
+		if err := http.ListenAndServe(pprofAddr, pprofMux); err != nil {
 			log.Printf("[PPROF] Server error: %v", err)
 		}
 	}()

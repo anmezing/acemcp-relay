@@ -28,7 +28,7 @@ func TestIndexSizeCapsAreOrderedAndBounded(t *testing.T) {
 		t.Errorf("单文件上限 (%d) 不应超过单批上限 (%d)", maxIndexFileBytes, maxIndexBatchBytes)
 	}
 	// 每日配额必须显著大于单批上限，否则一批就撞墙，正常扫描无法完成
-	if defaultDailyIndexBytes <= maxIndexBatchBytes {
+	if defaultDailyIndexBytes <= int64(maxIndexBatchBytes) {
 		t.Errorf("每日配额 (%d) 应远大于单批上限 (%d)", defaultDailyIndexBytes, maxIndexBatchBytes)
 	}
 	// 单批上限乘以批文件数上限不应超出 nginx 的 100MB 请求体限制
@@ -79,7 +79,7 @@ func TestEncodedMCPEnvelopeCannotExceedDownstreamBodyLimit(t *testing.T) {
 func TestSingleRequestCannotDriveUnboundedEmbedding(t *testing.T) {
 	// 加固前：1 次配额（创建 job）之后的批次不受任何体积约束
 	// 加固后：每批最多 maxIndexBatchBytes，且当日总量受 defaultDailyIndexBytes 封顶
-	maxPerDay := int64(defaultDailyIndexBytes)
+	maxPerDay := defaultDailyIndexBytes
 
 	// 上百 GB 是修复前的量级，修复后必须远低于它
 	const preFixOrderOfMagnitude = int64(100) << 30 // 100 GiB

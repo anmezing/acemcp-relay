@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"path"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -16,23 +17,12 @@ import (
 
 const (
 	codebaseIndexToolName = "codebase_index"
-	maxIndexPathBytes     = 4096
-	// 云客户端按每 4 KiB 估算一个分块；单文件上限为 512 KiB，因此 manifest
-	// 中的 estimated_chunks 最大为 128。两个值由 cloud-protocol.json 钉住。
+	// 客户端与 Relay 共享该估算单位；文件上限可配置，因此最大分块数运行时计算。
 	estimatedIndexChunkBytes = 4096
-	maxIndexEstimatedChunks  = (maxIndexFileBytes + estimatedIndexChunkBytes - 1) / estimatedIndexChunkBytes
 
 	// indexEnvelopeSchemaVersion 是跨仓库契约值（docs/contracts/cloud-protocol.json
 	// 的 responseEnvelope.schemaVersion），由 contract_pin_test.go 钉住。
 	indexEnvelopeSchemaVersion = "1.0"
-
-	// indexStartMinInterval 是同一 (user, root) 两次 start 之间的最小间隔：
-	// start 会触发 manifest 对账、staging 清理等重活，客户端重试逻辑失控时
-	// 靠它保护服务端。首次调用（无历史记录）必然放行，full sync 不受影响。
-	indexStartMinInterval = 30 * time.Second
-	// indexStartSeenMaxEntries 触发过期清理的上限，防止 (user, root) 基数
-	// 无界增长导致内存泄漏。
-	indexStartSeenMaxEntries = 4096
 )
 
 var (
@@ -41,7 +31,8 @@ var (
 	// '@' 允许出现在非首位：客户端把分支视图编码进 root_id（<root>@<branch>），
 	// /mcp/roots 按最后一个 '@' 拆出 base_root_id 与视图分支。分支名里不在
 	// 本字符集内的字符（如 '/'）必须由客户端在编码时清洗。
-	indexRootIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$`)
+	indexRootIDPattern     = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$`)
+	indexRetryAfterPattern = regexp.MustCompile(`(?i)retry after\s+(\d+)\s+seconds?`)
 
 	indexStartSeenMu sync.Mutex
 	indexStartSeen   = make(map[string]time.Time)
@@ -131,8 +122,8 @@ type mcpIndexFailArgs struct {
 }
 
 // codebaseIndexEnvelope 构造 codebase_index 的响应信封。字段名与
-// docs/contracts/cloud-protocol.json 的 responseEnvelope 契约一致：
-// ok 必有；成功带 payload，失败带 error:{message}。
+// docs/contracts/cloud-protocol.json 的 responseEnvelope 契约一致。失败除 message
+// 外返回稳定诊断字段，让客户端无需解析供应商文案即可决定重试/修复动作。
 func codebaseIndexEnvelope(ok bool, payload interface{}, errMessage string) map[string]interface{} {
 	envelope := map[string]interface{}{
 		"schemaVersion":  indexEnvelopeSchemaVersion,
@@ -144,9 +135,43 @@ func codebaseIndexEnvelope(ok bool, payload interface{}, errMessage string) map[
 	if ok {
 		envelope["payload"] = payload
 	} else {
-		envelope["error"] = map[string]interface{}{"message": errMessage}
+		diagnostic := classifyIndexFailure(indexJobStatusFailed, errMessage)
+		errorPayload := map[string]interface{}{
+			"message":  errMessage,
+			"code":     diagnostic.Code,
+			"origin":   diagnostic.Origin,
+			"recovery": diagnostic.Recovery,
+		}
+		if retryAfterSeconds, ok := indexRetryAfterSeconds(errMessage); ok {
+			errorPayload["retry_after_seconds"] = retryAfterSeconds
+		}
+		envelope["error"] = errorPayload
 	}
 	return envelope
+}
+
+func indexRetryAfterSeconds(detail string) (int, bool) {
+	match := indexRetryAfterPattern.FindStringSubmatch(detail)
+	if len(match) != 2 {
+		return 0, false
+	}
+	seconds, err := strconv.Atoi(match[1])
+	if err != nil || seconds <= 0 {
+		return 0, false
+	}
+	return seconds, true
+}
+
+func codebaseIndexLimitMetadata() map[string]interface{} {
+	return map[string]interface{}{
+		"maxFileBytes":        maxIndexFileBytes,
+		"maxBatchFiles":       maxIndexBatchFiles,
+		"maxBatchBytes":       maxIndexBatchBytes,
+		"estimatedChunkBytes": estimatedIndexChunkBytes,
+		"maxEstimatedChunks":  maxIndexEstimatedChunks(),
+		"maxManifestFiles":    maxIndexManifestFiles,
+		"maxPathBytes":        maxIndexPathBytes,
+	}
 }
 
 func codebaseIndexToolDefinition() (json.RawMessage, error) {
@@ -158,7 +183,7 @@ func codebaseIndexToolDefinition() (json.RawMessage, error) {
 			"path":             map[string]interface{}{"type": "string", "minLength": 1, "maxLength": maxIndexPathBytes},
 			"hash":             map[string]interface{}{"type": "string", "pattern": "^[a-fA-F0-9]{64}$"},
 			"size":             map[string]interface{}{"type": "integer", "minimum": 1, "maximum": maxIndexFileBytes},
-			"estimated_chunks": map[string]interface{}{"type": "integer", "minimum": 1, "maximum": maxIndexEstimatedChunks},
+			"estimated_chunks": map[string]interface{}{"type": "integer", "minimum": 1, "maximum": maxIndexEstimatedChunks()},
 		},
 	}
 	uploadFile := map[string]interface{}{
@@ -187,7 +212,10 @@ func codebaseIndexToolDefinition() (json.RawMessage, error) {
 	}
 	definition := map[string]interface{}{
 		"name": codebaseIndexToolName,
-		"description": "Synchronize the current local workspace into the authenticated tenant index without an IDE plugin. " +
+		"_meta": map[string]interface{}{
+			"com.anmezing.lce/index-limits": codebaseIndexLimitMetadata(),
+		},
+		"description": "Synchronize the current local workspace into the authenticated tenant index without requiring a host-specific plugin. " +
 			"The Agent must read the workspace with its native file tools, exclude secrets/binaries/generated dependencies, and call operations in order: " +
 			"start with the complete UTF-8 file manifest and stable root_id; upload only pending_files in bounded batches; " +
 			"call upload once with an empty files array when start reports only deletions; complete after every pending file is accepted; " +
@@ -233,7 +261,7 @@ func codebaseIndexToolDefinition() (json.RawMessage, error) {
 					"properties": map[string]interface{}{
 						"operation": operation("fail"),
 						"job_id":    map[string]interface{}{"type": "string", "minLength": 1},
-						"error":     map[string]interface{}{"type": "string", "maxLength": 2000},
+						"error":     map[string]interface{}{"type": "string", "maxLength": maxIndexFailureBytes},
 					},
 				},
 			},
@@ -337,11 +365,11 @@ func validateMCPManifestFiles(files []mcpIndexManifestFile) ([]indexManifestFile
 		if !sha256Pattern.MatchString(strings.TrimSpace(file.Hash)) {
 			return nil, fmt.Errorf("manifest file hash must be SHA-256: %s", filePath)
 		}
-		if file.Size < 1 || file.Size > maxIndexFileBytes {
+		if file.Size < 1 || file.Size > int64(maxIndexFileBytes) {
 			return nil, fmt.Errorf("manifest file size is invalid: %s", filePath)
 		}
-		if file.EstimatedChunks < 1 || file.EstimatedChunks > maxIndexEstimatedChunks {
-			return nil, fmt.Errorf("estimated_chunks must be between 1 and %d: %s", maxIndexEstimatedChunks, filePath)
+		if file.EstimatedChunks < 1 || file.EstimatedChunks > maxIndexEstimatedChunks() {
+			return nil, fmt.Errorf("estimated_chunks must be between 1 and %d: %s", maxIndexEstimatedChunks(), filePath)
 		}
 		result = append(result, indexManifestFile{
 			Path:            filePath,
