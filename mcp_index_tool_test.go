@@ -8,35 +8,6 @@ import (
 	"time"
 )
 
-func TestCodebaseIndexEnvelopeIncludesStableFailureDiagnostics(t *testing.T) {
-	embedding := codebaseIndexEnvelope(false, nil, "Embedding API 错误: HTTP 400: input must be encoded in valid UTF-8 format")
-	embeddingError, ok := embedding["error"].(map[string]interface{})
-	if !ok {
-		t.Fatalf("error payload has unexpected type: %T", embedding["error"])
-	}
-	if got := embeddingError["code"]; got != "embedding_input_rejected" {
-		t.Fatalf("embedding error code = %v", got)
-	}
-	if got := embeddingError["origin"]; got != "provider" {
-		t.Fatalf("embedding error origin = %v", got)
-	}
-	if got := embeddingError["recovery"]; got != "fix_embedding_input" {
-		t.Fatalf("embedding error recovery = %v", got)
-	}
-
-	quota := codebaseIndexEnvelope(false, nil, "daily index quota exceeded; retry after 56844 seconds")
-	quotaError, ok := quota["error"].(map[string]interface{})
-	if !ok {
-		t.Fatalf("quota error payload has unexpected type: %T", quota["error"])
-	}
-	if got := quotaError["code"]; got != "index_quota_exceeded" {
-		t.Fatalf("quota error code = %v", got)
-	}
-	if got := quotaError["retry_after_seconds"]; got != 56844 {
-		t.Fatalf("quota retry_after_seconds = %v", got)
-	}
-}
-
 func TestCodebaseIndexDefinitionKeepsTenantAndControlFieldsServerManaged(t *testing.T) {
 	raw, err := codebaseIndexToolDefinition()
 	if err != nil {
@@ -48,24 +19,6 @@ func TestCodebaseIndexDefinitionKeepsTenantAndControlFieldsServerManaged(t *test
 	}
 	if tool["name"] != codebaseIndexToolName {
 		t.Fatalf("unexpected tool name: %#v", tool["name"])
-	}
-	metadata, ok := tool["_meta"].(map[string]interface{})
-	if !ok {
-		t.Fatalf("codebase_index must publish deployment limit metadata: %#v", tool["_meta"])
-	}
-	limits, ok := metadata["com.anmezing.lce/index-limits"].(map[string]interface{})
-	if !ok {
-		t.Fatalf("codebase_index limit metadata missing: %#v", metadata)
-	}
-	for field, want := range map[string]int{
-		"maxFileBytes": maxIndexFileBytes, "maxBatchFiles": maxIndexBatchFiles,
-		"maxBatchBytes": maxIndexBatchBytes, "estimatedChunkBytes": estimatedIndexChunkBytes,
-		"maxEstimatedChunks": maxIndexEstimatedChunks(), "maxManifestFiles": maxIndexManifestFiles,
-		"maxPathBytes": maxIndexPathBytes,
-	} {
-		if got := int(limits[field].(float64)); got != want {
-			t.Fatalf("unexpected %s metadata: got %d want %d", field, got, want)
-		}
 	}
 	encoded := string(raw)
 	for _, forbidden := range []string{"tenant_id", "model_config", "deleted_files", "protocol_version"} {
@@ -147,12 +100,12 @@ func TestMCPIndexFileValidationRequiresRealSHAAndText(t *testing.T) {
 		t.Fatal("empty files must stay outside the index manifest")
 	}
 	if _, err := validateMCPManifestFiles([]mcpIndexManifestFile{{
-		Path: "src/main.go", Hash: hash, Size: int64(maxIndexFileBytes), EstimatedChunks: maxIndexEstimatedChunks(),
+		Path: "src/main.go", Hash: hash, Size: maxIndexFileBytes, EstimatedChunks: maxIndexEstimatedChunks,
 	}}); err != nil {
 		t.Fatalf("maximum valid estimated chunk count was rejected: %v", err)
 	}
 	if _, err := validateMCPManifestFiles([]mcpIndexManifestFile{{
-		Path: "src/main.go", Hash: hash, Size: int64(maxIndexFileBytes), EstimatedChunks: maxIndexEstimatedChunks() + 1,
+		Path: "src/main.go", Hash: hash, Size: maxIndexFileBytes, EstimatedChunks: maxIndexEstimatedChunks + 1,
 	}}); err == nil || !strings.Contains(err.Error(), "between 1 and 128") {
 		t.Fatalf("estimated chunk count above the protocol maximum must fail, got %v", err)
 	}

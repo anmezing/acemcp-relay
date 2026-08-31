@@ -312,17 +312,15 @@ func classifyIndexFailure(status, detail string) indexFailureDiagnostic {
 		return indexFailureDiagnostic{"heartbeat_timeout", "relay", "restart_client"}
 	case containsAny("cloud embedding space changed", "embedding space changed", "clear the tenant root before starting a new index job"):
 		return indexFailureDiagnostic{"embedding_space_changed", "remote_index", "reset_root"}
-	case containsAny("embedding api 错误: http 400", "embedding api error: http 400", "valid utf-8 format", "special characters are properly escaped", "remote-index 400"):
-		return indexFailureDiagnostic{"embedding_input_rejected", "provider", "fix_embedding_input"}
 	case containsAny("remote-index 502", "bad gateway", "cloudflare", "origin web server returned"):
 		return indexFailureDiagnostic{"upstream_bad_gateway", "remote_index", "retry_after_service_recovers"}
 	case containsAny("payment required", "insufficient balance", "insufficient credit", "余额不足", "欠费", "billing", "remote-index 402"):
 		return indexFailureDiagnostic{"provider_billing", "provider", "fix_provider_billing"}
 	case containsAny("too many requests", "rate limit", "rate-limit", "remote-index 429"):
 		return indexFailureDiagnostic{"provider_rate_limited", "provider", "retry_later"}
-	case containsAny("manifest exceeds", "unreadable file list exceeds", "too many files", "file count limit", "maximum file count", "文件数量", "文件数超过"):
+	case containsAny("manifest exceeds", "unreadable file list exceeds", "too many files", "file count limit", "maximum file count", "100,000 files", "100000 files", "文件数量", "文件数超过"):
 		return indexFailureDiagnostic{"repository_file_limit", "client", "reduce_repository"}
-	case containsAny("manifest file size is invalid", "file exceeds the", "byte limit", "file too large", "file size limit", "maximum file size", "文件大小超过", "单文件过大"):
+	case containsAny("manifest file size is invalid", "file exceeds the", "byte limit", "file too large", "file size limit", "maximum file size", "512 kib", "524288", "文件大小超过", "单文件过大"):
 		return indexFailureDiagnostic{"repository_file_size_limit", "client", "reduce_repository"}
 	case containsAny("quota exceeded", "quota exhausted", "配额不足", "配额已用尽", "超出配额"):
 		return indexFailureDiagnostic{"index_quota_exceeded", "relay", "wait_for_quota_reset"}
@@ -381,13 +379,18 @@ func handleListRoots(c *gin.Context) {
 
 // ── POST /mcp/delete-root ──────────────────────────────────────────────────
 
+const (
+	deleteRootMinInterval  = time.Minute
+	deleteRootSeenMaxEntry = 4096
+)
+
 var (
 	deleteRootSeenMu sync.Mutex
 	deleteRootSeen   = make(map[string]time.Time)
 )
 
 // checkDeleteRootRateLimit 与 checkIndexStartRateLimit 同模式，key 为
-// (tenant, root)：同一租户与 root 的删除保护窗口由运行策略控制，组织成员共享窗口。
+// (tenant, root)：每租户每 root 1 次/分钟，组织成员共享同一窗口。
 // 返回 0 表示放行并记录；正数表示还需等待的秒数（向上取整）。
 func checkDeleteRootRateLimit(tenantID, rootID string, now time.Time) int {
 	key := tenantID + "\x00" + lceIndexRootID(rootID)

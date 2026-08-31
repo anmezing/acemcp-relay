@@ -48,22 +48,12 @@ type cloudProtocolContract struct {
 			} `json:"busy"`
 			BusyRetryPolicy string `json:"busyRetryPolicy"`
 		} `json:"startOutcomes"`
-		LimitNegotiation struct {
-			ToolMetadataField       string   `json:"toolMetadataField"`
-			MetadataKey             string   `json:"metadataKey"`
-			RequiredFields          []string `json:"requiredFields"`
-			MissingMetadataBehavior string   `json:"missingMetadataBehavior"`
-			InvalidMetadataBehavior string   `json:"invalidMetadataBehavior"`
-		} `json:"limitNegotiation"`
-		CompatibilityFallbackLimits struct {
+		Limits struct {
 			MaxFileBytes        int `json:"maxFileBytes"`
-			MaxBatchFiles       int `json:"maxBatchFiles"`
-			MaxBatchBytes       int `json:"maxBatchBytes"`
 			EstimatedChunkBytes int `json:"estimatedChunkBytes"`
 			MaxEstimatedChunks  int `json:"maxEstimatedChunks"`
 			MaxManifestFiles    int `json:"maxManifestFiles"`
-			MaxPathBytes        int `json:"maxPathBytes"`
-		} `json:"compatibilityFallbackLimits"`
+		} `json:"limits"`
 	} `json:"codebaseIndex"`
 	ResponseEnvelope struct {
 		SchemaVersion string   `json:"schemaVersion"`
@@ -80,7 +70,7 @@ type cloudProtocolContract struct {
 		MinimumVersionSource                                 string `json:"minimumVersionSource"`
 		MinimumVersionAdminConfigurable                      bool   `json:"minimumVersionAdminConfigurable"`
 		IndexStartRequiresClientVersionWhenMinimumConfigured bool   `json:"indexStartRequiresClientVersionWhenMinimumConfigured"`
-		UpgradeMechanism                                     string `json:"upgradeMechanism"`
+		UpgradeCommand                                       string `json:"upgradeCommand"`
 		RestartRequiredAfterUpgrade                          bool   `json:"restartRequiredAfterUpgrade"`
 	} `json:"clientCompatibility"`
 	PromptEnhancement struct {
@@ -182,44 +172,23 @@ func TestContractPinCodebaseIndexOperationsAndRequiredFields(t *testing.T) {
 	}
 }
 
-func TestContractPinIndexLimitNegotiation(t *testing.T) {
+func TestContractPinIndexEstimationLimits(t *testing.T) {
 	contract := loadCloudProtocolContract(t)
-	negotiation := contract.CodebaseIndex.LimitNegotiation
-	if negotiation.ToolMetadataField != "_meta" ||
-		negotiation.MetadataKey != "com.anmezing.lce/index-limits" ||
-		negotiation.MissingMetadataBehavior != "use_compatibility_fallback" ||
-		negotiation.InvalidMetadataBehavior != "fail_before_manifest_scan" {
-		t.Fatalf("index limit negotiation contract drifted: %+v", negotiation)
-	}
-	wantFields := []string{
-		"maxFileBytes", "maxBatchFiles", "maxBatchBytes", "estimatedChunkBytes",
-		"maxEstimatedChunks", "maxManifestFiles", "maxPathBytes",
-	}
-	if msg := diffStringSets("index limit metadata fields", negotiation.RequiredFields, wantFields); msg != "" {
-		t.Fatal(msg)
-	}
-	metadata := codebaseIndexLimitMetadata()
-	for _, field := range wantFields {
-		if _, ok := metadata[field]; !ok {
-			t.Fatalf("relay limit metadata missing %q", field)
-		}
-	}
-	fallback := contract.CodebaseIndex.CompatibilityFallbackLimits
-	if fallback.MaxFileBytes != defaultMaxIndexFileBytes ||
-		fallback.MaxBatchFiles != defaultMaxIndexBatchFiles ||
-		fallback.MaxBatchBytes != defaultMaxIndexBatchBytes ||
-		fallback.EstimatedChunkBytes != estimatedIndexChunkBytes ||
-		fallback.MaxEstimatedChunks != (defaultMaxIndexFileBytes+estimatedIndexChunkBytes-1)/estimatedIndexChunkBytes ||
-		fallback.MaxManifestFiles != defaultMaxIndexManifestFiles ||
-		fallback.MaxPathBytes != defaultMaxIndexPathBytes {
-		t.Fatalf("index compatibility fallback drifted: %+v", fallback)
+	limits := contract.CodebaseIndex.Limits
+	if limits.MaxFileBytes != maxIndexFileBytes ||
+		limits.EstimatedChunkBytes != estimatedIndexChunkBytes ||
+		limits.MaxEstimatedChunks != maxIndexEstimatedChunks ||
+		limits.MaxManifestFiles != maxIndexManifestFiles {
+		t.Fatalf("index limits mismatch: relay=(%d,%d,%d,%d) contract=(%d,%d,%d,%d)",
+			maxIndexFileBytes, estimatedIndexChunkBytes, maxIndexEstimatedChunks, maxIndexManifestFiles,
+			limits.MaxFileBytes, limits.EstimatedChunkBytes, limits.MaxEstimatedChunks, limits.MaxManifestFiles)
 	}
 }
 
 func TestContractPinIndexStartOutcomes(t *testing.T) {
 	contract := loadCloudProtocolContract(t)
-	if contract.SchemaVersion != "1.8" {
-		t.Fatalf("cloud protocol schema version: got %q, want 1.8", contract.SchemaVersion)
+	if contract.SchemaVersion != "1.7" {
+		t.Fatalf("cloud protocol schema version: got %q, want 1.7", contract.SchemaVersion)
 	}
 	outcomes := contract.CodebaseIndex.StartOutcomes
 	if !reflect.DeepEqual(outcomes.Created.RequiredFields, []string{"job"}) ||
@@ -336,7 +305,7 @@ func TestContractPinClientCompatibilityPolicy(t *testing.T) {
 		policy.MinimumVersionSource != "relay_persistent_runtime_policy_with_env_bootstrap" ||
 		!policy.MinimumVersionAdminConfigurable ||
 		!policy.IndexStartRequiresClientVersionWhenMinimumConfigured ||
-		policy.UpgradeMechanism != "runtime_or_client_package_manager" ||
+		policy.UpgradeCommand != "npm install -g @anmezing/lce-cloud@latest" ||
 		!policy.RestartRequiredAfterUpgrade {
 		t.Fatalf("client compatibility policy drifted: %+v", policy)
 	}
