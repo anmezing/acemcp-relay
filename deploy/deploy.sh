@@ -6,6 +6,9 @@ LCE_DIR="$SCRIPT_DIR/../../lce"
 FRONTEND_DIR="$SCRIPT_DIR/../../acemcp-relay-frontend"
 RELAY_DIR="$SCRIPT_DIR/.."
 
+# 三个仓库默认跟随同一租户分支；可通过全局或仓库级环境变量覆盖。
+DEFAULT_DEPLOY_BRANCH="${DEPLOY_BRANCH_DEFAULT:-feat/multi-tenant-relay}"
+
 # 可选锁定部署版本：DEPLOY_REF_LCE / DEPLOY_REF_RELAY / DEPLOY_REF_FRONTEND
 # 指定 tag 或 commit 时按该版本部署；不指定则跟随远端分支（开发期默认）。
 update_repo() {
@@ -67,9 +70,9 @@ prune_docker_resources() {
 }
 
 echo "=== Updating code ==="
-update_repo "$LCE_DIR" "${DEPLOY_REF_LCE:-}" "${DEPLOY_BRANCH_LCE:-feat/multi-tenant-relay}"
-update_repo "$RELAY_DIR" "${DEPLOY_REF_RELAY:-}" "${DEPLOY_BRANCH_RELAY:-main}"
-update_repo "$FRONTEND_DIR" "${DEPLOY_REF_FRONTEND:-}" "${DEPLOY_BRANCH_FRONTEND:-main}"
+update_repo "$LCE_DIR" "${DEPLOY_REF_LCE:-}" "${DEPLOY_BRANCH_LCE:-$DEFAULT_DEPLOY_BRANCH}"
+update_repo "$RELAY_DIR" "${DEPLOY_REF_RELAY:-}" "${DEPLOY_BRANCH_RELAY:-$DEFAULT_DEPLOY_BRANCH}"
+update_repo "$FRONTEND_DIR" "${DEPLOY_REF_FRONTEND:-}" "${DEPLOY_BRANCH_FRONTEND:-$DEFAULT_DEPLOY_BRANCH}"
 
 echo "=== Verifying cross-repository contracts ==="
 verify_contract_snapshots
