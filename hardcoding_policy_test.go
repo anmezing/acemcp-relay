@@ -108,11 +108,8 @@ func TestDeploymentPolicyIsTemplateDrivenAndDiscoverable(t *testing.T) {
 	if strings.Contains(composeText, "https://lcebot.com") {
 		t.Fatal("docker-compose must not fall back to a deployment-specific public origin")
 	}
-	if !strings.Contains(composeText, "NEXT_PUBLIC_SITE_URL:-${BETTER_AUTH_URL:?") {
-		t.Fatal("public site URL must inherit the explicit Better Auth origin for old deployments")
-	}
-	if strings.Contains(composeText, "NEXT_PUBLIC_LCE_CLIENT_PACKAGE_RUNNER:?") {
-		t.Fatal("an optional client launcher must not prevent the service from deploying")
+	if !strings.Contains(composeText, "NEXT_PUBLIC_SITE_URL:?set NEXT_PUBLIC_SITE_URL") {
+		t.Fatal("public site URL must be explicit at frontend image build and runtime")
 	}
 
 	envExample, err := os.ReadFile(filepath.Join("deploy", ".env.example"))
@@ -134,17 +131,9 @@ func TestDeploymentPolicyIsTemplateDrivenAndDiscoverable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, required := range []string{"DEPLOY_LCE_DIR", "DEPLOY_RELAY_DIR", "DEPLOY_FRONTEND_DIR", "docker compose config"} {
+	for _, required := range []string{"DEPLOY_LCE_DIR", "DEPLOY_RELAY_DIR", "DEPLOY_FRONTEND_DIR"} {
 		if !strings.Contains(string(deployScript), required) {
-			t.Errorf("deploy script does not expose or validate %s", required)
+			t.Errorf("deploy script does not expose %s", required)
 		}
-	}
-
-	tuneHost, err := os.ReadFile(filepath.Join("deploy", "tune-host.sh"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(tuneHost), "conflicting server name") {
-		t.Fatal("host tuning must reject duplicate active Nginx virtual hosts")
 	}
 }

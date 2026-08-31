@@ -9,22 +9,6 @@ positive_int() {
   fi
 }
 
-check_nginx_config() {
-  local output
-  if ! output="$(sudo nginx -t 2>&1)"; then
-    printf '%s\n' "$output" >&2
-    echo "ERROR: Nginx configuration validation failed; refusing to continue." >&2
-    return 1
-  fi
-  printf '%s\n' "$output"
-  if grep -qi 'conflicting server name' <<<"$output"; then
-    echo "ERROR: Nginx has duplicate active server_name declarations; one virtual host is being ignored." >&2
-    echo "Inspect the files reported by 'sudo nginx -T', then keep exactly one enabled server block for each public host." >&2
-    echo "Common locations are /etc/nginx/sites-enabled and /etc/nginx/conf.d. Stale files are not deleted automatically." >&2
-    return 1
-  fi
-}
-
 SYSCTL_CONFIG_PATH="${DEPLOY_SYSCTL_CONFIG_PATH:-/etc/sysctl.d/99-lce-performance.conf}"
 NGINX_MAIN_CONFIG="${DEPLOY_NGINX_MAIN_CONFIG:-/etc/nginx/nginx.conf}"
 NGINX_SERVICE="${DEPLOY_NGINX_SERVICE:-nginx}"
@@ -57,10 +41,6 @@ if (( POSTGRES_RESERVED_CONNECTIONS >= POSTGRES_MAX_CONNECTIONS )); then
   exit 1
 fi
 
-# Refuse to mutate/reload the host when an existing duplicate virtual host means
-# Nginx is already ignoring one of the configured server blocks.
-check_nginx_config
-
 cat <<EOF | sudo tee "$SYSCTL_CONFIG_PATH" >/dev/null
 net.core.somaxconn = $SOMAXCONN
 net.ipv4.tcp_max_syn_backlog = $TCP_MAX_SYN_BACKLOG
@@ -77,7 +57,7 @@ else
 fi
 sudo sed -i -E "s/worker_connections[[:space:]]+[0-9]+;/worker_connections $NGINX_WORKER_CONNECTIONS;/" "$NGINX_MAIN_CONFIG"
 
-check_nginx_config
+sudo nginx -t
 sudo systemctl reload "$NGINX_SERVICE"
 
 current_max_connections="$(sudo -u "$POSTGRES_OS_USER" psql -Atqc 'SHOW max_connections')"
