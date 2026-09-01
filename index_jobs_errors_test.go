@@ -28,7 +28,7 @@ func jobFileRows() *sqlmock.Rows {
 
 const singleByteXHash = "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881"
 
-const jobColumnCount = 22
+const jobColumnCount = 25
 
 // jobRow 构造 loadIndexJobFrom 期望的那一行（列顺序必须与其 SELECT 一致）。
 func jobRow(status string, deletedCount int) *sqlmock.Rows {
@@ -36,12 +36,12 @@ func jobRow(status string, deletedCount int) *sqlmock.Rows {
 	return sqlmock.NewRows([]string{
 		"id", "workspace_id", "workspace_name", "root_id", "branch", "revision", "mode", "phase", "status",
 		"workspace_files", "total_files", "indexed_files", "failed_files", "total_chunks",
-		"indexed_chunks", "chunk_count_fallback", "deleted_count", "error", "cloud_revision",
-		"started_at", "heartbeat_at", "completed_at",
+		"indexed_chunks", "chunk_count_fallback", "deleted_count", "error", "error_code",
+		"error_origin", "recovery", "cloud_revision", "started_at", "heartbeat_at", "completed_at",
 	}).AddRow(
 		"job-1", "ws-1", "workspace", "", "main", "rev-1", "full", "indexing", status,
 		10, 10, 0, 0, int64(0),
-		int64(0), false, deletedCount, "", int64(0),
+		int64(0), false, deletedCount, "", "", "", "", int64(0),
 		now, now, nil,
 	)
 }

@@ -126,14 +126,17 @@ type mcpIndexJobArgs struct {
 }
 
 type mcpIndexFailArgs struct {
-	Operation string `json:"operation"`
-	JobID     string `json:"job_id"`
-	Error     string `json:"error,omitempty"`
+	Operation   string `json:"operation"`
+	JobID       string `json:"job_id"`
+	Error       string `json:"error"`
+	ErrorCode   string `json:"error_code,omitempty"`
+	ErrorOrigin string `json:"error_origin,omitempty"`
+	Recovery    string `json:"recovery,omitempty"`
 }
 
 // codebaseIndexEnvelope 构造 codebase_index 的响应信封。字段名与
 // docs/contracts/cloud-protocol.json 的 responseEnvelope 契约一致：
-// ok 必有；成功带 payload，失败带 error:{message}。
+// ok 必有；成功带 payload，失败带 error:{message}，并可带稳定 code。
 func codebaseIndexEnvelope(ok bool, payload interface{}, errMessage string, errorCode ...string) map[string]interface{} {
 	envelope := map[string]interface{}{
 		"schemaVersion":  indexEnvelopeSchemaVersion,
@@ -251,9 +254,12 @@ func codebaseIndexToolDefinition() (json.RawMessage, error) {
 					// 客户端放弃流程时必须说明原因，便于排障与配额审计。
 					"required": []string{"operation", "job_id", "error"},
 					"properties": map[string]interface{}{
-						"operation": operation("fail"),
-						"job_id":    map[string]interface{}{"type": "string", "minLength": 1},
-						"error":     map[string]interface{}{"type": "string", "maxLength": 2000},
+						"operation":    operation("fail"),
+						"job_id":       map[string]interface{}{"type": "string", "minLength": 1},
+						"error":        map[string]interface{}{"type": "string", "maxLength": 2000},
+						"error_code":   map[string]interface{}{"type": "string", "minLength": 1, "maxLength": 64},
+						"error_origin": map[string]interface{}{"type": "string", "minLength": 1, "maxLength": 32},
+						"recovery":     map[string]interface{}{"type": "string", "minLength": 1, "maxLength": 64},
 					},
 				},
 			},
@@ -515,7 +521,13 @@ func handleCodebaseIndex(ctx context.Context, userID string, raw map[string]inte
 		if uuid.Validate(strings.TrimSpace(input.JobID)) != nil {
 			return nil, fmt.Errorf("job_id must be a UUID")
 		}
-		job, err := failIndexJob(ctx, userID, input.JobID, input.Error)
+		diagnostic, err := resolveReportedIndexFailureDiagnostic(
+			indexJobStatusFailed, input.Error, input.ErrorCode, input.ErrorOrigin, input.Recovery,
+		)
+		if err != nil {
+			return nil, err
+		}
+		job, err := failIndexJob(ctx, userID, input.JobID, input.Error, diagnostic)
 		if err != nil {
 			return nil, err
 		}

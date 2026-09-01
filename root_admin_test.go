@@ -181,7 +181,8 @@ func TestHandleListRootsAggregatesFilesAndKeepsEmptyWorkspaceZero(t *testing.T) 
 			WithArgs("user-1").
 			WillReturnRows(sqlmock.NewRows([]string{
 				"workspace_id", "root_id", "branch", "revision", "phase", "status",
-				"total_files", "indexed_files", "failed_files", "error", "cloud_revision", "started_at",
+				"total_files", "indexed_files", "failed_files", "error", "error_code", "error_origin",
+				"recovery", "cloud_revision", "started_at",
 			}))
 
 		c, recorder := newRootAdminContext(t, "user-1", "GET", "")
@@ -236,10 +237,11 @@ func TestLoadIndexRootsMergesLatestProgressAndKeepsUnpublishedFailuresVisible(t 
 			WithArgs("user-1").
 			WillReturnRows(sqlmock.NewRows([]string{
 				"workspace_id", "root_id", "branch", "revision", "phase", "status",
-				"total_files", "indexed_files", "failed_files", "error", "cloud_revision", "started_at",
+				"total_files", "indexed_files", "failed_files", "error", "error_code", "error_origin",
+				"recovery", "cloud_revision", "started_at",
 			}).
-				AddRow("repo-a", "repo-a", "main", "next", "uploading", "running", 100, 37, 0, "", int64(8), indexedAt.Add(time.Hour)).
-				AddRow("repo-b", "repo-b@feature", "feature/x", "broken", "scanning", "failed", 12, 3, 1, "manifest rejected", int64(0), indexedAt))
+				AddRow("repo-a", "repo-a", "main", "next", "uploading", "running", 100, 37, 0, "", "", "", "", int64(8), indexedAt.Add(time.Hour)).
+				AddRow("repo-b", "repo-b@feature", "feature/x", "broken", "scanning", "failed", 12, 3, 1, "manifest rejected", "", "", "", int64(0), indexedAt))
 
 		roots, err := loadIndexRoots(context.Background(), "user-1")
 		if err != nil {
@@ -276,10 +278,11 @@ func TestLoadIndexRootsDoesNotResurrectDeletedCompletedOrSupersededJobs(t *testi
 			WithArgs("user-1").
 			WillReturnRows(sqlmock.NewRows([]string{
 				"workspace_id", "root_id", "branch", "revision", "phase", "status",
-				"total_files", "indexed_files", "failed_files", "error", "cloud_revision", "started_at",
+				"total_files", "indexed_files", "failed_files", "error", "error_code", "error_origin",
+				"recovery", "cloud_revision", "started_at",
 			}).
-				AddRow("deleted-a", "deleted-a", "main", "done", "completed", "completed", 10, 10, 0, "", int64(3), startedAt).
-				AddRow("deleted-b", "deleted-b", "main", "old", "superseded", "superseded", 10, 4, 0, "", int64(2), startedAt.Add(-time.Minute)))
+				AddRow("deleted-a", "deleted-a", "main", "done", "completed", "completed", 10, 10, 0, "", "", "", "", int64(3), startedAt).
+				AddRow("deleted-b", "deleted-b", "main", "old", "superseded", "superseded", 10, 4, 0, "", "", "", "", int64(2), startedAt.Add(-time.Minute)))
 
 		roots, err := loadIndexRoots(context.Background(), "user-1")
 		if err != nil {
@@ -323,6 +326,40 @@ func TestClassifyIndexFailure(t *testing.T) {
 	}
 }
 
+func TestApplyIndexFailureDiagnosticUsesPersistedTupleAtomically(t *testing.T) {
+	t.Run("valid persisted tuple wins over misleading legacy text", func(t *testing.T) {
+		root := indexRootView{}
+		applyIndexFailureDiagnostic(
+			&root,
+			indexJobStatusFailed,
+			"network down while formatting an upstream response",
+			"provider_invalid_request",
+			"provider",
+			"contact_admin",
+		)
+		if root.IndexErrorCode != "provider_invalid_request" ||
+			root.IndexErrorOrigin != "provider" || root.IndexRecovery != "contact_admin" {
+			t.Fatalf("persisted diagnostic was not preserved atomically: %+v", root)
+		}
+	})
+
+	t.Run("mismatched persisted tuple falls back as a whole", func(t *testing.T) {
+		root := indexRootView{}
+		applyIndexFailureDiagnostic(
+			&root,
+			indexJobStatusFailed,
+			"dial tcp: connection refused",
+			"provider_invalid_request",
+			"provider",
+			"retry_later",
+		)
+		if root.IndexErrorCode != "network_unavailable" ||
+			root.IndexErrorOrigin != "network" || root.IndexRecovery != "restart_client" {
+			t.Fatalf("mismatched tuple must not leak into admin presentation: %+v", root)
+		}
+	})
+}
+
 func TestSplitRootIDViewDerivation(t *testing.T) {
 	cases := []struct {
 		rootID string
@@ -359,7 +396,8 @@ func TestHandleListRootsReturnsEmptyArrayNotNull(t *testing.T) {
 			WithArgs("user-1").
 			WillReturnRows(sqlmock.NewRows([]string{
 				"workspace_id", "root_id", "branch", "revision", "phase", "status",
-				"total_files", "indexed_files", "failed_files", "error", "cloud_revision", "started_at",
+				"total_files", "indexed_files", "failed_files", "error", "error_code", "error_origin",
+				"recovery", "cloud_revision", "started_at",
 			}))
 		c, recorder := newRootAdminContext(t, "user-1", "GET", "")
 		handleListRoots(c)

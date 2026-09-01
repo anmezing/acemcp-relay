@@ -126,6 +126,9 @@ type latestIndexJobView struct {
 	IndexedFiles  int
 	FailedFiles   int
 	Error         string
+	ErrorCode     string
+	ErrorOrigin   string
+	Recovery      string
 	CloudRevision int64
 	StartedAt     time.Time
 }
@@ -212,7 +215,7 @@ func loadIndexRoots(ctx context.Context, userID string) ([]indexRootView, error)
 				BaseRootID:        base,
 				ViewBranch:        viewBranch,
 			}
-			applyIndexFailureDiagnostic(&root, job.Status, job.Error)
+			applyIndexFailureDiagnostic(&root, job.Status, job.Error, job.ErrorCode, job.ErrorOrigin, job.Recovery)
 			roots = append(roots, root)
 			continue
 		}
@@ -226,11 +229,12 @@ func loadLatestIndexJobs(ctx context.Context, userID string) ([]latestIndexJobVi
 		SELECT workspace_id, root_id, COALESCE(branch, ''), COALESCE(revision, ''),
 			COALESCE(phase, ''), status, COALESCE(total_files, 0),
 			COALESCE(indexed_files, 0), COALESCE(failed_files, 0), COALESCE(error, ''),
+			COALESCE(error_code, ''), COALESCE(error_origin, ''), COALESCE(recovery, ''),
 			COALESCE(cloud_revision, 0), started_at
 		FROM (
 			SELECT DISTINCT ON (workspace_id, root_id)
 				workspace_id, root_id, branch, revision, phase, status, total_files,
-				indexed_files, failed_files, error, cloud_revision, started_at
+				indexed_files, failed_files, error, error_code, error_origin, recovery, cloud_revision, started_at
 			FROM index_jobs
 			WHERE user_id = $1
 			ORDER BY workspace_id, root_id, started_at DESC, id DESC
@@ -247,7 +251,8 @@ func loadLatestIndexJobs(ctx context.Context, userID string) ([]latestIndexJobVi
 		if err := rows.Scan(
 			&job.WorkspaceID, &job.RootID, &job.Branch, &job.Revision, &job.Phase,
 			&job.Status, &job.TotalFiles, &job.IndexedFiles, &job.FailedFiles,
-			&job.Error, &job.CloudRevision, &job.StartedAt,
+			&job.Error, &job.ErrorCode, &job.ErrorOrigin, &job.Recovery,
+			&job.CloudRevision, &job.StartedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -288,63 +293,14 @@ func indexProgressPercent(indexed, total int, status string) int {
 	return percent
 }
 
-type indexFailureDiagnostic struct {
-	Code     string
-	Origin   string
-	Recovery string
-}
-
-// classifyIndexFailure 把原始错误归为稳定、可国际化的诊断代码。原始错误仍通过
-// index_error 返回用于排障；控制台不再需要解析 Cloudflare JSON 或供应商文案。
-func classifyIndexFailure(status, detail string) indexFailureDiagnostic {
-	lower := strings.ToLower(strings.TrimSpace(detail))
-	containsAny := func(values ...string) bool {
-		for _, value := range values {
-			if strings.Contains(lower, value) {
-				return true
-			}
-		}
-		return false
-	}
-
-	switch {
-	case containsAny("client disconnected before first upload"):
-		return indexFailureDiagnostic{"client_disconnected", "client", "restart_client"}
-	case status == indexJobStatusTimedOut || containsAny("heartbeat timed out", "heartbeat timeout"):
-		return indexFailureDiagnostic{"heartbeat_timeout", "relay", "restart_client"}
-	case containsAny("cloud embedding space changed", "embedding space changed", "clear the tenant root before starting a new index job"):
-		return indexFailureDiagnostic{"embedding_space_changed", "remote_index", "reset_root"}
-	case containsAny("remote-index 502", "bad gateway", "cloudflare", "origin web server returned"):
-		return indexFailureDiagnostic{"upstream_bad_gateway", "remote_index", "retry_after_service_recovers"}
-	case containsAny("payment required", "insufficient balance", "insufficient credit", "余额不足", "欠费", "billing", "remote-index 402"):
-		return indexFailureDiagnostic{"provider_billing", "provider", "fix_provider_billing"}
-	case containsAny("too many requests", "rate limit", "rate-limit", "remote-index 429"):
-		return indexFailureDiagnostic{"provider_rate_limited", "provider", "retry_later"}
-	case containsAny("the parameter is invalid", "[20015]", "valid utf-8", "special characters are properly escaped"):
-		return indexFailureDiagnostic{"provider_invalid_request", "provider", "contact_admin"}
-	case containsAny("manifest exceeds", "unreadable file list exceeds", "too many files", "file count limit", "maximum file count", "100,000 files", "100000 files", "文件数量", "文件数超过"):
-		return indexFailureDiagnostic{"repository_file_limit", "client", "reduce_repository"}
-	case containsAny("manifest file size is invalid", "file exceeds the", "byte limit", "file too large", "file size limit", "maximum file size", "512 kib", "524288", "文件大小超过", "单文件过大"):
-		return indexFailureDiagnostic{"repository_file_size_limit", "client", "reduce_repository"}
-	// Only Relay's platform index quota may use the wait-for-reset recovery.
-	// Bare provider messages such as "embedding provider quota exceeded" must
-	// not be mislabeled as Relay quota, otherwise clients wait for the wrong reset.
-	case containsAny("daily index quota exceeded", "index quota exceeded", "index_quota_exceeded", "每日索引配额", "索引配额已用尽", "超出索引配额"):
-		return indexFailureDiagnostic{"index_quota_exceeded", "relay", "wait_for_quota_reset"}
-	case containsAny("unauthorized", "invalid api key", "invalid token", "authentication failed", "remote-index 401", "remote-index 403"):
-		return indexFailureDiagnostic{"provider_authentication", "provider", "fix_credentials"}
-	case containsAny("connection refused", "connection reset", "network is unreachable", "no such host", "i/o timeout", "context deadline exceeded", "unexpected eof", "socket hang up"):
-		return indexFailureDiagnostic{"network_unavailable", "network", "restart_client"}
-	default:
-		return indexFailureDiagnostic{"index_failed", "unknown", "contact_admin"}
-	}
-}
-
-func applyIndexFailureDiagnostic(root *indexRootView, status, detail string) {
+func applyIndexFailureDiagnostic(root *indexRootView, status, detail, code, origin, recovery string) {
 	if status != indexJobStatusFailed && status != indexJobStatusTimedOut {
 		return
 	}
-	diagnostic := classifyIndexFailure(status, detail)
+	diagnostic, ok := persistedIndexFailureDiagnostic(code, origin, recovery)
+	if !ok {
+		diagnostic = classifyIndexFailure(status, detail)
+	}
 	root.IndexErrorCode = diagnostic.Code
 	root.IndexErrorOrigin = diagnostic.Origin
 	root.IndexRecovery = diagnostic.Recovery
@@ -358,7 +314,7 @@ func applyIndexJobToRoot(root *indexRootView, job latestIndexJobView) {
 	root.FailedFiles = job.FailedFiles
 	root.ProgressPercent = indexProgressPercent(job.IndexedFiles, job.TotalFiles, job.Status)
 	root.IndexError = job.Error
-	applyIndexFailureDiagnostic(root, job.Status, job.Error)
+	applyIndexFailureDiagnostic(root, job.Status, job.Error, job.ErrorCode, job.ErrorOrigin, job.Recovery)
 	root.SyncRevision = job.Revision
 	root.SyncCloudRevision = job.CloudRevision
 	if job.Branch != "" {

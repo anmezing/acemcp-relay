@@ -125,6 +125,9 @@ type indexJobView struct {
 	ChunkCountEstimated bool       `json:"chunk_count_estimated"`
 	DeletedCount        int        `json:"deleted_count"`
 	Error               string     `json:"error,omitempty"`
+	ErrorCode           string     `json:"error_code,omitempty"`
+	ErrorOrigin         string     `json:"error_origin,omitempty"`
+	Recovery            string     `json:"recovery,omitempty"`
 	StartedAt           time.Time  `json:"started_at"`
 	HeartbeatAt         time.Time  `json:"heartbeat_at"`
 	CompletedAt         *time.Time `json:"completed_at,omitempty"`
@@ -185,6 +188,9 @@ func migrateIndexingTables() error {
 			deleted_count INTEGER NOT NULL DEFAULT 0,
 			deletions_sent BOOLEAN NOT NULL DEFAULT FALSE,
 			error TEXT NOT NULL DEFAULT '',
+			error_code VARCHAR(64) NOT NULL DEFAULT '',
+			error_origin VARCHAR(32) NOT NULL DEFAULT '',
+			recovery VARCHAR(64) NOT NULL DEFAULT '',
 			cloud_revision BIGINT NOT NULL DEFAULT 0,
 			started_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
 			heartbeat_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
@@ -238,6 +244,9 @@ func migrateIndexingTables() error {
 		-- 只改 CREATE 文本会让升级后的旧库在引用新列的 SQL 上直接报错。
 		ALTER TABLE index_workspaces ADD COLUMN IF NOT EXISTS cloud_revision BIGINT NOT NULL DEFAULT 0;
 		ALTER TABLE index_jobs ADD COLUMN IF NOT EXISTS cloud_revision BIGINT NOT NULL DEFAULT 0;
+		ALTER TABLE index_jobs ADD COLUMN IF NOT EXISTS error_code VARCHAR(64) NOT NULL DEFAULT '';
+		ALTER TABLE index_jobs ADD COLUMN IF NOT EXISTS error_origin VARCHAR(32) NOT NULL DEFAULT '';
+		ALTER TABLE index_jobs ADD COLUMN IF NOT EXISTS recovery VARCHAR(64) NOT NULL DEFAULT '';
 	`)
 	if err != nil {
 		return fmt.Errorf("failed to migrate indexing tables: %w", err)
@@ -518,12 +527,15 @@ func inspectActiveIndexJob(
 	}
 
 	for _, job := range expired {
+		failure := timedOutIndexJobError(job.phase)
+		diagnostic := classifyIndexFailure(indexJobStatusTimedOut, failure)
 		if _, err := tx.ExecContext(ctx, `
 			UPDATE index_jobs
 			SET status = $1, phase = 'done', failed_files = total_files - indexed_files,
-				error = $2, completed_at = NOW()
-			WHERE id = $3 AND user_id = $4 AND status = $5
-		`, indexJobStatusTimedOut, timedOutIndexJobError(job.phase), job.id, userID, indexJobStatusRunning); err != nil {
+				error = $2, error_code = $3, error_origin = $4, recovery = $5, completed_at = NOW()
+			WHERE id = $6 AND user_id = $7 AND status = $8
+		`, indexJobStatusTimedOut, failure, diagnostic.Code, diagnostic.Origin, diagnostic.Recovery,
+			job.id, userID, indexJobStatusRunning); err != nil {
 			return nil, err
 		}
 		if _, err := tx.ExecContext(ctx, `DELETE FROM index_job_files WHERE job_id = $1`, job.id); err != nil {
@@ -704,11 +716,15 @@ func createIndexJob(ctx context.Context, userID string, req indexStartRequest) (
 		if abortErr := abortLCEIndexJob(context.Background(), userID, jobID, req.RootID); abortErr != nil {
 			log.Printf("[INDEX] cloud abort cleanup failed after begin error for job %s: %v", jobID, abortErr)
 		}
+		failure := "LCE cloud index begin failed: " + err.Error()
+		diagnostic := classifyIndexFailure(indexJobStatusFailed, failure)
 		_, _ = db.ExecContext(context.Background(), `
 			UPDATE index_jobs
-			SET status = $1, phase = 'done', error = $2, heartbeat_at = NOW(), completed_at = NOW()
-			WHERE id = $3 AND user_id = $4 AND status = $5
-		`, indexJobStatusFailed, "LCE cloud index begin failed: "+err.Error(), jobID, userID, indexJobStatusRunning)
+			SET status = $1, phase = 'done', error = $2, error_code = $3,
+				error_origin = $4, recovery = $5, heartbeat_at = NOW(), completed_at = NOW()
+			WHERE id = $6 AND user_id = $7 AND status = $8
+		`, indexJobStatusFailed, failure, diagnostic.Code, diagnostic.Origin, diagnostic.Recovery,
+			jobID, userID, indexJobStatusRunning)
 		_, _ = db.ExecContext(context.Background(), `DELETE FROM index_job_files WHERE job_id = $1`, jobID)
 		return createIndexJobResponse{}, err
 	}
@@ -759,7 +775,7 @@ func loadIndexJobFrom(ctx context.Context, queryer indexJobQueryer, userID, jobI
 	err := queryer.QueryRowContext(ctx, `
 		SELECT id::text, workspace_id, workspace_name, root_id, branch, revision, mode, phase, status,
 			workspace_files, total_files, indexed_files, failed_files, total_chunks,
-			indexed_chunks, chunk_count_fallback, deleted_count, error, cloud_revision,
+			indexed_chunks, chunk_count_fallback, deleted_count, error, error_code, error_origin, recovery, cloud_revision,
 			started_at, heartbeat_at, completed_at
 		FROM index_jobs
 		WHERE id = $1 AND user_id = $2
@@ -767,7 +783,8 @@ func loadIndexJobFrom(ctx context.Context, queryer indexJobQueryer, userID, jobI
 		&job.ID, &job.WorkspaceID, &job.WorkspaceName, &job.RootID, &job.Branch, &job.Revision,
 		&job.Mode, &job.Phase, &job.Status, &job.WorkspaceFiles, &job.TotalFiles,
 		&job.IndexedFiles, &job.FailedFiles, &job.TotalChunks, &job.IndexedChunks,
-		&fallback, &job.DeletedCount, &job.Error, &job.CloudRevision, &job.StartedAt, &job.HeartbeatAt,
+		&fallback, &job.DeletedCount, &job.Error, &job.ErrorCode, &job.ErrorOrigin, &job.Recovery,
+		&job.CloudRevision, &job.StartedAt, &job.HeartbeatAt,
 		&job.CompletedAt,
 	)
 	job.ChunkCountEstimated = fallback || job.Status != indexJobStatusCompleted
@@ -1374,7 +1391,29 @@ func extractCloudRevision(content []byte) (int64, error) {
 	return rev, nil
 }
 
-func failIndexJob(ctx context.Context, userID, jobID, failure string) (indexJobView, error) {
+type indexJobFailureExecer interface {
+	ExecContext(context.Context, string, ...interface{}) (sql.Result, error)
+}
+
+func markIndexJobFailed(
+	ctx context.Context, execer indexJobFailureExecer, userID, jobID, failure string, diagnostic indexFailureDiagnostic,
+) (bool, error) {
+	result, err := execer.ExecContext(ctx, `
+		UPDATE index_jobs
+		SET status = $1, phase = 'done', failed_files = total_files - indexed_files,
+			error = $2, error_code = $3, error_origin = $4, recovery = $5,
+			heartbeat_at = NOW(), completed_at = NOW()
+		WHERE id = $6 AND user_id = $7 AND status = $8
+	`, indexJobStatusFailed, failure, diagnostic.Code, diagnostic.Origin, diagnostic.Recovery,
+		jobID, userID, indexJobStatusRunning)
+	if err != nil {
+		return false, err
+	}
+	rows, err := result.RowsAffected()
+	return rows > 0, err
+}
+
+func failIndexJob(ctx context.Context, userID, jobID, failure string, diagnostic indexFailureDiagnostic) (indexJobView, error) {
 	jobID = strings.TrimSpace(jobID)
 	if jobID == "" {
 		return indexJobView{}, fmt.Errorf("index job id is required")
@@ -1408,17 +1447,11 @@ func failIndexJob(ctx context.Context, userID, jobID, failure string) (indexJobV
 		}
 		return indexJobView{}, err
 	}
-	result, err := tx.ExecContext(opCtx, `
-		UPDATE index_jobs
-		SET status = $1, phase = 'done', failed_files = total_files - indexed_files,
-			error = $2, heartbeat_at = NOW(), completed_at = NOW()
-		WHERE id = $3 AND user_id = $4 AND status = $5
-	`, indexJobStatusFailed, failure, jobID, userID, indexJobStatusRunning)
+	updated, err := markIndexJobFailed(opCtx, tx, userID, jobID, failure, diagnostic)
 	if err != nil {
 		return indexJobView{}, err
 	}
-	rows, _ := result.RowsAffected()
-	if rows == 0 {
+	if !updated {
 		return indexJobView{}, fmt.Errorf("index job is not running")
 	}
 	if _, err = tx.ExecContext(opCtx, `DELETE FROM index_job_files WHERE job_id = $1`, jobID); err != nil {
@@ -1532,7 +1565,15 @@ func sweepExpiredIndexJobs(ctx context.Context) {
 				WHEN expired.expired_phase = 'created' THEN 'index client disconnected before first upload'
 				ELSE 'index job heartbeat timed out'
 			END,
-			completed_at = NOW()
+			error_code = CASE
+				WHEN expired.expired_phase = 'created' THEN 'client_disconnected'
+				ELSE 'heartbeat_timeout'
+			END,
+			error_origin = CASE
+				WHEN expired.expired_phase = 'created' THEN 'client'
+				ELSE 'relay'
+			END,
+			recovery = 'restart_client', completed_at = NOW()
 		FROM expired
 		WHERE jobs.id = expired.id
 		RETURNING jobs.id::text, jobs.user_id, jobs.root_id, jobs.cloud_revision,

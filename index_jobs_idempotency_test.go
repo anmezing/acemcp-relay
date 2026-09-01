@@ -20,11 +20,11 @@ func activeIndexJobRow(now time.Time) *sqlmock.Rows {
 		"id", "workspace_id", "workspace_name", "root_id", "branch", "revision", "mode",
 		"phase", "status", "workspace_files", "total_files", "indexed_files", "failed_files",
 		"total_chunks", "indexed_chunks", "chunk_count_fallback", "deleted_count", "error",
-		"cloud_revision", "started_at", "heartbeat_at", "completed_at",
+		"error_code", "error_origin", "recovery", "cloud_revision", "started_at", "heartbeat_at", "completed_at",
 	}).AddRow(
 		"job-active", "workspace-a", "Workspace A", "root-a", "main", "revision-a", "incremental",
 		"indexing", indexJobStatusRunning, 12, 5, 2, 0,
-		int64(20), int64(8), false, 0, "", int64(1),
+		int64(20), int64(8), false, 0, "", "", "", "", int64(1),
 		now.Add(-time.Minute), now, nil,
 	)
 }
@@ -92,7 +92,11 @@ func TestInspectActiveIndexJobReclaimsExpiredOwnerBeforeReplacement(t *testing.T
 			WillReturnRows(sqlmock.NewRows([]string{"id", "root_id", "cloud_revision", "phase", "heartbeat_at"}).
 				AddRow("job-expired", "root-a", int64(1), "indexing", now.Add(-indexJobHeartbeatTimeout-time.Minute)))
 		mock.ExpectExec("UPDATE index_jobs").
-			WithArgs(indexJobStatusTimedOut, "index job heartbeat timed out", "job-expired", "user-a", indexJobStatusRunning).
+			WithArgs(
+				indexJobStatusTimedOut, "index job heartbeat timed out",
+				"heartbeat_timeout", "relay", "restart_client",
+				"job-expired", "user-a", indexJobStatusRunning,
+			).
 			WillReturnResult(sqlmock.NewResult(0, 1))
 		mock.ExpectExec("DELETE FROM index_job_files WHERE job_id").
 			WithArgs("job-expired").

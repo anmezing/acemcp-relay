@@ -1,6 +1,6 @@
 {
   "$comment": "三仓库（lce / relay / 前端）共享云协议契约的单一源头。relay 与前端提交本文件的精确快照，独立 CI 直接读取快照且缺失即失败；修改本文件必须三仓同步。",
-  "schemaVersion": "1.8",
+  "schemaVersion": "1.9",
   "cloudToolSurface": [
     "codebase-retrieval",
     "codebase_symbol_graph",
@@ -44,7 +44,77 @@
         "client_version",
         "branch",
         "revision"
+      ],
+      "fail": [
+        "error_code",
+        "error_origin",
+        "recovery"
       ]
+    },
+    "failureDiagnostics": {
+      "$comment": "Clients may report a stable failure diagnostic with fail. The three fields are atomic and Relay validates the exact code/origin/recovery tuple before persisting it. Older clients may omit all three; Relay then classifies the legacy error text once and persists the result.",
+      "fields": [
+        "error_code",
+        "error_origin",
+        "recovery"
+      ],
+      "presenceRule": "all_or_none",
+      "invalidValueBehavior": "reject",
+      "missingFieldsBehavior": "relay_classifies_error_text_and_persists_result",
+      "codes": {
+        "client_disconnected": {
+          "origin": "client",
+          "recovery": "restart_client"
+        },
+        "heartbeat_timeout": {
+          "origin": "relay",
+          "recovery": "restart_client"
+        },
+        "embedding_space_changed": {
+          "origin": "remote_index",
+          "recovery": "reset_root"
+        },
+        "upstream_bad_gateway": {
+          "origin": "remote_index",
+          "recovery": "retry_after_service_recovers"
+        },
+        "provider_billing": {
+          "origin": "provider",
+          "recovery": "fix_provider_billing"
+        },
+        "provider_rate_limited": {
+          "origin": "provider",
+          "recovery": "retry_later"
+        },
+        "provider_invalid_request": {
+          "origin": "provider",
+          "recovery": "contact_admin"
+        },
+        "repository_file_limit": {
+          "origin": "client",
+          "recovery": "reduce_repository"
+        },
+        "repository_file_size_limit": {
+          "origin": "client",
+          "recovery": "reduce_repository"
+        },
+        "index_quota_exceeded": {
+          "origin": "relay",
+          "recovery": "wait_for_quota_reset"
+        },
+        "provider_authentication": {
+          "origin": "provider",
+          "recovery": "fix_credentials"
+        },
+        "network_unavailable": {
+          "origin": "network",
+          "recovery": "restart_client"
+        },
+        "index_failed": {
+          "origin": "unknown",
+          "recovery": "contact_admin"
+        }
+      }
     },
     "startOutcomes": {
       "created": {
@@ -177,6 +247,10 @@
     ],
     "errorShape": [
       "message"
+    ],
+    "optionalErrorShape": [
+      "code",
+      "retry_after_seconds"
     ]
   },
   "manifestEntryFields": [

@@ -306,3 +306,36 @@ func TestCodebaseIndexEnvelopeIncludesOptionalDiagnosticCode(t *testing.T) {
 		t.Fatalf("unexpected error code: %#v", errorPayload["code"])
 	}
 }
+
+func TestCodebaseIndexFailRejectsPartialOrMismatchedDiagnosticsBeforeDatabaseAccess(t *testing.T) {
+	jobID := "7e224a32-3423-4bb0-9213-3c55a5797c9d"
+	for _, tc := range []struct {
+		name     string
+		input    map[string]interface{}
+		contains string
+	}{
+		{
+			name: "partial tuple",
+			input: map[string]interface{}{
+				"operation": "fail", "job_id": jobID, "error": "invalid embedding request",
+				"error_code": "provider_invalid_request",
+			},
+			contains: "provided together",
+		},
+		{
+			name: "mismatched tuple",
+			input: map[string]interface{}{
+				"operation": "fail", "job_id": jobID, "error": "invalid embedding request",
+				"error_code": "provider_invalid_request", "error_origin": "network", "recovery": "restart_client",
+			},
+			contains: "must use error_origin=provider and recovery=contact_admin",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := handleCodebaseIndex(context.Background(), "user-1", tc.input)
+			if err == nil || !strings.Contains(err.Error(), tc.contains) {
+				t.Fatalf("expected diagnostic validation error containing %q, got %v", tc.contains, err)
+			}
+		})
+	}
+}

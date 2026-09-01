@@ -28,9 +28,20 @@ type cloudProtocolContract struct {
 	SchemaVersion    string   `json:"schemaVersion"`
 	CloudToolSurface []string `json:"cloudToolSurface"`
 	CodebaseIndex    struct {
-		Operations     []string            `json:"operations"`
-		RequiredFields map[string][]string `json:"requiredFields"`
-		StartOutcomes  struct {
+		Operations         []string            `json:"operations"`
+		RequiredFields     map[string][]string `json:"requiredFields"`
+		OptionalFields     map[string][]string `json:"optionalFields"`
+		FailureDiagnostics struct {
+			Fields                []string `json:"fields"`
+			PresenceRule          string   `json:"presenceRule"`
+			InvalidValueBehavior  string   `json:"invalidValueBehavior"`
+			MissingFieldsBehavior string   `json:"missingFieldsBehavior"`
+			Codes                 map[string]struct {
+				Origin   string `json:"origin"`
+				Recovery string `json:"recovery"`
+			} `json:"codes"`
+		} `json:"failureDiagnostics"`
+		StartOutcomes struct {
 			Created struct {
 				RequiredFields []string `json:"requiredFields"`
 				OptionalFields []string `json:"optionalFields"`
@@ -66,11 +77,12 @@ type cloudProtocolContract struct {
 		} `json:"compatibilityFallbackLimits"`
 	} `json:"codebaseIndex"`
 	ResponseEnvelope struct {
-		SchemaVersion string   `json:"schemaVersion"`
-		Required      []string `json:"required"`
-		OnSuccess     []string `json:"onSuccess"`
-		OnError       []string `json:"onError"`
-		ErrorShape    []string `json:"errorShape"`
+		SchemaVersion      string   `json:"schemaVersion"`
+		Required           []string `json:"required"`
+		OnSuccess          []string `json:"onSuccess"`
+		OnError            []string `json:"onError"`
+		ErrorShape         []string `json:"errorShape"`
+		OptionalErrorShape []string `json:"optionalErrorShape"`
 	} `json:"responseEnvelope"`
 	ManifestEntryFields  []string `json:"manifestEntryFields"`
 	ClientRequestHeaders []string `json:"clientRequestHeaders"`
@@ -159,6 +171,46 @@ func relayIndexOperations(t *testing.T) map[string][]string {
 	return operations
 }
 
+func relayIndexOperationProperties(t *testing.T, operation string) []string {
+	t.Helper()
+	raw, err := codebaseIndexToolDefinition()
+	if err != nil {
+		t.Fatalf("build codebase_index tool definition: %v", err)
+	}
+	var definition struct {
+		InputSchema struct {
+			OneOf []struct {
+				Properties map[string]json.RawMessage `json:"properties"`
+			} `json:"oneOf"`
+		} `json:"inputSchema"`
+	}
+	if err := json.Unmarshal(raw, &definition); err != nil {
+		t.Fatalf("parse codebase_index tool definition: %v", err)
+	}
+	for _, branch := range definition.InputSchema.OneOf {
+		operationSchema, ok := branch.Properties["operation"]
+		if !ok {
+			continue
+		}
+		var discriminator struct {
+			Const string `json:"const"`
+		}
+		if err := json.Unmarshal(operationSchema, &discriminator); err != nil {
+			t.Fatalf("parse operation discriminator: %v", err)
+		}
+		if discriminator.Const != operation {
+			continue
+		}
+		fields := make([]string, 0, len(branch.Properties))
+		for field := range branch.Properties {
+			fields = append(fields, field)
+		}
+		return fields
+	}
+	t.Fatalf("tool definition missing operation %q", operation)
+	return nil
+}
+
 func TestContractPinCodebaseIndexOperationsAndRequiredFields(t *testing.T) {
 	contract := loadCloudProtocolContract(t)
 	relayOps := relayIndexOperations(t)
@@ -179,6 +231,65 @@ func TestContractPinCodebaseIndexOperationsAndRequiredFields(t *testing.T) {
 		if msg := diffStringSets(fmt.Sprintf("operation %q required fields", op), gotRequired, wantRequired); msg != "" {
 			t.Error(msg)
 		}
+	}
+}
+
+func TestContractPinIndexFailureDiagnostics(t *testing.T) {
+	contract := loadCloudProtocolContract(t)
+	diagnostics := contract.CodebaseIndex.FailureDiagnostics
+	wantFields := []string{"error_code", "error_origin", "recovery"}
+	if msg := diffStringSets("failure diagnostic fields", diagnostics.Fields, wantFields); msg != "" {
+		t.Fatal(msg)
+	}
+	if msg := diffStringSets("fail optional fields", contract.CodebaseIndex.OptionalFields["fail"], wantFields); msg != "" {
+		t.Fatal(msg)
+	}
+	failProperties := relayIndexOperationProperties(t, "fail")
+	failRequired := contract.CodebaseIndex.RequiredFields["fail"]
+	requiredSet := make(map[string]bool, len(failRequired))
+	for _, field := range failRequired {
+		requiredSet[field] = true
+	}
+	var failOptional []string
+	for _, field := range failProperties {
+		if !requiredSet[field] {
+			failOptional = append(failOptional, field)
+		}
+	}
+	if msg := diffStringSets("fail tool schema optional fields", failOptional, wantFields); msg != "" {
+		t.Error(msg)
+	}
+	if diagnostics.PresenceRule != "all_or_none" ||
+		diagnostics.InvalidValueBehavior != "reject" ||
+		diagnostics.MissingFieldsBehavior != "relay_classifies_error_text_and_persists_result" {
+		t.Fatalf("failure diagnostic policy drifted: %+v", diagnostics)
+	}
+	if len(diagnostics.Codes) != len(indexFailureDiagnosticsByCode) {
+		t.Fatalf("failure diagnostic code count: contract=%d relay=%d", len(diagnostics.Codes), len(indexFailureDiagnosticsByCode))
+	}
+	for code, expected := range indexFailureDiagnosticsByCode {
+		got, ok := diagnostics.Codes[code]
+		if !ok {
+			t.Errorf("contract missing failure diagnostic code %q", code)
+			continue
+		}
+		if got.Origin != expected.Origin || got.Recovery != expected.Recovery {
+			t.Errorf("failure diagnostic %q = (%s, %s), want (%s, %s)",
+				code, got.Origin, got.Recovery, expected.Origin, expected.Recovery)
+		}
+	}
+
+	structType := reflect.TypeOf(mcpIndexFailArgs{})
+	var relayOptionalFields []string
+	for i := 0; i < structType.NumField(); i++ {
+		field := structType.Field(i)
+		name, options, _ := strings.Cut(field.Tag.Get("json"), ",")
+		if strings.Contains(options, "omitempty") {
+			relayOptionalFields = append(relayOptionalFields, name)
+		}
+	}
+	if msg := diffStringSets("relay fail optional fields", relayOptionalFields, wantFields); msg != "" {
+		t.Error(msg)
 	}
 }
 
@@ -218,8 +329,8 @@ func TestContractPinIndexLimitNegotiation(t *testing.T) {
 
 func TestContractPinIndexStartOutcomes(t *testing.T) {
 	contract := loadCloudProtocolContract(t)
-	if contract.SchemaVersion != "1.8" {
-		t.Fatalf("cloud protocol schema version: got %q, want 1.8", contract.SchemaVersion)
+	if contract.SchemaVersion != "1.9" {
+		t.Fatalf("cloud protocol schema version: got %q, want 1.9", contract.SchemaVersion)
 	}
 	outcomes := contract.CodebaseIndex.StartOutcomes
 	if !reflect.DeepEqual(outcomes.Created.RequiredFields, []string{"job"}) ||
@@ -250,7 +361,7 @@ func TestContractPinResponseEnvelope(t *testing.T) {
 	}
 
 	success := codebaseIndexEnvelope(true, map[string]interface{}{"job_id": "j"}, "")
-	failure := codebaseIndexEnvelope(false, nil, "boom")
+	failure := codebaseIndexEnvelope(false, nil, "boom", "provider_invalid_request")
 
 	for _, field := range contract.ResponseEnvelope.Required {
 		if _, ok := success[field]; !ok {
@@ -284,6 +395,16 @@ func TestContractPinResponseEnvelope(t *testing.T) {
 		if _, ok := errObj[field]; !ok {
 			t.Errorf("error object missing field %q (has %v)", field, envelopeKeys(errObj))
 		}
+	}
+	if msg := diffStringSets(
+		"optional error shape",
+		contract.ResponseEnvelope.OptionalErrorShape,
+		[]string{"code", "retry_after_seconds"},
+	); msg != "" {
+		t.Error(msg)
+	}
+	if errObj["code"] != "provider_invalid_request" {
+		t.Errorf("error object code = %#v, want provider_invalid_request", errObj["code"])
 	}
 }
 
