@@ -308,6 +308,8 @@ func classifyIndexFailure(status, detail string) indexFailureDiagnostic {
 	}
 
 	switch {
+	case containsAny("client disconnected before first upload"):
+		return indexFailureDiagnostic{"client_disconnected", "client", "restart_client"}
 	case status == indexJobStatusTimedOut || containsAny("heartbeat timed out", "heartbeat timeout"):
 		return indexFailureDiagnostic{"heartbeat_timeout", "relay", "restart_client"}
 	case containsAny("cloud embedding space changed", "embedding space changed", "clear the tenant root before starting a new index job"):
@@ -318,6 +320,8 @@ func classifyIndexFailure(status, detail string) indexFailureDiagnostic {
 		return indexFailureDiagnostic{"provider_billing", "provider", "fix_provider_billing"}
 	case containsAny("too many requests", "rate limit", "rate-limit", "remote-index 429"):
 		return indexFailureDiagnostic{"provider_rate_limited", "provider", "retry_later"}
+	case containsAny("the parameter is invalid", "[20015]", "valid utf-8", "special characters are properly escaped"):
+		return indexFailureDiagnostic{"provider_invalid_request", "provider", "contact_admin"}
 	case containsAny("manifest exceeds", "unreadable file list exceeds", "too many files", "file count limit", "maximum file count", "100,000 files", "100000 files", "文件数量", "文件数超过"):
 		return indexFailureDiagnostic{"repository_file_limit", "client", "reduce_repository"}
 	case containsAny("manifest file size is invalid", "file exceeds the", "byte limit", "file too large", "file size limit", "maximum file size", "512 kib", "524288", "文件大小超过", "单文件过大"):
@@ -332,7 +336,7 @@ func classifyIndexFailure(status, detail string) indexFailureDiagnostic {
 	case containsAny("connection refused", "connection reset", "network is unreachable", "no such host", "i/o timeout", "context deadline exceeded", "unexpected eof", "socket hang up"):
 		return indexFailureDiagnostic{"network_unavailable", "network", "restart_client"}
 	default:
-		return indexFailureDiagnostic{"index_failed", "unknown", "inspect_logs"}
+		return indexFailureDiagnostic{"index_failed", "unknown", "contact_admin"}
 	}
 }
 

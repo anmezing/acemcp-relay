@@ -1948,7 +1948,11 @@ func handleMCPToolsCall(c *gin.Context, id json.RawMessage, params json.RawMessa
 				errorSource = "lce"
 			}
 			saveErrorDetailsAsync(logIDVal, errorSource, err.Error(), getInsertDone(c))
-			encoded, _ := json.Marshal(codebaseIndexEnvelope(false, nil, err.Error()))
+			var errorCode string
+			if upstreamErr != nil {
+				errorCode = upstreamErr.code
+			}
+			encoded, _ := json.Marshal(codebaseIndexEnvelope(false, nil, err.Error(), errorCode))
 			c.JSON(http.StatusOK, rpcResult(id, map[string]interface{}{
 				"content": []map[string]interface{}{{"type": "text", "text": string(encoded)}},
 				"isError": true,
@@ -2709,6 +2713,12 @@ func main() {
 			metricsGinHandler(c)
 		})
 	}
+
+	// 容器编排就绪探针：只证明 Relay HTTP 进程已完成启动并开始接收请求。
+	// 放在 authMiddleware 前，避免健康检查依赖某个租户 API key；不返回配置或依赖详情。
+	r.GET("/healthz", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"ok": true})
+	})
 
 	// 平台模型控制面只接受控制台派生 token，不依赖某个用户 API key。
 	// 路由注册在普通 authMiddleware 之前，避免把管理员操作绑定到个人凭据。

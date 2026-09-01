@@ -256,7 +256,7 @@ func TestLoadIndexRootsMergesLatestProgressAndKeepsUnpublishedFailuresVisible(t 
 		}
 		if roots[1].IndexedAt != "" || roots[1].IndexAvailable || roots[1].IndexState != "failed" ||
 			roots[1].IndexError != "manifest rejected" || roots[1].IndexErrorCode != "index_failed" ||
-			roots[1].IndexErrorOrigin != "unknown" || roots[1].IndexRecovery != "inspect_logs" ||
+			roots[1].IndexErrorOrigin != "unknown" || roots[1].IndexRecovery != "contact_admin" ||
 			roots[1].BaseRootID != "repo-b" || roots[1].ViewBranch != "feature" || roots[1].SyncRevision != "broken" {
 			t.Fatalf("unpublished failed root must remain visible: %+v", roots[1])
 		}
@@ -299,18 +299,20 @@ func TestClassifyIndexFailure(t *testing.T) {
 		expected indexFailureDiagnostic
 	}{
 		{"heartbeat", indexJobStatusTimedOut, "index job heartbeat timed out", indexFailureDiagnostic{"heartbeat_timeout", "relay", "restart_client"}},
+		{"client disconnected", indexJobStatusTimedOut, "index client disconnected before first upload", indexFailureDiagnostic{"client_disconnected", "client", "restart_client"}},
 		{"embedding space changed", indexJobStatusFailed, "LCE cloud index begin failed: cloud embedding space changed; clear the tenant root before starting a new index job", indexFailureDiagnostic{"embedding_space_changed", "remote_index", "reset_root"}},
 		{"cloudflare 502", indexJobStatusFailed, `remote-index 502: {"title":"Error 502: Bad gateway","detail":"origin web server returned an invalid response"}`, indexFailureDiagnostic{"upstream_bad_gateway", "remote_index", "retry_after_service_recovers"}},
 		{"provider billing", indexJobStatusFailed, "embedding provider: insufficient balance", indexFailureDiagnostic{"provider_billing", "provider", "fix_provider_billing"}},
+		{"provider invalid request", indexJobStatusFailed, "Embedding API 错误: The parameter is invalid. Please check again. [20015]", indexFailureDiagnostic{"provider_invalid_request", "provider", "contact_admin"}},
 		{"provider rate limit", indexJobStatusFailed, "remote-index 429: too many requests", indexFailureDiagnostic{"provider_rate_limited", "provider", "retry_later"}},
 		{"file count", indexJobStatusFailed, "manifest exceeds 100000 files", indexFailureDiagnostic{"repository_file_limit", "client", "reduce_repository"}},
 		{"file size", indexJobStatusFailed, "file exceeds the 524288 byte limit: generated/data.json", indexFailureDiagnostic{"repository_file_size_limit", "client", "reduce_repository"}},
 		{"manifest file size", indexJobStatusFailed, "manifest file size is invalid: generated/data.json", indexFailureDiagnostic{"repository_file_size_limit", "client", "reduce_repository"}},
 		{"quota", indexJobStatusFailed, "daily index quota exceeded (used=2147483648, limit=2147483648, remaining=0 bytes)", indexFailureDiagnostic{"index_quota_exceeded", "relay", "wait_for_quota_reset"}},
-		{"generic provider quota is not relay quota", indexJobStatusFailed, "embedding provider quota exceeded", indexFailureDiagnostic{"index_failed", "unknown", "inspect_logs"}},
+		{"generic provider quota is not relay quota", indexJobStatusFailed, "embedding provider quota exceeded", indexFailureDiagnostic{"index_failed", "unknown", "contact_admin"}},
 		{"credentials", indexJobStatusFailed, "remote-index 401: invalid api key", indexFailureDiagnostic{"provider_authentication", "provider", "fix_credentials"}},
 		{"network", indexJobStatusFailed, "dial tcp: connection refused", indexFailureDiagnostic{"network_unavailable", "network", "restart_client"}},
-		{"unknown", indexJobStatusFailed, "manifest rejected", indexFailureDiagnostic{"index_failed", "unknown", "inspect_logs"}},
+		{"unknown", indexJobStatusFailed, "manifest rejected", indexFailureDiagnostic{"index_failed", "unknown", "contact_admin"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

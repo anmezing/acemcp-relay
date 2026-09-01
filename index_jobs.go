@@ -25,11 +25,14 @@ const (
 	indexJobStatusSuperseded = "superseded"
 	indexJobStatusTimedOut   = "timed_out"
 
-	indexJobHeartbeatTimeout = 10 * time.Minute
-	indexJobSweepInterval    = time.Minute
-	indexJobRenewCallTimeout = 15 * time.Second
-	maxIndexManifestFiles    = 100000
-	maxIndexBatchFiles       = 50
+	// start 已经包含完整 manifest；任务进入 created 后，正常客户端会立刻发出第一批
+	// upload。客户端在此时退出时不能让控制台继续转十分钟，所以首批上传使用更短
+	// 的失联窗口。真正进入 uploading/indexing 后仍保留较长窗口，覆盖慢模型调用。
+	indexJobInitialUploadTimeout = 2 * time.Minute
+	indexJobHeartbeatTimeout     = 10 * time.Minute
+	indexJobSweepInterval        = time.Minute
+	maxIndexManifestFiles        = 100000
+	maxIndexBatchFiles           = 50
 	// 单个文件的内容上限。源码文件极少接近这个量级，而 embedding 本身也有
 	// token 上限——超过这个大小的"源码"要么是生成物要么是灌进来的负载。
 	maxIndexFileBytes = 512 << 10 // 512 KiB
@@ -47,7 +50,8 @@ const (
 )
 
 type indexUpstreamError struct {
-	err error
+	err  error
+	code string
 }
 
 func (e *indexUpstreamError) Error() string { return e.err.Error() }
@@ -55,6 +59,32 @@ func (e *indexUpstreamError) Unwrap() error { return e.err }
 
 func newIndexUpstreamError(format string, args ...interface{}) error {
 	return &indexUpstreamError{err: fmt.Errorf(format, args...)}
+}
+
+func newIndexUpstreamDiagnosticError(code, format string, args ...interface{}) error {
+	return &indexUpstreamError{err: fmt.Errorf(format, args...), code: code}
+}
+
+type lceToolErrorEnvelope struct {
+	Error struct {
+		Message string `json:"message"`
+		Code    string `json:"code"`
+	} `json:"error"`
+}
+
+func lceIndexToolError(prefix string, content []byte) error {
+	var envelope lceToolErrorEnvelope
+	if json.Unmarshal(content, &envelope) == nil && strings.TrimSpace(envelope.Error.Message) != "" {
+		message := strings.TrimSpace(envelope.Error.Message)
+		switch strings.ToUpper(strings.TrimSpace(envelope.Error.Code)) {
+		case "PROVIDER_INVALID_REQUEST":
+			return newIndexUpstreamDiagnosticError(
+				"provider_invalid_request", "%s: %s", prefix, message,
+			)
+		}
+		return newIndexUpstreamError("%s: %s", prefix, message)
+	}
+	return newIndexUpstreamError("%s: %s", prefix, string(content))
 }
 
 type indexManifestFile struct {
@@ -412,6 +442,22 @@ type expiredActiveIndexJob struct {
 	id            string
 	rootID        string
 	cloudRevision int64
+	phase         string
+}
+
+func indexJobHeartbeatExpired(phase string, heartbeatAt, now time.Time) bool {
+	timeout := indexJobHeartbeatTimeout
+	if phase == "created" {
+		timeout = indexJobInitialUploadTimeout
+	}
+	return heartbeatAt.Before(now.Add(-timeout))
+}
+
+func timedOutIndexJobError(phase string) string {
+	if phase == "created" {
+		return "index client disconnected before first upload"
+	}
+	return "index job heartbeat timed out"
 }
 
 // inspectActiveIndexJob makes start idempotent across client processes and relay
@@ -431,7 +477,7 @@ func inspectActiveIndexJob(
 	defer tx.Rollback()
 
 	rows, err := tx.QueryContext(ctx, `
-		SELECT id::text, root_id, cloud_revision, heartbeat_at
+		SELECT id::text, root_id, cloud_revision, phase, heartbeat_at
 		FROM index_jobs
 		WHERE user_id = $1 AND workspace_id = $2 AND status = $3
 		ORDER BY started_at DESC
@@ -440,17 +486,17 @@ func inspectActiveIndexJob(
 	if err != nil {
 		return nil, err
 	}
-	cutoff := time.Now().Add(-indexJobHeartbeatTimeout)
+	now := time.Now()
 	var activeJobID string
 	var expired []expiredActiveIndexJob
 	for rows.Next() {
 		var job expiredActiveIndexJob
 		var heartbeatAt time.Time
-		if err := rows.Scan(&job.id, &job.rootID, &job.cloudRevision, &heartbeatAt); err != nil {
+		if err := rows.Scan(&job.id, &job.rootID, &job.cloudRevision, &job.phase, &heartbeatAt); err != nil {
 			rows.Close()
 			return nil, err
 		}
-		if !heartbeatAt.Before(cutoff) {
+		if !indexJobHeartbeatExpired(job.phase, heartbeatAt, now) {
 			if activeJobID == "" {
 				activeJobID = job.id
 			}
@@ -475,9 +521,9 @@ func inspectActiveIndexJob(
 		if _, err := tx.ExecContext(ctx, `
 			UPDATE index_jobs
 			SET status = $1, phase = 'done', failed_files = total_files - indexed_files,
-				error = 'index job heartbeat timed out', completed_at = NOW()
-			WHERE id = $2 AND user_id = $3 AND status = $4
-		`, indexJobStatusTimedOut, job.id, userID, indexJobStatusRunning); err != nil {
+				error = $2, completed_at = NOW()
+			WHERE id = $3 AND user_id = $4 AND status = $5
+		`, indexJobStatusTimedOut, timedOutIndexJobError(job.phase), job.id, userID, indexJobStatusRunning); err != nil {
 			return nil, err
 		}
 		if _, err := tx.ExecContext(ctx, `DELETE FROM index_job_files WHERE job_id = $1`, job.id); err != nil {
@@ -535,6 +581,10 @@ func createIndexJob(ctx context.Context, userID string, req indexStartRequest) (
 		return createIndexJobResponse{}, err
 	}
 	if activeJob != nil {
+		log.Printf(
+			"[INDEX] start blocked by active job job_id=%s tenant=%s workspace=%s root=%s phase=%s indexed_files=%d total_files=%d",
+			activeJob.ID, userID, req.WorkspaceID, activeJob.RootID, activeJob.Phase, activeJob.IndexedFiles, activeJob.TotalFiles,
+		)
 		return createIndexJobResponse{
 			ActiveJob:         activeJob,
 			Busy:              true,
@@ -666,6 +716,10 @@ func createIndexJob(ctx context.Context, userID string, req indexStartRequest) (
 	if err != nil {
 		return createIndexJobResponse{}, err
 	}
+	log.Printf(
+		"[INDEX] job created job_id=%s tenant=%s workspace=%s root=%s mode=%s workspace_files=%d pending_files=%d deleted_files=%d",
+		jobID, userID, req.WorkspaceID, req.RootID, mode, len(files), len(pending), len(deleted),
+	)
 	return createIndexJobResponse{
 		Job:          &job,
 		PendingFiles: pending,
@@ -685,21 +739,9 @@ func getIndexJob(ctx context.Context, userID, jobID string) (indexJobView, error
 	if err != nil {
 		return indexJobView{}, err
 	}
-	if job.Status == indexJobStatusRunning {
-		if renewErr := renewLCEIndexJob(ctx, userID, job.ID, job.RootID); renewErr != nil {
-			log.Printf("[INDEX] cloud renew best-effort failed for job %s (status query continues): %v", jobID, renewErr)
-		}
-		if _, err := db.ExecContext(ctx, `
-			UPDATE index_jobs SET heartbeat_at = NOW()
-			WHERE id = $1 AND user_id = $2 AND status = $3
-		`, jobID, userID, indexJobStatusRunning); err != nil {
-			return indexJobView{}, err
-		}
-		job, err = loadIndexJob(ctx, userID, jobID)
-		if err != nil {
-			return indexJobView{}, err
-		}
-	}
+	// status 是只读观测，不是心跳。否则控制台/Agent 轮询会把已经退出客户端的
+	// created 任务永久续命，页面就会一直显示“正在索引”。任务活性只由真正的
+	// upload/complete/fail 操作推进。
 	return job, nil
 }
 
@@ -824,6 +866,26 @@ func uploadIndexBatch(ctx context.Context, userID string, req indexUploadRequest
 	if err := tx.Commit(); err != nil {
 		return indexBatchResponse{}, err
 	}
+	// 在调用 LCE/Embedding 前就把首批任务从 created 推进到 uploading，并刷新
+	// 活性时间。这样 created 可以使用较短的客户端失联窗口，而慢模型调用仍受
+	// 常规 10 分钟心跳窗口保护。
+	heartbeatResult, err := db.ExecContext(opCtx, `
+		UPDATE index_jobs
+		SET phase = 'uploading', heartbeat_at = NOW()
+		WHERE id = $1 AND user_id = $2 AND status = $3
+	`, job.ID, userID, indexJobStatusRunning)
+	if err != nil {
+		return indexBatchResponse{}, err
+	}
+	if affected, err := heartbeatResult.RowsAffected(); err != nil {
+		return indexBatchResponse{}, err
+	} else if affected != 1 {
+		return indexBatchResponse{}, fmt.Errorf("index job is no longer running")
+	}
+	log.Printf(
+		"[INDEX] upload started job_id=%s tenant=%s root=%s files=%d deleted_files=%d",
+		job.ID, userID, req.RootID, len(staged), len(deleted),
+	)
 	if _, err := validateIndexBatchSize(staged); err != nil {
 		return indexBatchResponse{}, err
 	}
@@ -867,7 +929,7 @@ func uploadIndexBatch(ctx context.Context, userID string, req indexUploadRequest
 		return indexBatchResponse{}, newIndexUpstreamError("LCE index call failed: %w", err)
 	}
 	if result.IsError {
-		return indexBatchResponse{}, newIndexUpstreamError("LCE index call failed: %s", string(result.Content))
+		return indexBatchResponse{}, lceIndexToolError("LCE index call failed", result.Content)
 	}
 
 	chunks, exact := extractChunkCount(result.Content)
@@ -895,6 +957,10 @@ func uploadIndexBatch(ctx context.Context, userID string, req indexUploadRequest
 	if err != nil {
 		return indexBatchResponse{}, err
 	}
+	log.Printf(
+		"[INDEX] upload committed job_id=%s tenant=%s root=%s batch_files=%d indexed_files=%d total_files=%d phase=%s",
+		job.ID, userID, req.RootID, len(staged), updated.IndexedFiles, updated.TotalFiles, updated.Phase,
+	)
 	var lceResponse interface{}
 	if err := json.Unmarshal(result.Content, &lceResponse); err != nil {
 		lceResponse = string(result.Content)
@@ -1128,7 +1194,7 @@ func completeIndexJob(ctx context.Context, userID, jobID string) (indexJobView, 
 			return indexJobView{}, newIndexUpstreamError("LCE cloud index publish failed: %w", err)
 		}
 		if result.IsError {
-			return indexJobView{}, newIndexUpstreamError("LCE cloud index publish failed: %s", string(result.Content))
+			return indexJobView{}, lceIndexToolError("LCE cloud index publish failed", result.Content)
 		}
 		cloudRevision, err = extractCloudRevision(result.Content)
 		if err != nil {
@@ -1241,7 +1307,7 @@ func beginLCEIndexJob(ctx context.Context, userID, jobID, rootID string, replace
 		return newIndexUpstreamError("LCE cloud index begin failed: %w", err)
 	}
 	if result.IsError {
-		return newIndexUpstreamError("LCE cloud index begin failed: %s", string(result.Content))
+		return lceIndexToolError("LCE cloud index begin failed", result.Content)
 	}
 	return nil
 }
@@ -1254,21 +1320,6 @@ func lceBeginIndexJobArgs(userID, jobID, rootID string, replaceRoot bool) map[st
 	return args
 }
 
-func renewLCEIndexJob(ctx context.Context, userID, jobID, rootID string) error {
-	args := lceIndexJobArgs(userID, jobID, rootID, "renew")
-	if _, err := validateMCPToolCallBody("codebase_remote_index", args); err != nil {
-		return err
-	}
-	result, err := lce.callToolWithTimeout(ctx, "codebase_remote_index", args, indexJobRenewCallTimeout)
-	if err != nil {
-		return newIndexUpstreamError("LCE cloud index renew failed: %w", err)
-	}
-	if result.IsError {
-		return newIndexUpstreamError("LCE cloud index renew failed: %s", string(result.Content))
-	}
-	return nil
-}
-
 func abortLCEIndexJob(ctx context.Context, userID, jobID, rootID string) error {
 	args := lceIndexJobArgs(userID, jobID, rootID, "abort")
 	if _, err := validateMCPToolCallBody("codebase_remote_index", args); err != nil {
@@ -1279,17 +1330,18 @@ func abortLCEIndexJob(ctx context.Context, userID, jobID, rootID string) error {
 		return newIndexUpstreamError("LCE cloud index abort failed: %w", err)
 	}
 	if result.IsError {
-		return newIndexUpstreamError("LCE cloud index abort failed: %s", string(result.Content))
+		return lceIndexToolError("LCE cloud index abort failed", result.Content)
 	}
 	return nil
 }
 
 func lceIndexJobArgs(userID, jobID, rootID, operation string) map[string]interface{} {
 	return map[string]interface{}{
-		"tenant_id": userID,
-		"job_id":    jobID,
-		"operation": operation,
-		"root_id":   rootID,
+		"tenant_id":       userID,
+		"job_id":          jobID,
+		"operation":       operation,
+		"root_id":         rootID,
+		"response_format": "json",
 	}
 }
 
@@ -1463,13 +1515,32 @@ func sweepExpiredIndexJobs(ctx context.Context) {
 		return
 	}
 	defer tx.Rollback()
+	now := time.Now()
 	rows, err := tx.QueryContext(ctx, `
-		UPDATE index_jobs
-		SET status = $1, phase = 'done', failed_files = total_files - indexed_files,
-			error = 'index job heartbeat timed out', completed_at = NOW()
-		WHERE status = $2 AND heartbeat_at < $3
-		RETURNING id::text, user_id, root_id, cloud_revision
-	`, indexJobStatusTimedOut, indexJobStatusRunning, time.Now().Add(-indexJobHeartbeatTimeout))
+		WITH expired AS (
+			SELECT id, phase AS expired_phase
+			FROM index_jobs
+			WHERE status = $2 AND (
+				(phase = 'created' AND heartbeat_at < $3) OR
+				(phase <> 'created' AND heartbeat_at < $4)
+			)
+			FOR UPDATE SKIP LOCKED
+		)
+		UPDATE index_jobs AS jobs
+		SET status = $1, phase = 'done', failed_files = jobs.total_files - jobs.indexed_files,
+			error = CASE
+				WHEN expired.expired_phase = 'created' THEN 'index client disconnected before first upload'
+				ELSE 'index job heartbeat timed out'
+			END,
+			completed_at = NOW()
+		FROM expired
+		WHERE jobs.id = expired.id
+		RETURNING jobs.id::text, jobs.user_id, jobs.root_id, jobs.cloud_revision,
+			expired.expired_phase, jobs.error
+	`, indexJobStatusTimedOut, indexJobStatusRunning,
+		now.Add(-indexJobInitialUploadTimeout),
+		now.Add(-indexJobHeartbeatTimeout),
+	)
 	if err != nil {
 		log.Printf("[INDEX] Failed to sweep timed out jobs: %v", err)
 		return
@@ -1479,11 +1550,13 @@ func sweepExpiredIndexJobs(ctx context.Context) {
 		userID        string
 		rootID        string
 		cloudRevision int64
+		phase         string
+		reason        string
 	}
 	var jobs []expiredJob
 	for rows.Next() {
 		var job expiredJob
-		if err := rows.Scan(&job.id, &job.userID, &job.rootID, &job.cloudRevision); err != nil {
+		if err := rows.Scan(&job.id, &job.userID, &job.rootID, &job.cloudRevision, &job.phase, &job.reason); err != nil {
 			// 出错必须整体放弃：吞掉 Scan 错误会让对应 job 被标成 timed_out
 			// 却漏删 index_job_files，永久泄漏。回滚后下一轮 sweep 重来。
 			rows.Close()
@@ -1508,6 +1581,10 @@ func sweepExpiredIndexJobs(ctx context.Context) {
 		return
 	}
 	for _, job := range jobs {
+		log.Printf(
+			"[INDEX] job timed out job_id=%s tenant=%s root=%s phase=%s reason=%q",
+			job.id, job.userID, job.rootID, job.phase, job.reason,
+		)
 		if job.cloudRevision > 0 {
 			log.Printf("[INDEX] skipping cloud abort for timed out job %s: LCE publish already succeeded (revision=%d)", job.id, job.cloudRevision)
 			continue
@@ -1522,6 +1599,10 @@ func sweepExpiredIndexJobs(ctx context.Context) {
 }
 
 func startIndexJobSweeper(ctx context.Context) {
+	// 启动后立即收敛上一次进程留下的陈旧任务，不再额外等待首个 ticker。
+	platformModelConfigBarrier.RLock()
+	sweepExpiredIndexJobs(ctx)
+	platformModelConfigBarrier.RUnlock()
 	ticker := time.NewTicker(indexJobSweepInterval)
 	defer ticker.Stop()
 	for {

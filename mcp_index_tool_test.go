@@ -292,3 +292,17 @@ func TestCodebaseIndexFailRequiresErrorField(t *testing.T) {
 		t.Fatalf("fail without error must be rejected before touching state, got: %v", err)
 	}
 }
+
+func TestCodebaseIndexEnvelopeIncludesOptionalDiagnosticCode(t *testing.T) {
+	envelope := codebaseIndexEnvelope(false, nil, "invalid embedding request", "provider_invalid_request")
+	errorPayload, ok := envelope["error"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("error payload = %T, want object", envelope["error"])
+	}
+	if errorPayload["message"] != "invalid embedding request" {
+		t.Fatalf("unexpected error message: %#v", errorPayload["message"])
+	}
+	if errorPayload["code"] != "provider_invalid_request" {
+		t.Fatalf("unexpected error code: %#v", errorPayload["code"])
+	}
+}

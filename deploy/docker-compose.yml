@@ -82,6 +82,12 @@ services:
       MODEL_CONFIG_SECRET: ${MODEL_CONFIG_SECRET:-}
       MCP_MAX_SESSIONS: ${MCP_MAX_SESSIONS:-1000}
       MCP_MAX_SESSIONS_PER_USER: ${MCP_MAX_SESSIONS_PER_USER:-16}
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3009/healthz >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
 
   frontend:
     build: ../../acemcp-relay-frontend
@@ -91,8 +97,12 @@ services:
       - "127.0.0.1:3001:3001"
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    depends_on:
+      relay:
+        condition: service_healthy
     environment:
       PORT: "3001"
+      LCE_RELAY_URL: ${LCE_RELAY_URL:-http://relay:3009}
       BETTER_AUTH_URL: ${BETTER_AUTH_URL:-https://lcebot.com}
       BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:?set BETTER_AUTH_SECRET in .env}
       BETTER_AUTH_TRUSTED_PROXIES: ${BETTER_AUTH_TRUSTED_PROXIES:-}

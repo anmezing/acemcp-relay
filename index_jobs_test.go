@@ -119,10 +119,11 @@ func TestExtractChunkCount(t *testing.T) {
 func TestLCEIndexJobArgsUseCloudProtocolWithoutUserEmbeddingConfig(t *testing.T) {
 	args := lceIndexJobArgs("tenant-1", "7e224a32-3423-4bb0-9213-3c55a5797c9d", "repo-a", "stage")
 	for key, expected := range map[string]string{
-		"tenant_id": "tenant-1",
-		"job_id":    "7e224a32-3423-4bb0-9213-3c55a5797c9d",
-		"root_id":   "repo-a",
-		"operation": "stage",
+		"tenant_id":       "tenant-1",
+		"job_id":          "7e224a32-3423-4bb0-9213-3c55a5797c9d",
+		"root_id":         "repo-a",
+		"operation":       "stage",
+		"response_format": "json",
 	} {
 		if args[key] != expected {
 			t.Fatalf("%s: got %#v, want %q", key, args[key], expected)
@@ -599,5 +600,37 @@ func TestGraftUnreadablePathsPrefersCurrentManifestEntry(t *testing.T) {
 	}
 	if len(files) != 1 || files[0].Hash != "new" {
 		t.Fatalf("current manifest entry must win over grafted snapshot entry: %#v", files)
+	}
+}
+
+func TestLCEIndexToolErrorPreservesProviderInvalidRequestDiagnostic(t *testing.T) {
+	content := []byte(`{"ok":false,"error":{"message":"Embedding API 错误: The parameter is invalid. [20015]","code":"PROVIDER_INVALID_REQUEST"}}`)
+	err := lceIndexToolError("LCE index call failed", content)
+
+	upstream, ok := err.(*indexUpstreamError)
+	if !ok {
+		t.Fatalf("expected indexUpstreamError, got %T: %v", err, err)
+	}
+	if upstream.code != "provider_invalid_request" {
+		t.Fatalf("diagnostic code = %q, want provider_invalid_request", upstream.code)
+	}
+	if got := err.Error(); got != "LCE index call failed: Embedding API 错误: The parameter is invalid. [20015]" {
+		t.Fatalf("unexpected public error: %q", got)
+	}
+}
+
+func TestLCEIndexToolErrorKeepsUnknownStructuredErrorGeneric(t *testing.T) {
+	content := []byte(`{"ok":false,"error":{"message":"provider unavailable","code":"SOME_FUTURE_CODE"}}`)
+	err := lceIndexToolError("LCE index call failed", content)
+
+	upstream, ok := err.(*indexUpstreamError)
+	if !ok {
+		t.Fatalf("expected indexUpstreamError, got %T: %v", err, err)
+	}
+	if upstream.code != "" {
+		t.Fatalf("unknown LCE code must not be exposed as a public diagnostic: %q", upstream.code)
+	}
+	if got := err.Error(); got != "LCE index call failed: provider unavailable" {
+		t.Fatalf("unexpected public error: %q", got)
 	}
 }

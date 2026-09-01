@@ -134,7 +134,7 @@ type mcpIndexFailArgs struct {
 // codebaseIndexEnvelope 构造 codebase_index 的响应信封。字段名与
 // docs/contracts/cloud-protocol.json 的 responseEnvelope 契约一致：
 // ok 必有；成功带 payload，失败带 error:{message}。
-func codebaseIndexEnvelope(ok bool, payload interface{}, errMessage string) map[string]interface{} {
+func codebaseIndexEnvelope(ok bool, payload interface{}, errMessage string, errorCode ...string) map[string]interface{} {
 	envelope := map[string]interface{}{
 		"schemaVersion":  indexEnvelopeSchemaVersion,
 		"toolName":       codebaseIndexToolName,
@@ -145,7 +145,11 @@ func codebaseIndexEnvelope(ok bool, payload interface{}, errMessage string) map[
 	if ok {
 		envelope["payload"] = payload
 	} else {
-		envelope["error"] = map[string]interface{}{"message": errMessage}
+		errorPayload := map[string]interface{}{"message": errMessage}
+		if len(errorCode) > 0 && strings.TrimSpace(errorCode[0]) != "" {
+			errorPayload["code"] = strings.TrimSpace(errorCode[0])
+		}
+		envelope["error"] = errorPayload
 	}
 	return envelope
 }

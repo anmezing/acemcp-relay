@@ -82,7 +82,7 @@ echo "=== Applying host capacity settings ==="
 
 echo "=== Rebuilding Docker containers ==="
 cd "$SCRIPT_DIR"
-docker compose up -d --build --no-deps lce relay frontend
+docker compose up -d --build --wait --wait-timeout "${DEPLOY_WAIT_TIMEOUT_SECONDS:-180}" lce relay frontend
 
 prune_docker_resources
 

@@ -29,14 +29,45 @@ func activeIndexJobRow(now time.Time) *sqlmock.Rows {
 	)
 }
 
+func TestIndexJobHeartbeatExpiredUsesShortCreatedWindow(t *testing.T) {
+	now := time.Now()
+	createdHeartbeat := now.Add(-indexJobInitialUploadTimeout - time.Second)
+	if !indexJobHeartbeatExpired("created", createdHeartbeat, now) {
+		t.Fatal("created job must expire when the client never uploads its first batch")
+	}
+	if indexJobHeartbeatExpired("indexing", createdHeartbeat, now) {
+		t.Fatal("active upload/index work must retain the normal heartbeat window")
+	}
+	if got := timedOutIndexJobError("created"); got != "index client disconnected before first upload" {
+		t.Fatalf("unexpected created timeout error: %q", got)
+	}
+}
+
+func TestGetIndexJobStatusIsReadOnly(t *testing.T) {
+	now := time.Now()
+	withMockDB(t, func(mock sqlmock.Sqlmock) {
+		mock.ExpectQuery("SELECT id::text, workspace_id, workspace_name, root_id").
+			WithArgs("job-active", "user-a").
+			WillReturnRows(activeIndexJobRow(now))
+
+		job, err := getIndexJob(context.Background(), "user-a", "job-active")
+		if err != nil {
+			t.Fatalf("getIndexJob: %v", err)
+		}
+		if job.ID != "job-active" || job.Status != indexJobStatusRunning {
+			t.Fatalf("unexpected job: %#v", job)
+		}
+	})
+}
+
 func TestInspectActiveIndexJobReturnsBusyOwnerWithoutMutatingIt(t *testing.T) {
 	now := time.Now()
 	withMockDB(t, func(mock sqlmock.Sqlmock) {
 		expectIndexUserLock(mock, "user-a")
-		mock.ExpectQuery("SELECT id::text, root_id, cloud_revision, heartbeat_at").
+		mock.ExpectQuery("SELECT id::text, root_id, cloud_revision, phase, heartbeat_at").
 			WithArgs("user-a", "workspace-a", indexJobStatusRunning).
-			WillReturnRows(sqlmock.NewRows([]string{"id", "root_id", "cloud_revision", "heartbeat_at"}).
-				AddRow("job-active", "root-a", int64(1), now))
+			WillReturnRows(sqlmock.NewRows([]string{"id", "root_id", "cloud_revision", "phase", "heartbeat_at"}).
+				AddRow("job-active", "root-a", int64(1), "indexing", now))
 		mock.ExpectQuery("SELECT id::text, workspace_id, workspace_name, root_id").
 			WithArgs("job-active", "user-a").
 			WillReturnRows(activeIndexJobRow(now))
@@ -56,12 +87,12 @@ func TestInspectActiveIndexJobReclaimsExpiredOwnerBeforeReplacement(t *testing.T
 	now := time.Now()
 	withMockDB(t, func(mock sqlmock.Sqlmock) {
 		expectIndexUserLock(mock, "user-a")
-		mock.ExpectQuery("SELECT id::text, root_id, cloud_revision, heartbeat_at").
+		mock.ExpectQuery("SELECT id::text, root_id, cloud_revision, phase, heartbeat_at").
 			WithArgs("user-a", "workspace-a", indexJobStatusRunning).
-			WillReturnRows(sqlmock.NewRows([]string{"id", "root_id", "cloud_revision", "heartbeat_at"}).
-				AddRow("job-expired", "root-a", int64(1), now.Add(-indexJobHeartbeatTimeout-time.Minute)))
+			WillReturnRows(sqlmock.NewRows([]string{"id", "root_id", "cloud_revision", "phase", "heartbeat_at"}).
+				AddRow("job-expired", "root-a", int64(1), "indexing", now.Add(-indexJobHeartbeatTimeout-time.Minute)))
 		mock.ExpectExec("UPDATE index_jobs").
-			WithArgs(indexJobStatusTimedOut, "job-expired", "user-a", indexJobStatusRunning).
+			WithArgs(indexJobStatusTimedOut, "index job heartbeat timed out", "job-expired", "user-a", indexJobStatusRunning).
 			WillReturnResult(sqlmock.NewResult(0, 1))
 		mock.ExpectExec("DELETE FROM index_job_files WHERE job_id").
 			WithArgs("job-expired").
@@ -95,10 +126,10 @@ func TestCreateIndexJobReturnsBusyWithoutCreatingProviderWork(t *testing.T) {
 		// this start attempt: no workspace mutation, job INSERT, or LCE/provider
 		// call may follow.
 		expectIndexUserLock(mock, "user-a")
-		mock.ExpectQuery("SELECT id::text, root_id, cloud_revision, heartbeat_at").
+		mock.ExpectQuery("SELECT id::text, root_id, cloud_revision, phase, heartbeat_at").
 			WithArgs("user-a", "workspace-a", indexJobStatusRunning).
-			WillReturnRows(sqlmock.NewRows([]string{"id", "root_id", "cloud_revision", "heartbeat_at"}).
-				AddRow("job-active", "root-a", int64(1), now))
+			WillReturnRows(sqlmock.NewRows([]string{"id", "root_id", "cloud_revision", "phase", "heartbeat_at"}).
+				AddRow("job-active", "root-a", int64(1), "indexing", now))
 		mock.ExpectQuery("SELECT id::text, workspace_id, workspace_name, root_id").
 			WithArgs("job-active", "user-a").
 			WillReturnRows(activeIndexJobRow(now))
@@ -149,9 +180,9 @@ func TestCreateIndexJobReturnsUnchangedWithoutCreatingProviderWork(t *testing.T)
 
 		// No healthy or expired job currently owns this workspace.
 		expectIndexUserLock(mock, "user-a")
-		mock.ExpectQuery("SELECT id::text, root_id, cloud_revision, heartbeat_at").
+		mock.ExpectQuery("SELECT id::text, root_id, cloud_revision, phase, heartbeat_at").
 			WithArgs("user-a", "workspace-a", indexJobStatusRunning).
-			WillReturnRows(sqlmock.NewRows([]string{"id", "root_id", "cloud_revision", "heartbeat_at"}))
+			WillReturnRows(sqlmock.NewRows([]string{"id", "root_id", "cloud_revision", "phase", "heartbeat_at"}))
 		mock.ExpectCommit()
 
 		mock.ExpectQuery("SELECT root_id FROM index_workspaces").
