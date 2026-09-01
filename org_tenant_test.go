@@ -370,7 +370,7 @@ func TestHandleDismissRootFailureOrgOwnerUsesOrgTenant(t *testing.T) {
 		mock.ExpectQuery("SELECT EXISTS").
 			WithArgs("org-1", "repo-a").
 			WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
-		expectDismissRootFailureTx(mock, "org-1", "repo-a", 1)
+		expectDismissRootFailureTx(mock, "org-1", "repo-a", 1, false)
 
 		c, recorder := newOrgContext(t, "owner-1", "org-1", "owner", "POST", `{"root_id":"repo-a"}`)
 		handleDismissRootFailure(c)

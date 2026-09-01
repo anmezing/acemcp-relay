@@ -409,14 +409,24 @@ func TestHandleListRootsReturnsEmptyArrayNotNull(t *testing.T) {
 
 // ── POST /mcp/dismiss-root-failure ─────────────────────────────────────────
 
-func expectDismissRootFailureTx(mock sqlmock.Sqlmock, userID, rootID string, dismissed int64) {
+func expectDismissRootFailureTx(mock sqlmock.Sqlmock, userID, rootID string, dismissed int64, hasPublishedIndex bool) {
 	mock.ExpectBegin()
 	mock.ExpectExec("pg_advisory_xact_lock").
 		WithArgs(userID).
 		WillReturnResult(sqlmock.NewResult(0, 0))
+	// 检查是否有已发布的索引
+	mock.ExpectQuery("SELECT EXISTS").
+		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(hasPublishedIndex))
+	// 删除失败任务
 	mock.ExpectExec("DELETE FROM index_jobs").
 		WithArgs(userID, rootID, indexJobStatusFailed, indexJobStatusTimedOut).
 		WillReturnResult(sqlmock.NewResult(0, dismissed))
+	// 如果没有已发布索引，删除 workspace
+	if !hasPublishedIndex {
+		mock.ExpectExec("DELETE FROM index_workspaces").
+			WithArgs(userID, rootID).
+			WillReturnResult(sqlmock.NewResult(0, 1))
+	}
 	mock.ExpectCommit()
 }
 
@@ -425,7 +435,8 @@ func TestHandleDismissRootFailurePreservesPublishedIndexState(t *testing.T) {
 		mock.ExpectQuery("SELECT EXISTS").
 			WithArgs("user-1", "repo-a").
 			WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
-		expectDismissRootFailureTx(mock, "user-1", "repo-a", 2)
+		// 有已发布索引，保留 workspace
+		expectDismissRootFailureTx(mock, "user-1", "repo-a", 2, true)
 
 		c, recorder := newRootAdminContext(t, "user-1", "POST", `{"root_id":"repo-a"}`)
 		handleDismissRootFailure(c)
@@ -435,8 +446,27 @@ func TestHandleDismissRootFailurePreservesPublishedIndexState(t *testing.T) {
 		if !strings.Contains(recorder.Body.String(), `"dismissed_jobs":2`) {
 			t.Fatalf("unexpected response: %s", recorder.Body.String())
 		}
-		// sqlmock 未配置 indexed_files/index_workspaces DELETE；若实现误删已发布快照，
-		// ExpectationsWereMet 会失败。
+		// 有已发布索引时不删除 workspace/indexed_files
+	})
+}
+
+func TestHandleDismissRootFailureClearsWorkspaceWhenNoPublishedIndex(t *testing.T) {
+	withMockDB(t, func(mock sqlmock.Sqlmock) {
+		mock.ExpectQuery("SELECT EXISTS").
+			WithArgs("user-1", "repo-b").
+			WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
+		// 没有已发布索引（首次索引失败），完全清理 workspace
+		expectDismissRootFailureTx(mock, "user-1", "repo-b", 1, false)
+
+		c, recorder := newRootAdminContext(t, "user-1", "POST", `{"root_id":"repo-b"}`)
+		handleDismissRootFailure(c)
+		if recorder.Code != 200 {
+			t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+		}
+		if !strings.Contains(recorder.Body.String(), `"dismissed_jobs":1`) {
+			t.Fatalf("unexpected response: %s", recorder.Body.String())
+		}
+		// 测试确认：没有已发布索引时会删除 workspace（expectDismissRootFailureTx 中已配置）
 	})
 }
 
@@ -445,7 +475,7 @@ func TestHandleDismissRootFailureIsIdempotent(t *testing.T) {
 		mock.ExpectQuery("SELECT EXISTS").
 			WithArgs("user-1", "repo-a").
 			WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
-		expectDismissRootFailureTx(mock, "user-1", "repo-a", 0)
+		expectDismissRootFailureTx(mock, "user-1", "repo-a", 0, false)
 
 		c, recorder := newRootAdminContext(t, "user-1", "POST", `{"root_id":"repo-a"}`)
 		handleDismissRootFailure(c)

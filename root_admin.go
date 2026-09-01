@@ -487,25 +487,59 @@ func deleteRootIndexState(ctx context.Context, userID, rootID string) (int64, er
 	return deletedFiles, tx.Commit()
 }
 
-// dismissRootFailureState 只清理该 root 的失败/超时任务和级联的暂存文件，保留
-// 已发布 workspace、indexed_files 与 LCE 云端快照。这样“更新失败但旧索引可用”
-// 的场景可以隐藏失败记录，而不会误删仍可检索的数据。
+// dismissRootFailureState 清理该 root 的失败/超时任务。如果该 root 没有任何已发布的
+// 索引数据（首次索引失败），则完全清理 workspace 和相关状态，让用户重启 IDE 后能够
+// 重新开始干净的索引；如果有已发布的快照（更新失败但旧索引可用），则只删除失败任务，
+// 保留 workspace、indexed_files 与 LCE 云端快照，不会误删仍可检索的数据。
 func dismissRootFailureState(ctx context.Context, userID, rootID string) (int64, error) {
 	tx, err := beginLockedIndexUserTx(ctx, userID)
 	if err != nil {
 		return 0, err
 	}
 	defer tx.Rollback()
+
+	normalizedRootID := lceIndexRootID(rootID)
+
+	// 检查该 root 是否有已发布的索引数据
+	var hasPublishedIndex bool
+	err = tx.QueryRowContext(ctx, `
+		SELECT EXISTS(
+			SELECT 1 FROM indexed_files AS files
+			JOIN index_workspaces AS workspaces
+			  ON files.user_id = workspaces.user_id
+			  AND files.workspace_id = workspaces.workspace_id
+			WHERE workspaces.user_id = $1
+			  AND CASE WHEN BTRIM(workspaces.root_id) = '' THEN 'default' ELSE BTRIM(workspaces.root_id) END = $2
+		)
+	`, userID, normalizedRootID).Scan(&hasPublishedIndex)
+	if err != nil {
+		return 0, err
+	}
+
+	// 删除失败/超时的任务
 	result, err := tx.ExecContext(ctx, `
 		DELETE FROM index_jobs
 		WHERE user_id = $1
 		  AND CASE WHEN BTRIM(root_id) = '' THEN 'default' ELSE BTRIM(root_id) END = $2
 		  AND status IN ($3, $4)
-	`, userID, lceIndexRootID(rootID), indexJobStatusFailed, indexJobStatusTimedOut)
+	`, userID, normalizedRootID, indexJobStatusFailed, indexJobStatusTimedOut)
 	if err != nil {
 		return 0, err
 	}
 	dismissed, _ := result.RowsAffected()
+
+	// 如果没有已发布的索引（首次索引失败），完全清理 workspace，让用户能重新开始
+	if !hasPublishedIndex {
+		_, err = tx.ExecContext(ctx, `
+			DELETE FROM index_workspaces
+			WHERE user_id = $1
+			  AND CASE WHEN BTRIM(root_id) = '' THEN 'default' ELSE BTRIM(root_id) END = $2
+		`, userID, normalizedRootID)
+		if err != nil {
+			return 0, err
+		}
+	}
+
 	return dismissed, tx.Commit()
 }
 
