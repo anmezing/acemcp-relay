@@ -6,6 +6,20 @@ LCE_DIR="$SCRIPT_DIR/../../lce"
 FRONTEND_DIR="$SCRIPT_DIR/../../acemcp-relay-frontend"
 RELAY_DIR="$SCRIPT_DIR/.."
 
+# Production Compose must use the deployment-scoped env file. Do not silently
+# fall back to the relay repository's local-development .env: that can point
+# at a developer machine or validation VM instead of production services.
+DEPLOY_ENV_FILE="${DEPLOY_ENV_FILE:-$SCRIPT_DIR/.env}"
+if [[ "$DEPLOY_ENV_FILE" != /* ]]; then
+  echo "ERROR: DEPLOY_ENV_FILE must be an absolute path when supplied: $DEPLOY_ENV_FILE" >&2
+  exit 1
+fi
+if [[ ! -f "$DEPLOY_ENV_FILE" ]]; then
+  echo "ERROR: production env file not found: $DEPLOY_ENV_FILE" >&2
+  echo "Create it with: cp deploy/.env.example deploy/.env" >&2
+  exit 1
+fi
+
 # 可选锁定部署版本：DEPLOY_REF_LCE / DEPLOY_REF_RELAY / DEPLOY_REF_FRONTEND
 # 指定 tag 或 commit 时按该版本部署；不指定则跟随远端分支（开发期默认）。
 update_repo() {
@@ -82,9 +96,34 @@ echo "=== Applying host capacity settings ==="
 
 echo "=== Rebuilding Docker containers ==="
 cd "$SCRIPT_DIR"
-docker compose up -d --build --wait --wait-timeout "${DEPLOY_WAIT_TIMEOUT_SECONDS:-180}" lce relay frontend
+# Neo4j and its projector are production services. The GDS algorithm worker is
+# intentionally a separate opt-in Compose profile; enabling it requires a
+# validated GDS capability and an explicit operator action.
+compose_env_args=(--env-file "$DEPLOY_ENV_FILE")
+compose_profile_args=()
+graph_algorithm_services=()
+case "${DEPLOY_GRAPH_ALGORITHMS:-false}" in
+  false)
+    # If a previous rollout enabled the profile, make the normal rollout
+    # converge back to the documented default instead of leaving the old
+    # worker container running.
+    echo "=== Ensuring graph algorithm worker is disabled ==="
+    docker compose "${compose_env_args[@]}" --profile graph-algorithms rm -sf neo4j-algorithm-worker || true
+    ;;
+  true)
+    compose_profile_args+=(--profile graph-algorithms)
+    graph_algorithm_services+=(neo4j-algorithm-worker)
+    ;;
+  *)
+    echo "ERROR: DEPLOY_GRAPH_ALGORITHMS must be true or false" >&2
+    exit 1
+    ;;
+esac
+
+docker compose "${compose_env_args[@]}" "${compose_profile_args[@]}" up -d --build --wait --wait-timeout "${DEPLOY_WAIT_TIMEOUT_SECONDS:-180}" \
+  neo4j lce neo4j-projector relay frontend "${graph_algorithm_services[@]}"
 
 prune_docker_resources
 
 echo "=== Done ==="
-docker compose ps
+docker compose "${compose_env_args[@]}" "${compose_profile_args[@]}" ps

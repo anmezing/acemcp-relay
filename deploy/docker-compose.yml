@@ -1,4 +1,36 @@
 services:
+  neo4j:
+    # Production must pin and review the Neo4j image tag/digest explicitly.
+    image: ${NEO4J_IMAGE:?set NEO4J_IMAGE to a validated Neo4j image tag or digest}
+    restart: unless-stopped
+    environment:
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:?set NEO4J_PASSWORD in .env}
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD}
+      # Keep [] unless the GDS plugin has been validated for this image/edition.
+      NEO4J_PLUGINS: ${NEO4J_PLUGINS:-[]}
+      NEO4J_server_memory_heap_initial__size: ${NEO4J_HEAP_INITIAL_SIZE:-2g}
+      NEO4J_server_memory_heap_max__size: ${NEO4J_HEAP_MAX_SIZE:-4g}
+      NEO4J_server_memory_pagecache_size: ${NEO4J_PAGECACHE_SIZE:-8g}
+      NEO4J_server_bolt_enabled: "true"
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    # Do not publish Neo4j to the LAN by default. LCE and the workers use the
+    # Compose DNS name neo4j:7687 on the private project network.
+    ports:
+      - "${NEO4J_PORT_BIND:-127.0.0.1}:7474:7474"
+      - "${NEO4J_PORT_BIND:-127.0.0.1}:7687:7687"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          cypher-shell --address bolt://127.0.0.1:7687 --username neo4j
+          --password "$${NEO4J_PASSWORD}" "RETURN 1" >/dev/null 2>&1
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 60s
+
   lce:
     build: ../../lce
     container_name: lce
@@ -11,6 +43,24 @@ services:
       LCE_HOME: /data
       LCE_CLOUD_DATABASE_URL: ${LCE_CLOUD_DATABASE_URL:?set a PostgreSQL URL whose server has pgvector installed}
       LCE_TENANT_ASSERTION_SECRET: ${LCE_TENANT_ASSERTION_SECRET:?set LCE_TENANT_ASSERTION_SECRET in .env (>=32 chars, shared with relay)}
+      LCE_NEO4J_URI: bolt://neo4j:7687
+      LCE_NEO4J_USERNAME: neo4j
+      LCE_NEO4J_PASSWORD: ${NEO4J_PASSWORD:?set NEO4J_PASSWORD in .env}
+      LCE_NEO4J_DATABASE: ${NEO4J_DATABASE:-neo4j}
+      # The HTTP process never runs the graph algorithm worker. Algorithms are
+      # isolated in the explicit graph-algorithms profile below.
+      LCE_NEO4J_ALGORITHM_WORKER_ENABLED: "false"
+      LCE_NEO4J_PROJECTOR_ENABLED: ${LCE_NEO4J_PROJECTOR_ENABLED:-true}
+      LCE_NEO4J_CONNECTION_TIMEOUT_MS: ${LCE_NEO4J_CONNECTION_TIMEOUT_MS:-10000}
+      LCE_NEO4J_MAX_CONNECTION_POOL_SIZE: ${LCE_NEO4J_MAX_CONNECTION_POOL_SIZE:-16}
+      LCE_NEO4J_MAX_TRANSACTION_RETRY_MS: ${LCE_NEO4J_MAX_TRANSACTION_RETRY_MS:-30000}
+      LCE_NEO4J_QUERY_TIMEOUT_MS: ${LCE_NEO4J_QUERY_TIMEOUT_MS:-15000}
+      LCE_NEO4J_GRAPH_READ_MODE: ${LCE_NEO4J_GRAPH_READ_MODE:-postgres}
+      LCE_NEO4J_GRAPH_GRAY_TENANTS: ${LCE_NEO4J_GRAPH_GRAY_TENANTS:-}
+      LCE_NEO4J_GRAPH_GRAY_PERCENT: ${LCE_NEO4J_GRAPH_GRAY_PERCENT:-0}
+      LCE_NEO4J_GRAPH_SHADOW_ENABLED: ${LCE_NEO4J_GRAPH_SHADOW_ENABLED:-false}
+      LCE_NEO4J_GRAPH_SHADOW_SAMPLE_RATE: ${LCE_NEO4J_GRAPH_SHADOW_SAMPLE_RATE:-0}
+      LCE_NEO4J_GRAPH_SHADOW_MAX_CONCURRENCY: ${LCE_NEO4J_GRAPH_SHADOW_MAX_CONCURRENCY:-2}
       EMBEDDINGS_PROVIDER: ${EMBEDDINGS_PROVIDER:-}
       EMBEDDINGS_MODEL: ${EMBEDDINGS_MODEL:-}
       EMBEDDINGS_BASE_URL: ${EMBEDDINGS_BASE_URL:-}
@@ -47,6 +97,92 @@ services:
       timeout: 10s
       retries: 3
       start_period: 15s
+
+  neo4j-projector:
+    build: ../../lce
+    restart: unless-stopped
+    command: ["node", "dist/cloud/neo4jProjectorEntry.js"]
+    depends_on:
+      neo4j:
+        condition: service_healthy
+    volumes:
+      - lce_data:/data
+      - neo4j_projector_spool:/tmp/lce-neo4j-projector
+    environment:
+      LCE_HOME: /data
+      LCE_CLOUD_DATABASE_URL: ${LCE_CLOUD_DATABASE_URL:?set a PostgreSQL URL whose server has pgvector installed}
+      LCE_NEO4J_URI: bolt://neo4j:7687
+      LCE_NEO4J_USERNAME: neo4j
+      LCE_NEO4J_PASSWORD: ${NEO4J_PASSWORD:?set NEO4J_PASSWORD in .env}
+      LCE_NEO4J_DATABASE: ${NEO4J_DATABASE:-neo4j}
+      # The projector is not an algorithm worker; keep the fallback disabled
+      # even if a shared production env file contains worker-related values.
+      LCE_NEO4J_ALGORITHM_WORKER_ENABLED: "false"
+      LCE_NEO4J_PROJECTOR_ENABLED: "true"
+      LCE_NEO4J_PROJECTOR_SPOOL_DIR: /tmp/lce-neo4j-projector
+      LCE_NEO4J_PROJECTOR_BATCH_SIZE: ${LCE_NEO4J_PROJECTOR_BATCH_SIZE:-1000}
+      LCE_NEO4J_PROJECTOR_DELETE_BATCH_SIZE: ${LCE_NEO4J_PROJECTOR_DELETE_BATCH_SIZE:-5000}
+      LCE_NEO4J_PROJECTOR_POLL_INTERVAL_MS: ${LCE_NEO4J_PROJECTOR_POLL_INTERVAL_MS:-1000}
+      LCE_NEO4J_PROJECTOR_LEASE_MS: ${LCE_NEO4J_PROJECTOR_LEASE_MS:-300000}
+      LCE_NEO4J_PROJECTOR_LEASE_RENEW_INTERVAL_MS: ${LCE_NEO4J_PROJECTOR_LEASE_RENEW_INTERVAL_MS:-60000}
+      LCE_NEO4J_PROJECTOR_MAX_ATTEMPTS: ${LCE_NEO4J_PROJECTOR_MAX_ATTEMPTS:-10}
+      LCE_NEO4J_PROJECTOR_RETRY_BASE_MS: ${LCE_NEO4J_PROJECTOR_RETRY_BASE_MS:-5000}
+      LCE_NEO4J_CONNECTION_TIMEOUT_MS: ${LCE_NEO4J_CONNECTION_TIMEOUT_MS:-10000}
+      LCE_NEO4J_MAX_CONNECTION_POOL_SIZE: ${LCE_NEO4J_MAX_CONNECTION_POOL_SIZE:-16}
+      LCE_NEO4J_MAX_TRANSACTION_RETRY_MS: ${LCE_NEO4J_MAX_TRANSACTION_RETRY_MS:-30000}
+      LCE_NEO4J_QUERY_TIMEOUT_MS: ${LCE_NEO4J_QUERY_TIMEOUT_MS:-15000}
+      LCE_NEO4J_PROJECTOR_SPOOL_RETENTION_MS: ${LCE_NEO4J_PROJECTOR_SPOOL_RETENTION_MS:-86400000}
+      LCE_NEO4J_PROJECTOR_OUTBOX_RETENTION_MS: ${LCE_NEO4J_PROJECTOR_OUTBOX_RETENTION_MS:-604800000}
+      LCE_NEO4J_PROJECTOR_OUTBOX_PURGE_INTERVAL_MS: ${LCE_NEO4J_PROJECTOR_OUTBOX_PURGE_INTERVAL_MS:-60000}
+      LCE_NEO4J_PROJECTOR_OUTBOX_PURGE_BATCH_SIZE: ${LCE_NEO4J_PROJECTOR_OUTBOX_PURGE_BATCH_SIZE:-1000}
+
+  neo4j-algorithm-worker:
+    # Algorithms are an explicit production capability, not part of the normal
+    # application rollout. Start with --profile graph-algorithms only after the
+    # target Neo4j deployment exposes gds.version().
+    profiles: ["graph-algorithms"]
+    build: ../../lce
+    restart: unless-stopped
+    command: ["node", "dist/cloud/neo4jAlgorithmEntry.js"]
+    depends_on:
+      neo4j:
+        condition: service_healthy
+    volumes:
+      - lce_data:/data
+    environment:
+      LCE_HOME: /data
+      LCE_CLOUD_DATABASE_URL: ${LCE_CLOUD_DATABASE_URL:?set a PostgreSQL URL whose server has pgvector installed}
+      LCE_NEO4J_URI: bolt://neo4j:7687
+      LCE_NEO4J_USERNAME: neo4j
+      LCE_NEO4J_PASSWORD: ${NEO4J_PASSWORD:?set NEO4J_PASSWORD in .env}
+      LCE_NEO4J_DATABASE: ${NEO4J_DATABASE:-neo4j}
+      # The Compose profile is the explicit enable switch for this service.
+      # Keep the application-level default off so HTTP/projector processes do
+      # not become GDS workers merely because Neo4j credentials are present.
+      LCE_NEO4J_ALGORITHM_WORKER_ENABLED: "true"
+      LCE_NEO4J_ALGORITHM_MAX_ACTIVE_JOBS_PER_TENANT: ${LCE_NEO4J_ALGORITHM_MAX_ACTIVE_JOBS_PER_TENANT:-4}
+      LCE_NEO4J_ALGORITHM_POLL_INTERVAL_MS: ${LCE_NEO4J_ALGORITHM_POLL_INTERVAL_MS:-1000}
+      LCE_NEO4J_ALGORITHM_LEASE_MS: ${LCE_NEO4J_ALGORITHM_LEASE_MS:-1800000}
+      LCE_NEO4J_ALGORITHM_LEASE_RENEW_INTERVAL_MS: ${LCE_NEO4J_ALGORITHM_LEASE_RENEW_INTERVAL_MS:-60000}
+      LCE_NEO4J_ALGORITHM_HEARTBEAT_INTERVAL_MS: ${LCE_NEO4J_ALGORITHM_HEARTBEAT_INTERVAL_MS:-30000}
+      LCE_NEO4J_ALGORITHM_MAX_ATTEMPTS: ${LCE_NEO4J_ALGORITHM_MAX_ATTEMPTS:-3}
+      LCE_NEO4J_ALGORITHM_RETRY_BASE_MS: ${LCE_NEO4J_ALGORITHM_RETRY_BASE_MS:-30000}
+      LCE_NEO4J_ALGORITHM_CONNECTION_TIMEOUT_MS: ${LCE_NEO4J_ALGORITHM_CONNECTION_TIMEOUT_MS:-10000}
+      LCE_NEO4J_ALGORITHM_MAX_CONNECTION_POOL_SIZE: ${LCE_NEO4J_ALGORITHM_MAX_CONNECTION_POOL_SIZE:-4}
+      LCE_NEO4J_ALGORITHM_MAX_TRANSACTION_RETRY_MS: ${LCE_NEO4J_ALGORITHM_MAX_TRANSACTION_RETRY_MS:-30000}
+      LCE_NEO4J_ALGORITHM_QUERY_TIMEOUT_MS: ${LCE_NEO4J_ALGORITHM_QUERY_TIMEOUT_MS:-1200000}
+      LCE_NEO4J_ALGORITHM_MAX_NODES: ${LCE_NEO4J_ALGORITHM_MAX_NODES:-1000000}
+      LCE_NEO4J_ALGORITHM_MAX_RELATIONSHIPS: ${LCE_NEO4J_ALGORITHM_MAX_RELATIONSHIPS:-5000000}
+      LCE_NEO4J_ALGORITHM_PROJECTION_CONCURRENCY: ${LCE_NEO4J_ALGORITHM_PROJECTION_CONCURRENCY:-2}
+      LCE_NEO4J_ALGORITHM_CONCURRENCY: ${LCE_NEO4J_ALGORITHM_CONCURRENCY:-2}
+      LCE_NEO4J_ALGORITHM_MAX_COMPONENTS: ${LCE_NEO4J_ALGORITHM_MAX_COMPONENTS:-100}
+      LCE_NEO4J_ALGORITHM_MAX_COMPONENT_MEMBERS: ${LCE_NEO4J_ALGORITHM_MAX_COMPONENT_MEMBERS:-100}
+      LCE_NEO4J_ALGORITHM_MAX_CENTRALITY_RESULTS: ${LCE_NEO4J_ALGORITHM_MAX_CENTRALITY_RESULTS:-1000}
+      LCE_NEO4J_ALGORITHM_RESULT_PURGE_INTERVAL_MS: ${LCE_NEO4J_ALGORITHM_RESULT_PURGE_INTERVAL_MS:-60000}
+      LCE_NEO4J_ALGORITHM_RESULT_PURGE_BATCH_SIZE: ${LCE_NEO4J_ALGORITHM_RESULT_PURGE_BATCH_SIZE:-100}
+      LCE_NEO4J_ALGORITHM_JOB_RETENTION_MS: ${LCE_NEO4J_ALGORITHM_JOB_RETENTION_MS:-604800000}
+      LCE_NEO4J_ALGORITHM_JOB_PURGE_INTERVAL_MS: ${LCE_NEO4J_ALGORITHM_JOB_PURGE_INTERVAL_MS:-3600000}
+      LCE_NEO4J_ALGORITHM_JOB_PURGE_BATCH_SIZE: ${LCE_NEO4J_ALGORITHM_JOB_PURGE_BATCH_SIZE:-100}
 
   relay:
     build: ../
@@ -154,3 +290,6 @@ services:
 
 volumes:
   lce_data:
+  neo4j_data:
+  neo4j_logs:
+  neo4j_projector_spool:
