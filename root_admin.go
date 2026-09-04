@@ -665,11 +665,8 @@ func handleDeleteRoot(c *gin.Context) {
 		} else if result != nil {
 			detail = string(result.Content)
 		}
-		logIDStr, _ := c.Get(ContextKeyLogID)
-		logIDVal, _ := logIDStr.(string)
-		saveErrorDetailsAsync(logIDVal, "lce", detail, getInsertDone(c))
 		c.JSON(http.StatusBadGateway, gin.H{"error": "清除云端索引失败: " + detail})
-		completeRequestLogAsync(getRequestLogEntry(c, http.StatusBadGateway))
+		completeRequestLogWithErrorAsync(getRequestLogEntry(c, http.StatusBadGateway), "lce", detail)
 		return
 	}
 
@@ -678,7 +675,7 @@ func handleDeleteRoot(c *gin.Context) {
 		// 云端已清、relay 行未删：该 root 仍显示在列表里，用户重试即可自愈
 		//（下一次 LCE clear 幂等，再删 relay 行）。
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "清除 Relay 索引状态失败: " + err.Error()})
-		completeRequestLogAsync(getRequestLogEntry(c, http.StatusInternalServerError))
+		completeRequestLogWithErrorAsync(getRequestLogEntry(c, http.StatusInternalServerError), "relay", err.Error())
 		return
 	}
 

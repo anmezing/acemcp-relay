@@ -271,3 +271,50 @@ func TestPrepareIndexBatchRejectsStaleFileWithoutErrNoRows(t *testing.T) {
 		}
 	})
 }
+
+// 只删不改的同步没有内容批次；客户端用 files=[] 的 upload 把 relay 差分出的
+// 删除列表送去 LCE。这是 complete 前"pending deletions"能清零的唯一途径。
+func TestPrepareIndexBatchAcceptsDeletionOnlyEmptyBatch(t *testing.T) {
+	withMockTx(t, func(mock sqlmock.Sqlmock) {
+		mock.ExpectQuery("FROM index_jobs").
+			WithArgs("job-1", "user-1").
+			WillReturnRows(jobRow(indexJobStatusRunning, 1))
+		mock.ExpectQuery("SELECT deletions_sent FROM index_jobs").
+			WithArgs("job-1").
+			WillReturnRows(sqlmock.NewRows([]string{"deletions_sent"}).AddRow(false))
+		mock.ExpectQuery("SELECT old.path").
+			WithArgs("user-1", "ws-1", "job-1").
+			WillReturnRows(sqlmock.NewRows([]string{"path"}).AddRow("gone.go"))
+	}, func(tx *sql.Tx) {
+		_, staged, deleted, err := prepareIndexBatch(context.Background(), tx, "user-1", indexUploadRequest{
+			JobID: "job-1",
+		})
+		if err != nil {
+			t.Fatalf("deletion-only batch must be accepted: %v", err)
+		}
+		if len(staged) != 0 {
+			t.Fatalf("empty batch must stage nothing, got %+v", staged)
+		}
+		if len(deleted) != 1 || deleted[0] != "gone.go" {
+			t.Fatalf("expected the diffed deletion list, got %v", deleted)
+		}
+	})
+}
+
+func TestPrepareIndexBatchRejectsEmptyBatchWithoutDeletions(t *testing.T) {
+	withMockTx(t, func(mock sqlmock.Sqlmock) {
+		mock.ExpectQuery("FROM index_jobs").
+			WithArgs("job-1", "user-1").
+			WillReturnRows(jobRow(indexJobStatusRunning, 0))
+	}, func(tx *sql.Tx) {
+		_, _, _, err := prepareIndexBatch(context.Background(), tx, "user-1", indexUploadRequest{
+			JobID: "job-1",
+		})
+		if err == nil || !strings.Contains(err.Error(), "empty index batch") {
+			t.Fatalf("expected empty batch rejection, got %v", err)
+		}
+		if errors.Is(err, sql.ErrNoRows) {
+			t.Fatal("empty batch must not be reported as a missing job")
+		}
+	})
+}

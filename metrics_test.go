@@ -31,11 +31,6 @@ func TestMetricsMiddlewareCountsAndLabels(t *testing.T) {
 		w := httptest.NewRecorder()
 		r.ServeHTTP(w, httptest.NewRequest("POST", path, nil))
 	}
-	do("/mm-test/abc")
-	do("/mm-test/def")
-	do("/mm-mcp")
-	do("/mm-nowhere")
-
 	cases := []struct {
 		path, method, status string
 		want                 float64
@@ -45,16 +40,27 @@ func TestMetricsMiddlewareCountsAndLabels(t *testing.T) {
 		{"/mm-mcp/tools/call/codebase-retrieval", "POST", "200", 1},
 		{"unmatched", "POST", "404", 1},
 	}
+	before := make(map[string]float64, len(cases)+1)
 	for _, tc := range cases {
-		got := testutil.ToFloat64(metricHTTPRequests.WithLabelValues(tc.path, tc.method, tc.status))
+		before[tc.path] = testutil.ToFloat64(metricHTTPRequests.WithLabelValues(tc.path, tc.method, tc.status))
+	}
+	rawURLBefore := testutil.ToFloat64(metricHTTPRequests.WithLabelValues("/mm-test/abc", "POST", "418"))
+
+	do("/mm-test/abc")
+	do("/mm-test/def")
+	do("/mm-mcp")
+	do("/mm-nowhere")
+
+	for _, tc := range cases {
+		got := testutil.ToFloat64(metricHTTPRequests.WithLabelValues(tc.path, tc.method, tc.status)) - before[tc.path]
 		if got != tc.want {
-			t.Errorf("relay_http_requests_total{path=%q,method=%q,status=%q} = %v, want %v",
+			t.Errorf("relay_http_requests_total delta {path=%q,method=%q,status=%q} = %v, want %v",
 				tc.path, tc.method, tc.status, got, tc.want)
 		}
 	}
-	// 原始 URL 不应成为标签。
-	if got := testutil.ToFloat64(metricHTTPRequests.WithLabelValues("/mm-test/abc", "POST", "418")); got != 0 {
-		t.Errorf("raw URL leaked into path label: %v", got)
+	// 原始 URL 不应成为标签；用 delta 断言，避免 -count=N 时被历史样本污染。
+	if got := testutil.ToFloat64(metricHTTPRequests.WithLabelValues("/mm-test/abc", "POST", "418")) - rawURLBefore; got != 0 {
+		t.Errorf("raw URL leaked into path label: delta=%v", got)
 	}
 
 	// duration histogram 与 counter 同口径。
@@ -74,6 +80,9 @@ func TestMetricsIndexBytesCounter(t *testing.T) {
 
 func TestMetricsEndpointServesRegistry(t *testing.T) {
 	metricHTTPRequests.WithLabelValues("/mm-endpoint", "GET", "200").Inc()
+	// 不依赖 TestMetricsMiddlewareCountsAndLabels 的执行顺序；单测本身负责
+	// 先创建 histogram 的一个样本，否则 Prometheus 不会输出该 family。
+	metricHTTPDuration.WithLabelValues("/mm-endpoint").Observe(0.001)
 	w := httptest.NewRecorder()
 	metricsHandler().ServeHTTP(w, httptest.NewRequest("GET", "/metrics", nil))
 	if w.Code != http.StatusOK {

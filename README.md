@@ -22,7 +22,7 @@ LCE 的多租户远程 MCP 服务。IDE Agent 只需配置一个 Streamable HTTP
 |------|------|
 | `POST /mcp` | MCP Streamable HTTP 入口，承载初始化、工具发现和全部工具调用 |
 | `DELETE /mcp` | 关闭当前 MCP session |
-| `GET /mcp` | 返回 405；服务不提供 SSE 推流 |
+| `GET /mcp` | 认证后按 `Mcp-Session-Id` 建立 SSE 推流；无效 Session 返回 404 |
 | `GET /mcp/tenant-stats` | 网页控制台内部索引统计接口；要求控制台内部凭据 |
 | `GET /mcp/roots` | 网页控制台内部 root/分支索引状态接口；返回已发布快照、最近任务进度及结构化失败诊断 |
 | `POST /mcp/dismiss-root-failure` | 清理指定 root 的 `failed` / `timed_out` 任务记录；保留已发布云端快照，仅组织 owner 可操作组织索引 |

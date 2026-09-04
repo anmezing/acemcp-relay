@@ -19,7 +19,7 @@ import (
 //   - 响应信封（codebaseIndexEnvelope）的 schemaVersion 与字段名
 //   - manifest 条目字段（mcpIndexManifestFile 的 json tag）
 //   - 客户端请求头（clientVersionHeader / Authorization）
-//   - 公开工具面是契约 cloudToolSurface 的子集
+//   - Relay 服务端公开工具面与契约 cloudToolSurface（排除本地/Relay 自有工具）精确一致
 //
 // 快照缺失、格式错误或实现漂移都必须让独立 CI 失败；同步快照时还会在
 // 三仓联动验证中比较文件摘要，避免依赖 sibling checkout 和静默 skip。
@@ -104,6 +104,24 @@ type cloudProtocolContract struct {
 		} `json:"input"`
 		VerifiedReferenceFields []string `json:"verifiedReferenceFields"`
 	} `json:"promptEnhancement"`
+	DeepGraph struct {
+		ToolName string `json:"toolName"`
+		Input    struct {
+			RequiredFields      []string `json:"requiredFields"`
+			RelayRequiredFields []string `json:"relayRequiredFields"`
+			OptionalFields      []string `json:"optionalFields"`
+			RelayInjectedFields []string `json:"relayInjectedFields"`
+		} `json:"input"`
+	} `json:"deepGraph"`
+	GraphAlgorithms struct {
+		ToolName string `json:"toolName"`
+		Input    struct {
+			RequiredFields            []string            `json:"requiredFields"`
+			ConditionalRequiredFields map[string][]string `json:"conditionalRequiredFields"`
+			OptionalFields            []string            `json:"optionalFields"`
+			RelayInjectedFields       []string            `json:"relayInjectedFields"`
+		} `json:"input"`
+	} `json:"graphAlgorithms"`
 }
 
 func loadCloudProtocolContract(t *testing.T) cloudProtocolContract {
@@ -463,17 +481,64 @@ func TestContractPinClientCompatibilityPolicy(t *testing.T) {
 	}
 }
 
-func TestContractPinPublicToolSurfaceIsContractSubset(t *testing.T) {
+func TestContractPinRelayServerToolSurfaceMatchesContract(t *testing.T) {
 	contract := loadCloudProtocolContract(t)
-	surface := make(map[string]bool)
-	for _, tool := range contract.CloudToolSurface {
-		surface[tool] = true
+	// Relay owns codebase_index_status and the npm client owns the two local
+	// worktree tools. Every other contract tool must be present in the Relay
+	// allowlist, and Relay must not expose anything outside that set.
+	notUpstreamChatTool := map[string]bool{
+		codebaseIndexStatusToolName: true,
+		"codebase_git_context":      true,
+		"codebase_review_changes":   true,
 	}
-	for tool := range chatMCPToolPolicies {
-		if !surface[tool] {
-			t.Errorf("relay exposes tool %q not present in contract cloudToolSurface %v",
-				tool, contract.CloudToolSurface)
+	want := make([]string, 0, len(contract.CloudToolSurface))
+	for _, tool := range contract.CloudToolSurface {
+		if !notUpstreamChatTool[tool] {
+			want = append(want, tool)
 		}
+	}
+	got := make([]string, 0, len(chatMCPToolPolicies))
+	for tool := range chatMCPToolPolicies {
+		got = append(got, tool)
+	}
+	if diff := diffStringSets("relay server tool surface", got, want); diff != "" {
+		t.Error(diff)
+	}
+}
+
+func TestContractPinDeepGraphAndAlgorithmPolicies(t *testing.T) {
+	contract := loadCloudProtocolContract(t)
+	for _, check := range []struct {
+		label          string
+		toolName       string
+		contractFields []string
+		relayRequired  []string
+		optional       []string
+		injected       []string
+	}{
+		{"deep graph", contract.DeepGraph.ToolName, contract.DeepGraph.Input.RequiredFields, contract.DeepGraph.Input.RelayRequiredFields, contract.DeepGraph.Input.OptionalFields, contract.DeepGraph.Input.RelayInjectedFields},
+		{"graph algorithm", contract.GraphAlgorithms.ToolName, contract.GraphAlgorithms.Input.RequiredFields, contract.GraphAlgorithms.Input.RequiredFields, contract.GraphAlgorithms.Input.OptionalFields, contract.GraphAlgorithms.Input.RelayInjectedFields},
+	} {
+		policy, ok := chatMCPToolPolicies[check.toolName]
+		if !ok {
+			t.Fatalf("relay %s policy %q is missing", check.label, check.toolName)
+		}
+		wantArguments := append(append([]string(nil), check.contractFields...), check.optional...)
+		if diff := diffStringSets(check.label+" arguments", sortedStringSetKeys(policy.arguments), wantArguments); diff != "" {
+			t.Error(diff)
+		}
+		if diff := diffStringSets(check.label+" required arguments", sortedStringSetKeys(policy.required), check.relayRequired); diff != "" {
+			t.Error(diff)
+		}
+		if !reflect.DeepEqual(check.injected, []string{"tenant_id"}) {
+			t.Errorf("unexpected %s relay-injected fields: %v", check.label, check.injected)
+		}
+	}
+	if !reflect.DeepEqual(contract.GraphAlgorithms.Input.ConditionalRequiredFields, map[string][]string{
+		"submit": {"root_id", "algorithm"},
+		"status": {"job_id"},
+	}) {
+		t.Errorf("graph algorithm conditional requirements drifted: %v", contract.GraphAlgorithms.Input.ConditionalRequiredFields)
 	}
 }
 

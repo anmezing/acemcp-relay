@@ -763,18 +763,8 @@ func initDB() error {
 		return fmt.Errorf("failed to migrate leaderboard table: %w", err)
 	}
 
-	_, err = db.Exec(`
-		CREATE TABLE IF NOT EXISTS error_details (
-			id SERIAL PRIMARY KEY,
-			request_id UUID NOT NULL REFERENCES request_logs(id),
-			source VARCHAR(20) NOT NULL DEFAULT 'proxy',
-			error TEXT NOT NULL,
-			created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
-		);
-		CREATE INDEX IF NOT EXISTS idx_error_details_request_id ON error_details(request_id);
-	`)
-	if err != nil {
-		return fmt.Errorf("failed to migrate error_details table: %w", err)
+	if err = migrateErrorDetailsTable(); err != nil {
+		return err
 	}
 
 	_, err = db.Exec(`
@@ -837,6 +827,56 @@ func initDB() error {
 	}
 
 	return migrateIndexingTables()
+}
+
+func migrateErrorDetailsTable() error {
+	_, err := db.Exec(`
+		CREATE TABLE IF NOT EXISTS error_details (
+			id SERIAL PRIMARY KEY,
+			request_id UUID NOT NULL REFERENCES request_logs(id) ON DELETE CASCADE,
+			source VARCHAR(20) NOT NULL DEFAULT 'proxy',
+			error TEXT NOT NULL,
+			created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+		);
+
+		-- Older deployments created the request_id foreign key without cascading
+		-- deletes. Upgrade that constraint in place so deleting a request log and
+		-- its error details is one atomic database operation.
+		DO $$
+		DECLARE
+			request_fk_name text;
+			request_fk_delete_action "char";
+		BEGIN
+			SELECT constraint_row.conname, constraint_row.confdeltype
+			INTO request_fk_name, request_fk_delete_action
+			FROM pg_constraint AS constraint_row
+			JOIN pg_attribute AS attribute_row
+				ON attribute_row.attrelid = constraint_row.conrelid
+				AND attribute_row.attnum = ANY (constraint_row.conkey)
+			WHERE constraint_row.conrelid = 'error_details'::regclass
+				AND constraint_row.contype = 'f'
+				AND constraint_row.confrelid = 'request_logs'::regclass
+				AND attribute_row.attname = 'request_id'
+			LIMIT 1;
+
+			IF request_fk_name IS NULL THEN
+				ALTER TABLE error_details
+					ADD CONSTRAINT error_details_request_id_fkey
+					FOREIGN KEY (request_id) REFERENCES request_logs(id) ON DELETE CASCADE;
+			ELSIF request_fk_delete_action <> 'c' THEN
+				EXECUTE format('ALTER TABLE error_details DROP CONSTRAINT %I', request_fk_name);
+				ALTER TABLE error_details
+					ADD CONSTRAINT error_details_request_id_fkey
+					FOREIGN KEY (request_id) REFERENCES request_logs(id) ON DELETE CASCADE;
+			END IF;
+		END $$;
+
+		CREATE INDEX IF NOT EXISTS idx_error_details_request_id ON error_details(request_id);
+	`)
+	if err != nil {
+		return fmt.Errorf("failed to migrate error_details table: %w", err)
+	}
+	return nil
 }
 
 func initRedis() error {
@@ -987,9 +1027,8 @@ func normalizeOrgRole(role, orgID string) string {
 }
 
 // lookupAPIKey 同时按 MD5 与 SHA-256 哈希匹配 api_keys.id（双读过渡）。
-// 个人密钥只依赖 Relay 自有表，避免 Better Auth 组织表尚未迁移时全站鉴权
-// 中断。组织密钥再以 Better Auth 表为权威来源；api_keys.org_role 只是展示
-// 冗余，不能让已移除成员或已降权 owner 继续获得组织权限。
+// 这里只缓存密钥本身携带的稳定身份；组织成员关系、owner 归属和订阅席位是
+// 动态授权状态，必须在每次请求时重新校验，不能被 30 秒密钥缓存掩盖。
 func lookupAPIKey(token string) (authIdentity, bool, error) {
 	md5Hash := md5.Sum([]byte(token))
 	sha256Hash := sha256.Sum256([]byte(token))
@@ -1009,25 +1048,114 @@ func lookupAPIKey(token string) (authIdentity, bool, error) {
 	if err != nil {
 		return authIdentity{}, false, err
 	}
+	id.UserID = strings.TrimSpace(id.UserID)
+	if id.UserID == "" {
+		return authIdentity{}, false, nil
+	}
 	id.Tier = normalizeTier(id.Tier)
 	id.OrgID = strings.TrimSpace(id.OrgID)
-	if id.OrgID != "" {
-		var currentRole string
-		err = db.QueryRow(`
-			SELECT COALESCE(members."role", '')
+	return id, true, nil
+}
+
+// authorizeOrganizationIdentity 以 Better Auth 成员表和当前有效订阅为权威，
+// 动态授权组织密钥。canonical owner（组织中最早的 owner）不占席位；其余成员
+// 共享该 owner 名下全部组织的唯一用户席位。数据库触发器负责阻止新增/结算造成
+// 超配，这里仍核对 used <= limit，使历史脏数据或人工改库不会放大权限。
+//
+// 此查询故意不使用 authCache：成员被移除、owner 转移或套餐恰好过期后，下一次
+// 请求必须立即失效，而不是继续使用最长 30 秒的旧权限。
+func authorizeOrganizationIdentity(id authIdentity) (authIdentity, bool, error) {
+	if id.OrgID == "" {
+		id.OrgRole = ""
+		return id, true, nil
+	}
+
+	var currentRole string
+	var ownerUserID string
+	var seatLimit int
+	var usedSeats int
+	err := db.QueryRow(`
+		WITH target_membership AS (
+			SELECT COALESCE(members."role", '') AS role
 			FROM "member" AS members
 			JOIN "organization" AS organizations
 			  ON organizations."id" = members."organizationId"
 			WHERE members."organizationId" = $1
 			  AND members."userId" = $2
-		`, id.OrgID, id.UserID).Scan(&currentRole)
-		if err == sql.ErrNoRows {
-			return authIdentity{}, false, nil
-		}
-		if err != nil {
-			return authIdentity{}, false, err
-		}
-		id.OrgRole = normalizeOrgRole(currentRole, id.OrgID)
+			ORDER BY members."createdAt", members.id
+			LIMIT 1
+		),
+		target_owner AS (
+			SELECT members."userId" AS owner_user_id
+			FROM "member" AS members
+			WHERE members."organizationId" = $1
+			  AND 'owner' = ANY(
+				  regexp_split_to_array(COALESCE(members.role, ''), '\s*,\s*')
+			  )
+			ORDER BY members."createdAt", members.id
+			LIMIT 1
+		),
+		owned_organizations AS (
+			SELECT owner_membership."organizationId" AS organization_id
+			FROM target_owner
+			JOIN "member" AS owner_membership
+			  ON owner_membership."userId" = target_owner.owner_user_id
+			WHERE 'owner' = ANY(
+				  regexp_split_to_array(COALESCE(owner_membership.role, ''), '\s*,\s*')
+			  )
+			  AND NOT EXISTS (
+				  SELECT 1
+				  FROM "member" AS earlier_owner
+				  WHERE earlier_owner."organizationId" = owner_membership."organizationId"
+				    AND 'owner' = ANY(
+					    regexp_split_to_array(COALESCE(earlier_owner.role, ''), '\s*,\s*')
+				    )
+				    AND (
+					    earlier_owner."createdAt" < owner_membership."createdAt"
+					    OR (
+						    earlier_owner."createdAt" = owner_membership."createdAt"
+						    AND earlier_owner.id < owner_membership.id
+					    )
+				    )
+			  )
+		),
+		active_entitlement AS (
+			SELECT subscriptions.subaccount_limit
+			FROM user_subscriptions AS subscriptions
+			JOIN target_owner
+			  ON target_owner.owner_user_id = subscriptions.user_id
+			WHERE subscriptions.starts_at <= NOW()
+			  AND subscriptions.expires_at > NOW()
+			LIMIT 1
+		),
+		seat_usage AS (
+			SELECT COUNT(DISTINCT members."userId")::integer AS used
+			FROM target_owner
+			JOIN owned_organizations AS ownership ON TRUE
+			JOIN "member" AS members
+			  ON members."organizationId" = ownership.organization_id
+			 AND members."userId" <> target_owner.owner_user_id
+		)
+		SELECT COALESCE((SELECT role FROM target_membership), ''),
+		       COALESCE((SELECT owner_user_id FROM target_owner), ''),
+		       COALESCE((SELECT subaccount_limit FROM active_entitlement), 0)::integer,
+		       COALESCE((SELECT used FROM seat_usage), 0)::integer
+	`, id.OrgID, id.UserID).Scan(&currentRole, &ownerUserID, &seatLimit, &usedSeats)
+	if err != nil {
+		return authIdentity{}, false, err
+	}
+	currentRole = strings.TrimSpace(currentRole)
+	ownerUserID = strings.TrimSpace(ownerUserID)
+	if currentRole == "" || ownerUserID == "" {
+		return authIdentity{}, false, nil
+	}
+
+	id.OrgRole = normalizeOrgRole(currentRole, id.OrgID)
+	if id.UserID == ownerUserID {
+		return id, true, nil
+	}
+	if seatLimit <= 0 || usedSeats > seatLimit {
+		return authIdentity{}, false, nil
 	}
 	return id, true, nil
 }
@@ -1046,7 +1174,14 @@ func authenticateRequest(c *gin.Context) (authIdentity, bool) {
 
 	now := time.Now()
 	if entry, hit := authCacheGet(cacheKey, now); hit {
-		return entry.identity, entry.ok
+		if !entry.ok {
+			return authIdentity{}, false
+		}
+		identity, ok, err := authorizeOrganizationIdentity(entry.identity)
+		if err != nil {
+			return authIdentity{}, false
+		}
+		return identity, ok
 	}
 
 	identity, ok, err := lookupAPIKey(token)
@@ -1058,7 +1193,16 @@ func authenticateRequest(c *gin.Context) (authIdentity, bool) {
 	if !ok {
 		ttl = authCacheNegativeTTL
 	}
+	// 组织条目只缓存密钥静态身份；动态成员/席位授权在返回前以及后续每次
+	// cache hit 都会重新查询。个人密钥仍保持原有零额外查询的缓存路径。
 	authCachePut(cacheKey, authCacheEntry{identity: identity, ok: ok, expiresAt: now.Add(ttl)})
+	if !ok {
+		return authIdentity{}, false
+	}
+	identity, ok, err = authorizeOrganizationIdentity(identity)
+	if err != nil {
+		return authIdentity{}, false
+	}
 	return identity, ok
 }
 
@@ -1209,32 +1353,91 @@ type RequestLogEntry struct {
 	InsertDone       <-chan struct{}
 }
 
-func completeRequestLogAsync(entry RequestLogEntry) {
-	go func() {
-		if entry.LogID == "" {
-			return
-		}
-		if entry.InsertDone != nil {
-			<-entry.InsertDone
-		}
-		durationMs := entry.ResponseDuration.Milliseconds()
+type requestLogErrorDetail struct {
+	Source  string
+	Message string
+}
 
-		result, err := db.Exec(`
-			UPDATE request_logs
-			SET status = $1,
-				status_code = $2,
-				response_duration_ms = $3,
-				request_path = CASE WHEN $4 = '' THEN request_path ELSE $4 END,
-				updated_at = NOW()
-			WHERE id = $5
-		`, StatusCompleted, entry.StatusCode, durationMs, entry.RequestPath, entry.LogID)
+func persistRequestLogCompletion(entry RequestLogEntry, detail *requestLogErrorDetail) (bool, error) {
+	if entry.LogID == "" {
+		return true, nil
+	}
+	if entry.InsertDone != nil {
+		<-entry.InsertDone
+	}
+	durationMs := entry.ResponseDuration.Milliseconds()
+	updateQuery := `
+		UPDATE request_logs
+		SET status = $1,
+			status_code = $2,
+			response_duration_ms = $3,
+			request_path = CASE WHEN $4 = '' THEN request_path ELSE $4 END,
+			updated_at = NOW()
+		WHERE id = $5
+	`
 
+	if detail == nil || detail.Message == "" {
+		result, err := db.Exec(updateQuery, StatusCompleted, entry.StatusCode, durationMs, entry.RequestPath, entry.LogID)
 		if err != nil {
-			log.Printf("[ERROR] Failed to update request log: %v", err)
-		} else if rows, _ := result.RowsAffected(); rows == 0 {
+			return false, err
+		}
+		rows, err := result.RowsAffected()
+		return rows > 0, err
+	}
+
+	// Error details and completion are one state transition. Keeping the parent
+	// pending until the detail exists prevents clear-index from deleting the
+	// parent between two independent background writes.
+	tx, err := db.Begin()
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if _, err := tx.Exec(`
+		INSERT INTO error_details (request_id, source, error)
+		VALUES ($1, $2, $3)
+	`, entry.LogID, detail.Source, detail.Message); err != nil {
+		return false, err
+	}
+	result, err := tx.Exec(updateQuery, StatusCompleted, entry.StatusCode, durationMs, entry.RequestPath, entry.LogID)
+	if err != nil {
+		return false, err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if rows == 0 {
+		return false, nil
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func completeRequestLogRecordAsync(entry RequestLogEntry, detail *requestLogErrorDetail) {
+	go func() {
+		updated, err := persistRequestLogCompletion(entry, detail)
+		if err != nil {
+			log.Printf("[ERROR] Failed to complete request log: %v", err)
+		} else if !updated {
 			log.Printf("[WARN] Update request log affected 0 rows (id=%s)", entry.LogID)
 		}
 	}()
+}
+
+func completeRequestLogAsync(entry RequestLogEntry) {
+	completeRequestLogRecordAsync(entry, nil)
+}
+
+func completeRequestLogWithErrorAsync(entry RequestLogEntry, source string, errorMsg string) {
+	if errorMsg == "" {
+		completeRequestLogAsync(entry)
+		return
+	}
+	completeRequestLogRecordAsync(entry, &requestLogErrorDetail{Source: source, Message: errorMsg})
 }
 
 const staleRequestLogAfter = 15 * time.Minute
@@ -1270,24 +1473,6 @@ func startRequestLogReconciler(ctx context.Context) {
 			reconcileStaleRequestLogs()
 		}
 	}
-}
-
-func saveErrorDetailsAsync(logID string, source string, errorMsg string, insertDone <-chan struct{}) {
-	if logID == "" || errorMsg == "" {
-		return
-	}
-	go func() {
-		if insertDone != nil {
-			<-insertDone
-		}
-		_, err := db.Exec(`
-			INSERT INTO error_details (request_id, source, error)
-			VALUES ($1, $2, $3)
-		`, logID, source, errorMsg)
-		if err != nil {
-			log.Printf("[ERROR] Failed to save error details: %v", err)
-		}
-	}()
 }
 
 func getInsertDone(c *gin.Context) <-chan struct{} {
@@ -1329,6 +1514,7 @@ const (
 	mcpServerVersion        = "2.0.0"
 	mcpSessionTTL           = 30 * time.Minute
 	mcpSessionSweepInterval = 60 * time.Second
+	mcpSSEHeartbeatInterval = 15 * time.Second
 	toolsCacheTTL           = 5 * time.Minute
 )
 
@@ -1336,6 +1522,145 @@ var (
 	mcpMaxSessions        = max(1, getEnvInt("MCP_MAX_SESSIONS", 1000))
 	mcpMaxSessionsPerUser = max(1, getEnvInt("MCP_MAX_SESSIONS_PER_USER", 16))
 )
+
+// mcpSSEStream is the optional Streamable HTTP GET stream for a session. The
+// current Relay does not originate server-initiated JSON-RPC messages yet, but
+// keeping a real per-session stream (rather than returning 405) lets clients
+// establish the channel and gives us a safe delivery point for future
+// notifications/progress events.
+type mcpSSEStream struct {
+	events    chan []byte
+	done      chan struct{}
+	closeOnce sync.Once
+}
+
+func newMCPSSEStream() *mcpSSEStream {
+	return &mcpSSEStream{
+		events: make(chan []byte, 16),
+		done:   make(chan struct{}),
+	}
+}
+
+func (s *mcpSSEStream) close() {
+	s.closeOnce.Do(func() { close(s.done) })
+}
+
+var (
+	mcpSSEStreamsMu sync.Mutex
+	mcpSSEStreams   = make(map[string]*mcpSSEStream)
+)
+
+// registerMCPSSEStream keeps one active GET stream per MCP session. Replacing
+// the old stream avoids broadcasting a future server message to multiple
+// connections for the same session.
+func registerMCPSSEStream(sessionID string) *mcpSSEStream {
+	stream := newMCPSSEStream()
+	mcpSSEStreamsMu.Lock()
+	previous := mcpSSEStreams[sessionID]
+	mcpSSEStreams[sessionID] = stream
+	mcpSSEStreamsMu.Unlock()
+	if previous != nil {
+		previous.close()
+	}
+	return stream
+}
+
+func unregisterMCPSSEStream(sessionID string, stream *mcpSSEStream) {
+	mcpSSEStreamsMu.Lock()
+	if current := mcpSSEStreams[sessionID]; current == stream {
+		delete(mcpSSEStreams, sessionID)
+	}
+	mcpSSEStreamsMu.Unlock()
+	stream.close()
+}
+
+func closeMCPSSEStream(sessionID string) {
+	mcpSSEStreamsMu.Lock()
+	stream := mcpSSEStreams[sessionID]
+	delete(mcpSSEStreams, sessionID)
+	mcpSSEStreamsMu.Unlock()
+	if stream != nil {
+		stream.close()
+	}
+}
+
+func closeMCPSSEStreams(sessionIDs ...[]string) {
+	for _, ids := range sessionIDs {
+		for _, id := range ids {
+			closeMCPSSEStream(id)
+		}
+	}
+}
+
+// publishMCPSSEEvent is intentionally small and private for now. The Relay
+// can use it when it starts emitting server-initiated JSON-RPC notifications;
+// a disconnected/replaced stream is treated as an unsuccessful delivery.
+func publishMCPSSEEvent(sessionID string, payload []byte) bool {
+	mcpSSEStreamsMu.Lock()
+	stream := mcpSSEStreams[sessionID]
+	mcpSSEStreamsMu.Unlock()
+	if stream == nil {
+		return false
+	}
+	message := append([]byte(nil), payload...)
+	select {
+	case stream.events <- message:
+		return true
+	case <-stream.done:
+		return false
+	}
+}
+
+func acceptsMCPEventStream(accept string) bool {
+	var eventStreamQuality *float64
+	var wildcardQuality *float64
+	for _, part := range strings.Split(accept, ",") {
+		pieces := strings.Split(part, ";")
+		mediaType := strings.ToLower(strings.TrimSpace(pieces[0]))
+		quality := 1.0
+		for _, parameter := range pieces[1:] {
+			key, value, ok := strings.Cut(strings.TrimSpace(parameter), "=")
+			if !ok || !strings.EqualFold(strings.TrimSpace(key), "q") {
+				continue
+			}
+			parsed, err := strconv.ParseFloat(strings.Trim(strings.TrimSpace(value), `"`), 64)
+			if err == nil {
+				quality = parsed
+			}
+		}
+		switch mediaType {
+		case "text/event-stream":
+			q := quality
+			eventStreamQuality = &q
+		case "*/*":
+			q := quality
+			wildcardQuality = &q
+		}
+	}
+	// An explicit media type takes precedence over */*. This matters for
+	// Accept: text/event-stream;q=0, */*;q=1, which must not opt into SSE.
+	if eventStreamQuality != nil {
+		return *eventStreamQuality > 0
+	}
+	return wildcardQuality != nil && *wildcardQuality > 0
+}
+
+func writeMCPSSEData(w io.Writer, payload []byte) error {
+	text := strings.ReplaceAll(string(payload), "\r\n", "\n")
+	text = strings.ReplaceAll(text, "\r", "\n")
+	for _, line := range strings.Split(text, "\n") {
+		if _, err := fmt.Fprintf(w, "data: %s\n", line); err != nil {
+			return err
+		}
+	}
+	_, err := io.WriteString(w, "\n")
+	return err
+}
+
+func writeMCPSSEComment(w io.Writer, comment string) error {
+	_, err := fmt.Fprintf(w, ": %s\n\n", comment)
+	return err
+}
 
 type chatMCPToolPolicy struct {
 	description string
@@ -1370,6 +1695,40 @@ var chatMCPToolPolicies = map[string]chatMCPToolPolicy{
 			"response_format",
 		),
 		required: stringSet("root_id", "symbol"),
+	},
+	"codebase_deep_graph": {
+		description: "Query the authenticated tenant's Neo4j-derived root graph for bounded multi-hop impact, paths, cycles, SCC, and centrality. Results include projection freshness and explicit budget/truncation diagnostics. Global cross-repository analysis remains unavailable until the asynchronous global graph manifest exists. The service supplies tenant identity; root_id is required to select one indexed branch view.",
+		arguments: stringSet(
+			"root_id",
+			"symbol",
+			"target_symbol",
+			"query_type",
+			"direction",
+			"depth",
+			"limit",
+			"max_nodes",
+			"max_edges",
+			"max_paths",
+			"relationship_types",
+			"required_revision",
+			"allow_stale",
+			"include_evidence",
+			"response_format",
+		),
+		required: stringSet("root_id", "symbol"),
+	},
+	"codebase_graph_algorithm": {
+		description: "Submit or inspect a durable asynchronous SCC or centrality job for the authenticated tenant's ready Neo4j root generation. Use operation=submit with root_id and algorithm, or operation=status with job_id. The tool reports executor availability and never runs a full-graph algorithm synchronously in the request. The service supplies tenant identity.",
+		arguments: stringSet(
+			"operation",
+			"root_id",
+			"job_id",
+			"algorithm",
+			"parameters",
+			"result_ttl_seconds",
+			"response_format",
+		),
+		required: stringSet(),
 	},
 	"codebase_enhance_prompt": {
 		description: "Use when the user explicitly asks to enhance or refine a coding prompt, or asks for a code-grounded implementation brief before coding. Pass the complete original request in prompt and known symbols, file names, or error codes in technical_terms. The result contains goals, requirements, constraints, verified code references, verification steps, and open questions. Treat it as supplemental: the original request remains authoritative. Do not call automatically for every ordinary coding task. The service supplies tenant identity; root_id may scope the request to one indexed branch view.",
@@ -1492,8 +1851,47 @@ func validateChatMCPToolArgs(toolName string, args map[string]interface{}) error
 		if !ok {
 			return fmt.Errorf("root_id must be a string")
 		}
+		if strings.TrimSpace(text) == "" {
+			return fmt.Errorf("root_id must not be blank")
+		}
 		if len(text) > maxIndexRootIDLen {
 			return fmt.Errorf("root_id exceeds %d bytes", maxIndexRootIDLen)
+		}
+	}
+	if toolName == "codebase_graph_algorithm" {
+		operation := "submit"
+		if value, exists := args["operation"]; exists && value != nil {
+			text, ok := value.(string)
+			if !ok || strings.TrimSpace(text) == "" {
+				return fmt.Errorf("operation must be a non-blank string")
+			}
+			operation = strings.TrimSpace(text)
+		}
+		requireNonBlankString := func(field string) error {
+			value, exists := args[field]
+			if !exists || value == nil {
+				return fmt.Errorf("missing required argument: %s", field)
+			}
+			text, ok := value.(string)
+			if !ok || strings.TrimSpace(text) == "" {
+				return fmt.Errorf("required argument must be a non-blank string: %s", field)
+			}
+			return nil
+		}
+		switch operation {
+		case "submit":
+			if err := requireNonBlankString("root_id"); err != nil {
+				return err
+			}
+			if err := requireNonBlankString("algorithm"); err != nil {
+				return err
+			}
+		case "status":
+			if err := requireNonBlankString("job_id"); err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("unsupported graph algorithm operation: %s", operation)
 		}
 	}
 	return nil
@@ -1706,10 +2104,12 @@ func touchMCPSession(
 
 func sweepExpiredMCPSessions() {
 	serverSessionsMu.Lock()
-	defer serverSessionsMu.Unlock()
-	for _, id := range pruneExpiredMCPSessions(serverSessions, time.Now(), mcpSessionTTL) {
+	expired := pruneExpiredMCPSessions(serverSessions, time.Now(), mcpSessionTTL)
+	serverSessionsMu.Unlock()
+	for _, id := range expired {
 		log.Printf("[MCP_SERVER] Session expired: %s", id)
 	}
+	closeMCPSSEStreams(expired)
 }
 
 func startMCPSessionSweeper(ctx context.Context) {
@@ -1831,6 +2231,7 @@ func handleMCPPost(c *gin.Context) {
 			lastActivity: now,
 		}
 		serverSessionsMu.Unlock()
+		closeMCPSSEStreams(expired, evicted)
 
 		c.Header("Mcp-Session-Id", newSID)
 		c.JSON(http.StatusOK, rpcResult(rpc.ID, map[string]interface{}{
@@ -1868,11 +2269,8 @@ func handleMCPPost(c *gin.Context) {
 	case "tools/list":
 		tools, err := getCachedToolsList(c.Request.Context())
 		if err != nil {
-			logIDStr, _ := c.Get(ContextKeyLogID)
-			logIDVal, _ := logIDStr.(string)
-			saveErrorDetailsAsync(logIDVal, "lce", err.Error(), getInsertDone(c))
 			c.JSON(http.StatusOK, rpcError(rpc.ID, -32000, "upstream error: "+err.Error()))
-			completeRequestLogAsync(getRequestLogEntry(c, http.StatusOK))
+			completeRequestLogWithErrorAsync(getRequestLogEntry(c, http.StatusOK), "lce", err.Error())
 			return
 		}
 		c.JSON(http.StatusOK, rpcResult(rpc.ID, map[string]interface{}{
@@ -1891,9 +2289,88 @@ func handleMCPPost(c *gin.Context) {
 
 func handleMCPGet(c *gin.Context) {
 	c.Set(ContextKeyMetricsPath, "/mcp/session/listen")
-	c.Header("Allow", "POST, DELETE")
-	c.JSON(http.StatusMethodNotAllowed, gin.H{"error": "SSE stream not supported; use POST"})
-	completeRequestLogAsync(getRequestLogEntry(c, http.StatusMethodNotAllowed))
+
+	if !acceptsMCPEventStream(c.GetHeader("Accept")) {
+		c.JSON(http.StatusNotAcceptable, gin.H{"error": "SSE requires Accept: text/event-stream"})
+		completeRequestLogAsync(getRequestLogEntry(c, http.StatusNotAcceptable))
+		return
+	}
+
+	sessionID := c.GetHeader("Mcp-Session-Id")
+	if sessionID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "missing Mcp-Session-Id"})
+		completeRequestLogAsync(getRequestLogEntry(c, http.StatusBadRequest))
+		return
+	}
+
+	userID := c.GetString(ContextKeyUserID)
+	serverSessionsMu.Lock()
+	valid := touchMCPSession(serverSessions, sessionID, userID, time.Now())
+	serverSessionsMu.Unlock()
+	if !valid {
+		c.Status(http.StatusNotFound)
+		completeRequestLogAsync(getRequestLogEntry(c, http.StatusNotFound))
+		return
+	}
+
+	flusher, ok := c.Writer.(http.Flusher)
+	if !ok {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "SSE streaming is unavailable"})
+		completeRequestLogAsync(getRequestLogEntry(c, http.StatusInternalServerError))
+		return
+	}
+
+	c.Header("Content-Type", "text/event-stream; charset=utf-8")
+	c.Header("Cache-Control", "no-cache, no-transform")
+	c.Header("X-Accel-Buffering", "no")
+	c.Status(http.StatusOK)
+
+	stream := registerMCPSSEStream(sessionID)
+	defer func() {
+		unregisterMCPSSEStream(sessionID, stream)
+		// A standalone SSE request is intentionally long-lived, so it cannot use
+		// the normal handler-return path for request-log completion until the
+		// client disconnects or the stream is closed.
+		status := c.Writer.Status()
+		if c.Request.Context().Err() != nil {
+			status = 499 // client closed request; keep the same convention as stale logs
+		}
+		completeRequestLogAsync(getRequestLogEntry(c, status))
+	}()
+
+	// Send an immediate comment so proxies and clients observe that the stream
+	// is open without creating a JSON-RPC message that the client must parse.
+	if err := writeMCPSSEComment(c.Writer, "connected"); err != nil {
+		return
+	}
+	flusher.Flush()
+
+	ticker := time.NewTicker(mcpSSEHeartbeatInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-c.Request.Context().Done():
+			return
+		case <-stream.done:
+			return
+		case payload := <-stream.events:
+			if err := writeMCPSSEData(c.Writer, payload); err != nil {
+				return
+			}
+			flusher.Flush()
+		case <-ticker.C:
+			serverSessionsMu.Lock()
+			valid = touchMCPSession(serverSessions, sessionID, userID, time.Now())
+			serverSessionsMu.Unlock()
+			if !valid {
+				return
+			}
+			if err := writeMCPSSEComment(c.Writer, "keepalive"); err != nil {
+				return
+			}
+			flusher.Flush()
+		}
+	}
 }
 
 // requestTenantID 取本请求的租户（org_id ?? user_id）。中间件未设置时（如
@@ -1926,8 +2403,6 @@ func handleMCPToolsCall(c *gin.Context, id json.RawMessage, params json.RawMessa
 		return
 	}
 
-	logIDStr, _ := c.Get(ContextKeyLogID)
-	logIDVal, _ := logIDStr.(string)
 	toolPath := "/mcp/tools/call/" + p.Name
 	c.Set(ContextKeyMetricsPath, toolPath)
 
@@ -1947,7 +2422,6 @@ func handleMCPToolsCall(c *gin.Context, id json.RawMessage, params json.RawMessa
 			if errors.As(err, &upstreamErr) {
 				errorSource = "lce"
 			}
-			saveErrorDetailsAsync(logIDVal, errorSource, err.Error(), getInsertDone(c))
 			var errorCode string
 			if upstreamErr != nil {
 				errorCode = upstreamErr.code
@@ -1957,7 +2431,7 @@ func handleMCPToolsCall(c *gin.Context, id json.RawMessage, params json.RawMessa
 				"content": []map[string]interface{}{{"type": "text", "text": string(encoded)}},
 				"isError": true,
 			}))
-			completeRequestLogAsync(getRequestLogEntry(c, http.StatusOK))
+			completeRequestLogWithErrorAsync(getRequestLogEntry(c, http.StatusOK), errorSource, err.Error())
 			return
 		}
 		indexResult := codebaseIndexEnvelope(true, payload, "")
@@ -1982,7 +2456,6 @@ func handleMCPToolsCall(c *gin.Context, id json.RawMessage, params json.RawMessa
 		}
 		allRoots, err := loadIndexRoots(c.Request.Context(), tenantID)
 		if err != nil {
-			saveErrorDetailsAsync(logIDVal, "relay", err.Error(), getInsertDone(c))
 			encoded, _ := json.Marshal(map[string]interface{}{
 				"error":   "index status unavailable",
 				"message": err.Error(),
@@ -1991,7 +2464,7 @@ func handleMCPToolsCall(c *gin.Context, id json.RawMessage, params json.RawMessa
 				"content": []map[string]interface{}{{"type": "text", "text": string(encoded)}},
 				"isError": true,
 			}))
-			completeRequestLogAsync(getRequestLogEntry(c, http.StatusOK))
+			completeRequestLogWithErrorAsync(getRequestLogEntry(c, http.StatusOK), "relay", err.Error())
 			return
 		}
 		requestedRootID, _ := p.Arguments["root_id"].(string)
@@ -2058,9 +2531,8 @@ func handleMCPToolsCall(c *gin.Context, id json.RawMessage, params json.RawMessa
 			completeRequestLogAsync(getRequestLogEntry(c, 499))
 			return
 		}
-		saveErrorDetailsAsync(logIDVal, "lce", err.Error(), getInsertDone(c))
 		c.JSON(http.StatusOK, rpcError(id, -32000, err.Error()))
-		completeRequestLogAsync(getRequestLogEntry(c, http.StatusOK))
+		completeRequestLogWithErrorAsync(getRequestLogEntry(c, http.StatusOK), "lce", err.Error())
 		return
 	}
 
@@ -2118,17 +2590,36 @@ func setClearIndexCooldown(ctx context.Context, tenantID string) {
 	redisClient.Set(ctx, clearIndexCooldownKey(tenantID), "1", time.Duration(clearIndexCooldownSeconds)*time.Second)
 }
 
-func deleteUserLogsAsync(userID string) {
+func deleteCompletedUserLogsBefore(userID string, before time.Time) (int64, error) {
+	// Keep the clear-index request itself and any request that was still running
+	// when the clear began. The strict timestamp boundary gives the operation a
+	// deterministic snapshot, and ON DELETE CASCADE removes error_details in the
+	// same transaction as each parent request log.
+	result, err := db.Exec(`
+		DELETE FROM request_logs
+		WHERE user_id = $1
+			AND request_timestamp < $2
+			AND status = $3
+	`, userID, before, StatusCompleted)
+	if err != nil {
+		return 0, err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	return rows, nil
+}
+
+func deleteUserLogsAsync(userID string, before time.Time) {
 	go func() {
-		_, err := db.Exec(`DELETE FROM error_details WHERE request_id IN (SELECT id FROM request_logs WHERE user_id = $1)`, userID)
+		rows, err := deleteCompletedUserLogsBefore(userID, before)
 		if err != nil {
-			log.Printf("[ERROR] Failed to delete error_details for user %s: %v", userID, err)
+			log.Printf("[ERROR] Failed to delete completed request_logs for user %s: %v", userID, err)
+			return
 		}
-		result, err := db.Exec(`DELETE FROM request_logs WHERE user_id = $1`, userID)
-		if err != nil {
-			log.Printf("[ERROR] Failed to delete request_logs for user %s: %v", userID, err)
-		} else if rows, _ := result.RowsAffected(); rows > 0 {
-			log.Printf("[CLEAR_INDEX] Deleted %d request logs for user %s", rows, userID)
+		if rows > 0 {
+			log.Printf("[CLEAR_INDEX] Deleted %d completed request logs for user %s", rows, userID)
 		}
 	}()
 }
@@ -2177,11 +2668,8 @@ func handleClearIndex(c *gin.Context) {
 	args := map[string]interface{}{"tenant_id": tenantID}
 	result, err := lce.callToolWithTimeout(opCtx, "codebase_clear_index", args, remoteIndexMCPCallTimeout)
 	if err != nil {
-		logIDStr, _ := c.Get(ContextKeyLogID)
-		logIDVal, _ := logIDStr.(string)
-		saveErrorDetailsAsync(logIDVal, "lce", err.Error(), getInsertDone(c))
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "清除索引失败: " + err.Error()})
-		completeRequestLogAsync(getRequestLogEntry(c, http.StatusInternalServerError))
+		completeRequestLogWithErrorAsync(getRequestLogEntry(c, http.StatusInternalServerError), "lce", err.Error())
 		return
 	}
 
@@ -2193,9 +2681,15 @@ func handleClearIndex(c *gin.Context) {
 
 	setClearIndexCooldown(c.Request.Context(), tenantID)
 	// 审计日志按真实用户删除：request_logs 归属个人，与租户归并无关。
-	deleteUserLogsAsync(userIDStr)
+	// 仅删除本次清理开始前已完成的日志；当前清理审计和并发中的请求保留。
+	clearStartedAt, ok := c.Get(ContextKeyStartTime)
+	clearStartedAtValue, ok := clearStartedAt.(time.Time)
+	if !ok {
+		clearStartedAtValue = time.Now()
+	}
+	deleteUserLogsAsync(userIDStr, clearStartedAtValue)
 
-	c.JSON(http.StatusOK, gin.H{"success": true, "message": "索引和日志已清除"})
+	c.JSON(http.StatusOK, gin.H{"success": true, "message": "索引和历史日志已清除"})
 	completeRequestLogAsync(getRequestLogEntry(c, http.StatusOK))
 }
 
@@ -2213,11 +2707,8 @@ func handleTenantStats(c *gin.Context) {
 	args := map[string]interface{}{"tenant_id": tenantID}
 	result, err := lce.callTool(c.Request.Context(), "codebase_tenant_stats", args)
 	if err != nil {
-		logIDStr, _ := c.Get(ContextKeyLogID)
-		logIDVal, _ := logIDStr.(string)
-		saveErrorDetailsAsync(logIDVal, "lce", err.Error(), getInsertDone(c))
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "获取统计失败: " + err.Error()})
-		completeRequestLogAsync(getRequestLogEntry(c, http.StatusInternalServerError))
+		completeRequestLogWithErrorAsync(getRequestLogEntry(c, http.StatusInternalServerError), "lce", err.Error())
 		return
 	}
 
@@ -2276,6 +2767,9 @@ func handleMCPDelete(c *gin.Context) {
 		existed = false
 	}
 	serverSessionsMu.Unlock()
+	if existed {
+		closeMCPSSEStream(sessionID)
+	}
 
 	if !existed {
 		c.Status(http.StatusNotFound)
@@ -2732,8 +3226,8 @@ func main() {
 
 	r.POST("/mcp", handleMCPPost)
 	r.DELETE("/mcp", handleMCPDelete)
-	// Streamable HTTP 规范：不提供服务端 SSE 推流时对 GET 回 405，
-	// MCP SDK 客户端会按"无推流"优雅降级；回 404 会被当成连接错误。
+	// Streamable HTTP GET 提供每个 MCP session 的可选 SSE 通道；POST 仍然
+	// 返回 application/json，GET 负责服务端通知/进度和 keepalive。
 	r.GET("/mcp", handleMCPGet)
 	r.POST("/mcp/clear-index", handleClearIndex)
 	r.GET("/mcp/tenant-stats", handleTenantStats)

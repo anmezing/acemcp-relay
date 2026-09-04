@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -163,25 +164,32 @@ func TestHandleCodebaseIndexRejectsInvalidLifecycleInputBeforeDatabaseAccess(t *
 
 func TestCheckIndexStartRateLimitEnforcesPerRootInterval(t *testing.T) {
 	base := time.Now()
+	// 该限流器的状态是进程级 map；使用本次测试唯一 key，保证 -count=N
+	// 或 shuffle 重复运行时不会把上一轮测试的窗口带进来。
+	suffix := strconv.FormatInt(base.UnixNano(), 10)
+	userA := "rate-user-a-" + suffix
+	userB := "rate-user-b-" + suffix
+	root1 := "root-1-" + suffix
+	root2 := "root-2-" + suffix
 
 	// full sync 首次调用必须放行
-	if wait := checkIndexStartRateLimit("rate-user-a", "root-1", base); wait != 0 {
+	if wait := checkIndexStartRateLimit(userA, root1, base); wait != 0 {
 		t.Fatalf("first start must pass, got wait=%d", wait)
 	}
 	// 窗口内的重试要被挡下，并给出剩余等待秒数
-	if wait := checkIndexStartRateLimit("rate-user-a", "root-1", base.Add(5*time.Second)); wait <= 0 || wait > 30 {
+	if wait := checkIndexStartRateLimit(userA, root1, base.Add(5*time.Second)); wait <= 0 || wait > 30 {
 		t.Fatalf("retry within interval must be limited with 0 < wait <= 30, got %d", wait)
 	}
 	// 不同 root 互不影响
-	if wait := checkIndexStartRateLimit("rate-user-a", "root-2", base.Add(5*time.Second)); wait != 0 {
+	if wait := checkIndexStartRateLimit(userA, root2, base.Add(5*time.Second)); wait != 0 {
 		t.Fatalf("different root must pass, got wait=%d", wait)
 	}
 	// 不同用户互不影响
-	if wait := checkIndexStartRateLimit("rate-user-b", "root-1", base.Add(6*time.Second)); wait != 0 {
+	if wait := checkIndexStartRateLimit(userB, root1, base.Add(6*time.Second)); wait != 0 {
 		t.Fatalf("different user must pass, got wait=%d", wait)
 	}
 	// 间隔过后放行
-	if wait := checkIndexStartRateLimit("rate-user-a", "root-1", base.Add(indexStartMinInterval+5*time.Second)); wait != 0 {
+	if wait := checkIndexStartRateLimit(userA, root1, base.Add(indexStartMinInterval+5*time.Second)); wait != 0 {
 		t.Fatalf("start after interval must pass, got wait=%d", wait)
 	}
 }

@@ -10,7 +10,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"time"
 )
 
 // ── 按用户 Rerank 配置────────────────────────────────────────────────────
@@ -21,11 +20,6 @@ import (
 // 保持一致）。relay 只转发 rerank；云端 embedding 和向量空间由 LCE 服务端固定。
 //
 // MODEL_CONFIG_SECRET 未设置时整个特性关闭（不查表、不注入）。
-
-const (
-	modelConfigCacheTTL   = 5 * time.Minute
-	modelConfigNoRowValue = "0"
-)
 
 var modelConfigKey []byte // nil = 特性关闭
 
@@ -57,39 +51,28 @@ type userModelConfigRow struct {
 	Enc string `json:"enc"`
 }
 
-// getUserModelConfigRow 带 Redis 缓存读取配置行；无配置返回 nil。
-// 前端保存配置后会删除 modelcfg:{user} 缓存使其立即可见。
+// getUserModelConfigRow reads the primary row on every request. Personal model
+// credentials are security-sensitive configuration: a best-effort Redis DEL
+// cannot make save/reset strongly consistent because a failed invalidation can
+// resurrect a stale API key until TTL expiry. The primary-key lookup is cheap
+// and guarantees that clearing the row immediately falls back to platform
+// configuration on every Relay instance.
 func getUserModelConfigRow(ctx context.Context, userID string) (*userModelConfigRow, error) {
-	cacheKey := "modelcfg:" + userID
-	if v, err := redisClient.Get(ctx, cacheKey).Result(); err == nil {
-		if v == modelConfigNoRowValue {
-			return nil, nil
-		}
-		var row userModelConfigRow
-		if json.Unmarshal([]byte(v), &row) == nil {
-			return &row, nil
-		}
-	}
-
 	var enc sql.NullString
-	err := db.QueryRow(
+	err := db.QueryRowContext(
+		ctx,
 		`SELECT config_enc FROM user_model_configs WHERE user_id = $1`,
 		userID,
 	).Scan(&enc)
 	switch {
 	case err == sql.ErrNoRows:
-		redisClient.Set(ctx, cacheKey, modelConfigNoRowValue, modelConfigCacheTTL)
 		return nil, nil
 	case err != nil:
 		log.Printf("[MODELCFG] lookup failed (user=%s): %v", userID, err)
 		return nil, fmt.Errorf("model config lookup failed: %w", err)
 	}
 
-	row := &userModelConfigRow{Enc: enc.String}
-	if data, err := json.Marshal(row); err == nil {
-		redisClient.Set(ctx, cacheKey, string(data), modelConfigCacheTTL)
-	}
-	return row, nil
+	return &userModelConfigRow{Enc: enc.String}, nil
 }
 
 func decryptModelConfig(enc string) (map[string]interface{}, error) {

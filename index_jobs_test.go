@@ -174,6 +174,8 @@ func TestFilterChatMCPToolsHidesIndexManagementTools(t *testing.T) {
 		{"name":"codebase_git_context","description":"git"},
 		{"name":"codebase_review_changes","description":"review"},
 		{"name":"codebase_symbol_graph","description":"graph","inputSchema":{"type":"object","properties":{"root_id":{"type":"string"},"symbol":{"type":"string"}}}},
+		{"name":"codebase_deep_graph","description":"deep graph","inputSchema":{"type":"object","properties":{"tenant_id":{"type":"string"},"root_id":{"type":"string"},"symbol":{"type":"string"},"query_type":{"type":"string"}}}},
+		{"name":"codebase_graph_algorithm","description":"graph algorithm","inputSchema":{"type":"object","properties":{"tenant_id":{"type":"string"},"operation":{"type":"string"},"root_id":{"type":"string"},"job_id":{"type":"string"},"algorithm":{"type":"string"},"parameters":{"type":"object"},"result_ttl_seconds":{"type":"integer"},"response_format":{"type":"string"}}}},
 		{"name":"codebase_enhance_prompt","description":"enhance","inputSchema":{"type":"object","properties":{"prompt":{"type":"string"},"technical_terms":{"type":"array"},"root_id":{"type":"string"},"output_language":{"type":"string"},"response_format":{"type":"string"},"tenant_id":{"type":"string"}},"required":["tenant_id","prompt"]}},
 		{"name":"codebase_tenant_stats","description":"stats","inputSchema":{"type":"object","properties":{"response_format":{"type":"string"}}}},
 		{"name":"future_admin_tool","description":"must stay private"}
@@ -192,7 +194,7 @@ func TestFilterChatMCPToolsHidesIndexManagementTools(t *testing.T) {
 	for i, tool := range tools {
 		got[i] = tool.Name
 	}
-	if !reflect.DeepEqual(got, []string{"codebase-retrieval", "codebase_symbol_graph", "codebase_enhance_prompt"}) {
+	if !reflect.DeepEqual(got, []string{"codebase-retrieval", "codebase_symbol_graph", "codebase_deep_graph", "codebase_graph_algorithm", "codebase_enhance_prompt"}) {
 		t.Fatalf("unexpected chat MCP tools: %#v", got)
 	}
 }
@@ -216,7 +218,7 @@ func TestFilterChatMCPToolsRequiresExactRemoteContract(t *testing.T) {
 }
 
 func TestChatMCPToolPolicyKeepsTenantToolsAndRejectsRawManagement(t *testing.T) {
-	for _, allowed := range []string{"codebase-retrieval", "codebase_symbol_graph", "codebase_enhance_prompt", codebaseIndexToolName, codebaseIndexStatusToolName} {
+	for _, allowed := range []string{"codebase-retrieval", "codebase_symbol_graph", "codebase_deep_graph", "codebase_graph_algorithm", "codebase_enhance_prompt", codebaseIndexToolName, codebaseIndexStatusToolName} {
 		if !isChatMCPToolAllowed(allowed) {
 			t.Fatalf("%q must remain available through chat MCP", allowed)
 		}
@@ -238,6 +240,8 @@ func TestPromptEnhancementPolicyHidesTenantAndRejectsCallerOverride(t *testing.T
 	raw := json.RawMessage(`[
 		{"name":"codebase-retrieval","inputSchema":{"type":"object","properties":{"information_request":{"type":"string"}}}},
 		{"name":"codebase_symbol_graph","inputSchema":{"type":"object","properties":{"root_id":{"type":"string"},"symbol":{"type":"string"}}}},
+		{"name":"codebase_deep_graph","inputSchema":{"type":"object","properties":{"tenant_id":{"type":"string"},"root_id":{"type":"string"},"symbol":{"type":"string"}}}},
+		{"name":"codebase_graph_algorithm","inputSchema":{"type":"object","properties":{"tenant_id":{"type":"string"},"operation":{"type":"string"}}}},
 		{"name":"codebase_enhance_prompt","inputSchema":{"type":"object","properties":{"tenant_id":{"type":"string"},"prompt":{"type":"string"},"root_id":{"type":"string"}},"required":["tenant_id","prompt"]}}
 	]`)
 	filtered, err := filterChatMCPTools(raw)
@@ -248,7 +252,7 @@ func TestPromptEnhancementPolicyHidesTenantAndRejectsCallerOverride(t *testing.T
 	if err := json.Unmarshal(filtered, &tools); err != nil {
 		t.Fatal(err)
 	}
-	prompt := tools[2]
+	prompt := tools[4]
 	description, ok := prompt["description"].(string)
 	if !ok {
 		t.Fatal("prompt enhancer must expose an agent-facing description")
@@ -285,6 +289,8 @@ func TestAppendCodebaseIndexToolExposesExpectedTools(t *testing.T) {
 	raw := json.RawMessage(`[
 		{"name":"codebase-retrieval","inputSchema":{"type":"object","properties":{"information_request":{"type":"string"}}}},
 		{"name":"codebase_symbol_graph","inputSchema":{"type":"object","properties":{"root_id":{"type":"string"},"symbol":{"type":"string"}}}},
+		{"name":"codebase_deep_graph","inputSchema":{"type":"object","properties":{"root_id":{"type":"string"},"symbol":{"type":"string"}}}},
+		{"name":"codebase_graph_algorithm","inputSchema":{"type":"object","properties":{}}},
 		{"name":"codebase_enhance_prompt","inputSchema":{"type":"object","properties":{"prompt":{"type":"string"}}}}
 	]`)
 	filtered, err := filterChatMCPTools(raw)
@@ -299,13 +305,13 @@ func TestAppendCodebaseIndexToolExposesExpectedTools(t *testing.T) {
 	if err := json.Unmarshal(combined, &tools); err != nil {
 		t.Fatal(err)
 	}
-	if len(tools) != 4 {
-		t.Fatalf("remote MCP must expose exactly four tools, got %d", len(tools))
+	if len(tools) != 6 {
+		t.Fatalf("remote MCP must expose exactly six tools, got %d", len(tools))
 	}
-	if tools[3]["name"] != codebaseIndexToolName {
-		t.Fatalf("fourth tool must be %s, got %#v", codebaseIndexToolName, tools[3]["name"])
+	if tools[5]["name"] != codebaseIndexToolName {
+		t.Fatalf("sixth tool must be %s, got %#v", codebaseIndexToolName, tools[5]["name"])
 	}
-	schema := tools[3]["inputSchema"].(map[string]interface{})
+	schema := tools[5]["inputSchema"].(map[string]interface{})
 	operations := schema["oneOf"].([]interface{})
 	if len(operations) != 5 {
 		t.Fatalf("index tool must advertise five lifecycle operations, got %d", len(operations))
@@ -424,6 +430,107 @@ func TestRewriteToolSchemaSymbolGraph(t *testing.T) {
 	}
 }
 
+func TestRewriteToolSchemaDeepGraph(t *testing.T) {
+	tool := json.RawMessage(`{
+		"name": "codebase_deep_graph",
+		"description": "upstream deep graph",
+		"inputSchema": {
+			"type": "object",
+			"properties": {
+				"tenant_id": {"type": "string"},
+				"repo_path": {"type": "string"},
+				"root_id": {"type": "string"},
+				"symbol": {"type": "string"},
+				"target_symbol": {"type": "string"},
+				"query_type": {"type": "string"},
+				"max_paths": {"type": "integer"},
+				"response_format": {"type": "string"}
+			},
+			"required": ["tenant_id", "symbol"],
+			"oneOf": [{"required": ["tenant_id"]}]
+		}
+	}`)
+
+	rewritten, err := rewriteToolSchema(tool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result map[string]interface{}
+	if err := json.Unmarshal(rewritten, &result); err != nil {
+		t.Fatal(err)
+	}
+	schema := result["inputSchema"].(map[string]interface{})
+	props := schema["properties"].(map[string]interface{})
+	for _, removed := range []string{"tenant_id", "repo_path"} {
+		if _, exists := props[removed]; exists {
+			t.Fatalf("property %q should have been removed", removed)
+		}
+	}
+	for _, kept := range []string{"root_id", "symbol", "target_symbol", "query_type", "max_paths", "response_format"} {
+		if _, exists := props[kept]; !exists {
+			t.Fatalf("property %q should have been kept", kept)
+		}
+	}
+	if _, exists := schema["oneOf"]; exists {
+		t.Fatal("oneOf constraint should have been removed")
+	}
+	if required := schema["required"].([]interface{}); !reflect.DeepEqual(required, []interface{}{"root_id", "symbol"}) {
+		t.Fatalf("required should contain root_id and symbol, got %v", required)
+	}
+	if additional, _ := schema["additionalProperties"].(bool); additional {
+		t.Fatal("deep graph schema must reject undeclared arguments")
+	}
+}
+
+func TestRewriteToolSchemaGraphAlgorithm(t *testing.T) {
+	tool := json.RawMessage(`{
+		"name": "codebase_graph_algorithm",
+		"description": "upstream graph algorithm",
+		"inputSchema": {
+			"type": "object",
+			"properties": {
+				"tenant_id": {"type": "string"},
+				"operation": {"type": "string"},
+				"root_id": {"type": "string"},
+				"job_id": {"type": "string"},
+				"algorithm": {"type": "string"},
+				"parameters": {"type": "object"},
+				"result_ttl_seconds": {"type": "integer"},
+				"response_format": {"type": "string"},
+				"admin_override": {"type": "boolean"}
+			},
+			"required": ["tenant_id"]
+		}
+	}`)
+
+	rewritten, err := rewriteToolSchema(tool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result map[string]interface{}
+	if err := json.Unmarshal(rewritten, &result); err != nil {
+		t.Fatal(err)
+	}
+	schema := result["inputSchema"].(map[string]interface{})
+	props := schema["properties"].(map[string]interface{})
+	for _, removed := range []string{"tenant_id", "admin_override"} {
+		if _, exists := props[removed]; exists {
+			t.Fatalf("property %q should have been removed", removed)
+		}
+	}
+	for _, kept := range []string{"operation", "root_id", "job_id", "algorithm", "parameters", "result_ttl_seconds", "response_format"} {
+		if _, exists := props[kept]; !exists {
+			t.Fatalf("property %q should have been kept", kept)
+		}
+	}
+	if required := schema["required"].([]interface{}); len(required) != 0 {
+		t.Fatalf("conditional algorithm arguments must not become statically required, got %v", required)
+	}
+	if description, _ := result["description"].(string); !strings.Contains(description, "operation=submit") || !strings.Contains(description, "operation=status") {
+		t.Fatalf("algorithm description must document conditional operation arguments: %q", description)
+	}
+}
+
 func TestRewriteToolSchemaPassesThroughUnknownTools(t *testing.T) {
 	original := json.RawMessage(`{"name":"future_tool","inputSchema":{"type":"object","properties":{"foo":{"type":"string"}}}}`)
 	rewritten, err := rewriteToolSchema(original)
@@ -524,14 +631,54 @@ func TestValidateChatMCPToolArgsRequiresRemoteRoot(t *testing.T) {
 	}
 }
 
+func TestValidateChatMCPDeepGraphRequiresRemoteRoot(t *testing.T) {
+	if err := validateChatMCPToolArgs("codebase_deep_graph", map[string]interface{}{"symbol": "Handler"}); err == nil {
+		t.Fatal("deep graph calls without root_id must be rejected at Relay")
+	}
+	if err := validateChatMCPToolArgs("codebase_deep_graph", map[string]interface{}{
+		"root_id": "root-123", "symbol": "Handler", "query_type": "impact",
+	}); err != nil {
+		t.Fatalf("complete deep graph call should pass: %v", err)
+	}
+}
+
+func TestValidateChatMCPGraphAlgorithmConditionalArguments(t *testing.T) {
+	tests := []struct {
+		name    string
+		args    map[string]interface{}
+		wantErr bool
+	}{
+		{"default submit requires root", map[string]interface{}{"algorithm": "scc"}, true},
+		{"submit requires algorithm", map[string]interface{}{"root_id": "root-1"}, true},
+		{"submit passes", map[string]interface{}{"operation": "submit", "root_id": "root-1", "algorithm": "scc"}, false},
+		{"status requires job", map[string]interface{}{"operation": "status"}, true},
+		{"status passes", map[string]interface{}{"operation": "status", "job_id": "job-1"}, false},
+		{"blank operation rejected", map[string]interface{}{"operation": "  ", "root_id": "root-1", "algorithm": "scc"}, true},
+		{"unknown operation rejected", map[string]interface{}{"operation": "cancel", "job_id": "job-1"}, true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateChatMCPToolArgs("codebase_graph_algorithm", test.args)
+			if test.wantErr && err == nil {
+				t.Fatal("expected validation error")
+			}
+			if !test.wantErr && err != nil {
+				t.Fatalf("unexpected validation error: %v", err)
+			}
+		})
+	}
+}
+
 func TestRetrievalAndPromptEnhancementUseTenantRerankConfig(t *testing.T) {
 	for _, toolName := range []string{"codebase-retrieval", "codebase_enhance_prompt"} {
 		if !chatMCPToolUsesRerankConfig(toolName) {
 			t.Fatalf("%s must receive the tenant rerank configuration", toolName)
 		}
 	}
-	if chatMCPToolUsesRerankConfig("codebase_symbol_graph") {
-		t.Fatal("codebase_symbol_graph must not depend on rerank configuration")
+	for _, toolName := range []string{"codebase_symbol_graph", "codebase_deep_graph", "codebase_graph_algorithm"} {
+		if chatMCPToolUsesRerankConfig(toolName) {
+			t.Fatalf("%s must not depend on rerank configuration", toolName)
+		}
 	}
 }
 

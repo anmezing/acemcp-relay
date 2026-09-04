@@ -307,20 +307,35 @@ func TestAuthenticateRequestUnknownTierFallsBackToFree(t *testing.T) {
 	}
 }
 
-// ── 组织身份读取与缓存 ─────────────────────────────────────────────────────
+// ── 组织身份、订阅席位与动态授权 ───────────────────────────────────────────
 
-func TestAuthenticateRequestReadsOrgFieldsAndCachesThem(t *testing.T) {
+func expectOrgAuthorization(
+	mock sqlmock.Sqlmock,
+	orgID string,
+	userID string,
+	role string,
+	ownerUserID string,
+	seatLimit int,
+	usedSeats int,
+) {
+	mock.ExpectQuery("WITH target_membership AS").WithArgs(orgID, userID).
+		WillReturnRows(sqlmock.NewRows([]string{"role", "owner_user_id", "seat_limit", "used_seats"}).
+			AddRow(role, ownerUserID, seatLimit, usedSeats))
+}
+
+func TestAuthenticateRequestCachesOrgKeyButRevalidatesDynamicAuthorization(t *testing.T) {
 	const token = "lce_org_member_key"
 	context, mock, cleanup := newAuthTestContext(t, token)
 	defer cleanup()
 
 	md5Hex, sha256Hex := tokenHashes(token)
-	// 首次认证查 key + 权威成员关系；第二次必须完全来自缓存。
+	// 首次认证查一次 key；成员关系和席位在每次请求上重新读取，避免套餐过期或
+	// 成员移除后继续使用 auth cache 中的旧权限。
 	mock.ExpectQuery("SELECT keys.user_id, COALESCE").WithArgs(md5Hex, sha256Hex).
 		WillReturnRows(sqlmock.NewRows([]string{"user_id", "tier", "org_id"}).
 			AddRow("user-m", "free", "org-1"))
-	mock.ExpectQuery("SELECT COALESCE").WithArgs("org-1", "user-m").
-		WillReturnRows(sqlmock.NewRows([]string{"role"}).AddRow("member"))
+	expectOrgAuthorization(mock, "org-1", "user-m", "member", "owner-1", 3, 1)
+	expectOrgAuthorization(mock, "org-1", "user-m", "member", "owner-1", 3, 1)
 
 	identity, ok := authenticateRequest(context)
 	if !ok || identity.OrgID != "org-1" || identity.OrgRole != "member" {
@@ -330,10 +345,10 @@ func TestAuthenticateRequestReadsOrgFieldsAndCachesThem(t *testing.T) {
 		t.Fatalf("tenant must resolve to org_id, got %q", identity.TenantID())
 	}
 	if cached, ok := authenticateRequest(context); !ok || cached.OrgID != "org-1" || cached.OrgRole != "member" {
-		t.Fatalf("cached auth must keep org fields, got %+v ok=%v", cached, ok)
+		t.Fatalf("cached key must retain org identity after revalidation, got %+v ok=%v", cached, ok)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Fatalf("second auth must not query the database: %v", err)
+		t.Fatalf("org cache hit must skip key lookup but revalidate dynamic authorization: %v", err)
 	}
 }
 
@@ -346,11 +361,69 @@ func TestAuthenticateRequestRejectsOrgKeyWithoutCurrentMembership(t *testing.T) 
 	mock.ExpectQuery("SELECT keys.user_id, COALESCE").WithArgs(md5Hex, sha256Hex).
 		WillReturnRows(sqlmock.NewRows([]string{"user_id", "tier", "org_id"}).
 			AddRow("removed-user", "free", "org-1"))
-	mock.ExpectQuery("SELECT COALESCE").WithArgs("org-1", "removed-user").
-		WillReturnRows(sqlmock.NewRows([]string{"role"}))
+	expectOrgAuthorization(mock, "org-1", "removed-user", "", "owner-1", 3, 1)
 
 	if identity, ok := authenticateRequest(context); ok || identity.UserID != "" {
 		t.Fatalf("removed organization member must not authenticate, got %+v ok=%v", identity, ok)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAuthenticateRequestRejectsMemberImmediatelyAfterSubscriptionExpiry(t *testing.T) {
+	const token = "lce_expired_org_member"
+	context, mock, cleanup := newAuthTestContext(t, token)
+	defer cleanup()
+
+	md5Hex, sha256Hex := tokenHashes(token)
+	mock.ExpectQuery("SELECT keys.user_id, COALESCE").WithArgs(md5Hex, sha256Hex).
+		WillReturnRows(sqlmock.NewRows([]string{"user_id", "tier", "org_id"}).
+			AddRow("member-1", "free", "org-1"))
+	// 无有效订阅时 active_entitlement 回落为 0；已有非 owner 成员必须立即失效。
+	expectOrgAuthorization(mock, "org-1", "member-1", "member", "owner-1", 0, 1)
+
+	if identity, ok := authenticateRequest(context); ok || identity.UserID != "" {
+		t.Fatalf("expired organization seat must not authenticate, got %+v ok=%v", identity, ok)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAuthenticateRequestAllowsCanonicalOwnerWithoutPaidSeat(t *testing.T) {
+	const token = "lce_org_owner"
+	context, mock, cleanup := newAuthTestContext(t, token)
+	defer cleanup()
+
+	md5Hex, sha256Hex := tokenHashes(token)
+	mock.ExpectQuery("SELECT keys.user_id, COALESCE").WithArgs(md5Hex, sha256Hex).
+		WillReturnRows(sqlmock.NewRows([]string{"user_id", "tier", "org_id"}).
+			AddRow("owner-1", "free", "org-1"))
+	expectOrgAuthorization(mock, "org-1", "owner-1", "owner", "owner-1", 0, 0)
+
+	identity, ok := authenticateRequest(context)
+	if !ok || identity.OrgRole != orgRoleOwner || identity.TenantID() != "org-1" {
+		t.Fatalf("canonical owner must authenticate without consuming a seat, got %+v ok=%v", identity, ok)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAuthenticateRequestFailsClosedWhenStoredMembershipsExceedSeatLimit(t *testing.T) {
+	const token = "lce_overallocated_org_member"
+	context, mock, cleanup := newAuthTestContext(t, token)
+	defer cleanup()
+
+	md5Hex, sha256Hex := tokenHashes(token)
+	mock.ExpectQuery("SELECT keys.user_id, COALESCE").WithArgs(md5Hex, sha256Hex).
+		WillReturnRows(sqlmock.NewRows([]string{"user_id", "tier", "org_id"}).
+			AddRow("member-3", "free", "org-1"))
+	expectOrgAuthorization(mock, "org-1", "member-3", "member", "owner-1", 2, 3)
+
+	if identity, ok := authenticateRequest(context); ok || identity.UserID != "" {
+		t.Fatalf("overallocated organization must fail closed, got %+v ok=%v", identity, ok)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatal(err)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
 	"fmt"
 	"log"
 	"strconv"
@@ -79,6 +80,24 @@ func migrateQuotaTables() error {
 	if err != nil {
 		return fmt.Errorf("failed to migrate user subscriptions table: %w", err)
 	}
+	// 组织密钥在每次请求上校验当前成员关系和 owner 的有效席位。Better Auth
+	// 表可能尚未由前端初始化，因此通过 to_regclass 条件安装热路径索引；已有生产
+	// 库会立即补齐，全新库稍后仍由前端 initDB 创建同名索引。
+	_, err = db.Exec(`
+		DO $$
+		BEGIN
+			IF to_regclass('public.member') IS NOT NULL THEN
+				CREATE INDEX IF NOT EXISTS member_user_org_idx
+					ON "member" ("userId", "organizationId");
+				CREATE INDEX IF NOT EXISTS member_org_created_idx
+					ON "member" ("organizationId", "createdAt", "id");
+			END IF;
+		END;
+		$$
+	`)
+	if err != nil {
+		return fmt.Errorf("failed to migrate organization authorization indexes: %w", err)
+	}
 	// org_quotas 由平台管理员写入（前端仓库也会幂等建同一张表）。
 	// NULL/无记录继承 canonical owner 的套餐或基础 tier；<=0 = 不限。
 	_, err = db.Exec(`
@@ -137,6 +156,7 @@ func tierIndexBytesLimit(tier string) int64 {
 }
 
 type planQuotaLimits struct {
+	OwnerID    string
 	Request    int64
 	IndexBytes int64
 	ExpiresAt  time.Time
@@ -165,15 +185,19 @@ func getUserPlanQuotaLimits(userID string) planQuotaLimits {
 
 // getOrgOwnerQuotaLimits 与前端子账号口径一致：按成员创建时间和 id 选择最早
 // owner 作为组织权益拥有者，避免多个 owner 通过取最大值叠加套餐权益。
-// 有有效套餐时读取购买时冻结的额度；否则读取 owner 的基础 tier。组织成员
-// 自己的 tier 不参与组织共享池计算，避免受邀 Pro 成员意外抬高整个组织额度。
+// owner 的管理员覆盖、有效套餐和基础 tier 依次生效；组织成员自己的 tier 不参与
+// 共享池计算，避免受邀 Pro 成员意外抬高整个组织额度。
 func getOrgOwnerQuotaLimits(orgID string) planQuotaLimits {
 	var limits planQuotaLimits
-	var requestLimit, indexBytesLimit sql.NullInt64
+	var requestOverride, indexBytesOverride sql.NullInt64
+	var planRequestLimit, planIndexBytesLimit sql.NullInt64
 	var expiresAt sql.NullTime
 	var ownerTier string
 	err := db.QueryRow(`
-		SELECT subscriptions.daily_request_limit,
+		SELECT canonical_owner."userId",
+		       overrides.daily_limit,
+		       overrides.daily_index_bytes_limit,
+		       subscriptions.daily_request_limit,
 		       subscriptions.daily_index_bytes_limit,
 		       subscriptions.expires_at,
 		       COALESCE(owner_key.tier, 'free') AS owner_tier
@@ -185,6 +209,8 @@ func getOrgOwnerQuotaLimits(orgID string) planQuotaLimits {
 			ORDER BY owners."createdAt", owners.id
 			LIMIT 1
 		) AS canonical_owner
+		LEFT JOIN user_quotas AS overrides
+		  ON overrides.user_id = canonical_owner."userId"
 		LEFT JOIN LATERAL (
 			SELECT active.daily_request_limit,
 			       active.daily_index_bytes_limit,
@@ -199,10 +225,19 @@ func getOrgOwnerQuotaLimits(orgID string) planQuotaLimits {
 			SELECT keys.tier
 			FROM api_keys AS keys
 			WHERE keys.user_id = canonical_owner."userId"
+			  AND (keys.org_id IS NULL OR keys.org_id = $1)
 			ORDER BY (keys.org_id IS NULL) DESC, keys.created_at, keys.id
 			LIMIT 1
 		) AS owner_key ON TRUE
-	`, orgID).Scan(&requestLimit, &indexBytesLimit, &expiresAt, &ownerTier)
+	`, orgID).Scan(
+		&limits.OwnerID,
+		&requestOverride,
+		&indexBytesOverride,
+		&planRequestLimit,
+		&planIndexBytesLimit,
+		&expiresAt,
+		&ownerTier,
+	)
 	switch {
 	case err == sql.ErrNoRows:
 		return limits
@@ -211,15 +246,19 @@ func getOrgOwnerQuotaLimits(orgID string) planQuotaLimits {
 		log.Printf("[QUOTA] organization plan lookup failed (org=%s): %v", orgID, err)
 		return limits
 	}
-	if requestLimit.Valid && indexBytesLimit.Valid && expiresAt.Valid {
-		limits.Request = requestLimit.Int64
-		limits.IndexBytes = indexBytesLimit.Int64
-		limits.ExpiresAt = expiresAt.Time
-		limits.Found = true
-		return limits
-	}
 	limits.Request = int64(tierDailyRequestLimit(ownerTier))
 	limits.IndexBytes = tierIndexBytesLimit(ownerTier)
+	if planRequestLimit.Valid && planIndexBytesLimit.Valid && expiresAt.Valid {
+		limits.Request = planRequestLimit.Int64
+		limits.IndexBytes = planIndexBytesLimit.Int64
+		limits.ExpiresAt = expiresAt.Time
+	}
+	if requestOverride.Valid {
+		limits.Request = requestOverride.Int64
+	}
+	if indexBytesOverride.Valid {
+		limits.IndexBytes = indexBytesOverride.Int64
+	}
 	limits.Found = true
 	return limits
 }
@@ -343,15 +382,15 @@ func memberQuotaLimitCacheKey(orgID, userID string) string {
 // getMemberDailyLimit 查询 org_member_quotas 是否给该组织成员设了个人上限。
 // 缓存键与个人路径的 quota:limit:{user} 分开：两者语义不同（这里要区分
 // "无记录"），且键含 (org, user)，不会跨组织串扰。
-func getMemberDailyLimit(orgID, userID string) (int, bool) {
+func getMemberDailyLimit(orgID, userID string) (int, bool, error) {
 	ctx := context.Background()
 	cacheKey := memberQuotaLimitCacheKey(orgID, userID)
 	if v, err := redisClient.Get(ctx, cacheKey).Result(); err == nil {
 		if v == quotaCacheNoRow {
-			return 0, false
+			return 0, false, nil
 		}
 		if n, convErr := strconv.Atoi(v); convErr == nil {
-			return n, true
+			return n, true, nil
 		}
 	}
 	var dbLimit int
@@ -363,21 +402,24 @@ func getMemberDailyLimit(orgID, userID string) (int, bool) {
 	switch {
 	case err == sql.ErrNoRows:
 		redisClient.Set(ctx, cacheKey, quotaCacheNoRow, quotaCacheTTL)
-		return 0, false
+		return 0, false, nil
 	case err != nil:
-		// DB 故障：跳过成员上限（与请求配额一致的 fail-open），不写缓存
+		// 成员上限是组织授权的一部分。查询失败时不能把“未知”解释为
+		// “未配置”，否则会绕过管理员设置的成员上限。由 HTTP 边界返回 503。
 		log.Printf("[QUOTA] member limit lookup failed (org=%s user=%s): %v", orgID, userID, err)
-		return 0, false
+		return 0, false, err
 	}
 	redisClient.Set(ctx, cacheKey, strconv.Itoa(dbLimit), quotaCacheTTL)
-	return dbLimit, true
+	return dbLimit, true, nil
 }
 
 type orgQuotaLimits struct {
-	Request       int64
-	RequestSet    bool
-	IndexBytes    int64
-	IndexBytesSet bool
+	Request          int64
+	RequestSet       bool
+	RequestPoolID    string
+	IndexBytes       int64
+	IndexBytesSet    bool
+	IndexBytesPoolID string
 }
 
 // org_quotas 的两个维度可独立配置：NULL 表示该维度继承 canonical owner
@@ -399,20 +441,35 @@ func getOrgQuotaLimits(orgID string) orgQuotaLimits {
 	switch {
 	case err == sql.ErrNoRows:
 	case err != nil:
-		// DB 故障：回退 Free 默认且不写缓存，恢复后自动回到正确值。
+		// DB 故障时不能返回未设置的零值：调用方会把它解释为“不限”，形成
+		// 组织请求/索引配额的 fail-open。回退到独立的 Free 组织池且不写缓存，
+		// 数据库恢复后下一次请求会重新解析 canonical owner 权益。
 		log.Printf("[QUOTA] org quota lookup failed (org=%s): %v", orgID, err)
-		return orgQuotaLimits{}
+		return freeOrgQuotaLimits(orgID)
 	}
 	limits := orgQuotaLimits{
-		Request:       reqLimit.Int64,
-		RequestSet:    reqLimit.Valid,
-		IndexBytes:    bytesLimit.Int64,
-		IndexBytesSet: bytesLimit.Valid,
+		Request:          reqLimit.Int64,
+		RequestSet:       reqLimit.Valid,
+		RequestPoolID:    orgID,
+		IndexBytes:       bytesLimit.Int64,
+		IndexBytesSet:    bytesLimit.Valid,
+		IndexBytesPoolID: orgID,
 	}
 	cacheTTL := quotaCacheTTL
 	if !limits.RequestSet || !limits.IndexBytesSet {
 		owner := getOrgOwnerQuotaLimits(orgID)
 		if owner.Failed {
+			// 保留已经成功读取的组织级维度，只对无法继承的维度使用 Free
+			// 默认。这样既不覆盖显式管理员配置，也不会因 owner 查询故障而放开。
+			defaults := freeOrgQuotaLimits(orgID)
+			if !limits.RequestSet {
+				limits.Request = defaults.Request
+				limits.RequestSet = true
+			}
+			if !limits.IndexBytesSet {
+				limits.IndexBytes = defaults.IndexBytes
+				limits.IndexBytesSet = true
+			}
 			return limits
 		}
 		if !owner.Found {
@@ -422,10 +479,16 @@ func getOrgQuotaLimits(orgID string) orgQuotaLimits {
 		if !limits.RequestSet {
 			limits.Request = owner.Request
 			limits.RequestSet = true
+			if owner.OwnerID != "" {
+				limits.RequestPoolID = owner.OwnerID
+			}
 		}
 		if !limits.IndexBytesSet {
 			limits.IndexBytes = owner.IndexBytes
 			limits.IndexBytesSet = true
+			if owner.OwnerID != "" {
+				limits.IndexBytesPoolID = owner.OwnerID
+			}
 		}
 		if !owner.ExpiresAt.IsZero() {
 			cacheTTL = planCacheTTL(owner.ExpiresAt)
@@ -437,26 +500,45 @@ func getOrgQuotaLimits(orgID string) orgQuotaLimits {
 	return limits
 }
 
+func freeOrgQuotaLimits(orgID string) orgQuotaLimits {
+	return orgQuotaLimits{
+		Request:          int64(tierDailyRequestLimit(tierFree)),
+		RequestSet:       true,
+		RequestPoolID:    orgID,
+		IndexBytes:       tierIndexBytesLimit(tierFree),
+		IndexBytesSet:    true,
+		IndexBytesPoolID: orgID,
+	}
+}
+
 func formatOrgQuotaCache(limits orgQuotaLimits) string {
-	return "v2," + strconv.FormatInt(limits.Request, 10) + "," +
-		strconv.FormatInt(limits.IndexBytes, 10)
+	encode := base64.RawURLEncoding.EncodeToString
+	return "v3," + strconv.FormatInt(limits.Request, 10) + "," +
+		strconv.FormatInt(limits.IndexBytes, 10) + "," +
+		encode([]byte(limits.RequestPoolID)) + "," +
+		encode([]byte(limits.IndexBytesPoolID))
 }
 
 func parseOrgQuotaCache(value string) (orgQuotaLimits, bool) {
 	parts := strings.Split(value, ",")
-	if len(parts) != 3 || parts[0] != "v2" {
+	if len(parts) != 5 || parts[0] != "v3" {
 		return orgQuotaLimits{}, false
 	}
 	requestLimit, requestErr := strconv.ParseInt(parts[1], 10, 64)
 	indexBytesLimit, indexBytesErr := strconv.ParseInt(parts[2], 10, 64)
-	if requestErr != nil || indexBytesErr != nil {
+	requestPoolID, requestPoolErr := base64.RawURLEncoding.DecodeString(parts[3])
+	indexBytesPoolID, indexBytesPoolErr := base64.RawURLEncoding.DecodeString(parts[4])
+	if requestErr != nil || indexBytesErr != nil || requestPoolErr != nil || indexBytesPoolErr != nil ||
+		len(requestPoolID) == 0 || len(indexBytesPoolID) == 0 {
 		return orgQuotaLimits{}, false
 	}
 	return orgQuotaLimits{
-		Request:       requestLimit,
-		RequestSet:    true,
-		IndexBytes:    indexBytesLimit,
-		IndexBytesSet: true,
+		Request:          requestLimit,
+		RequestSet:       true,
+		RequestPoolID:    string(requestPoolID),
+		IndexBytes:       indexBytesLimit,
+		IndexBytesSet:    true,
+		IndexBytesPoolID: string(indexBytesPoolID),
 	}, true
 }
 
@@ -527,16 +609,24 @@ type indexQuotaFile struct {
 	Bytes int64
 }
 
-func resolveIndexBytesLimit(tenantID, orgID, tier string) int64 {
+type indexQuotaPool struct {
+	Limit  int64
+	PoolID string
+}
+
+func resolveIndexBytesQuota(tenantID, orgID, tier string) indexQuotaPool {
 	if orgID == "" {
-		return getUserIndexBytesLimit(tenantID, tier)
+		return indexQuotaPool{Limit: getUserIndexBytesLimit(tenantID, tier), PoolID: tenantID}
 	}
-	limit := tierIndexBytesLimit(tierFree)
+	pool := indexQuotaPool{Limit: tierIndexBytesLimit(tierFree), PoolID: orgID}
 	limits := getOrgQuotaLimits(orgID)
 	if limits.IndexBytesSet {
-		limit = limits.IndexBytes
+		pool.Limit = limits.IndexBytes
 	}
-	return limit
+	if limits.IndexBytesPoolID != "" {
+		pool.PoolID = limits.IndexBytesPoolID
+	}
+	return pool
 }
 
 // chargeIndexBytes 保留给非文件级调用和配额单元测试；上传路径使用下面的
@@ -569,13 +659,14 @@ func chargeIndexBytes(tenantID, orgID, tier string, bytes int64) indexQuotaDecis
 }
 
 func chargeIndexBytesQuota(tenantID, orgID, tier string, bytes int64) indexQuotaDecision {
-	limit := resolveIndexBytesLimit(tenantID, orgID, tier)
+	quota := resolveIndexBytesQuota(tenantID, orgID, tier)
+	limit := quota.Limit
 	if limit <= 0 || bytes <= 0 {
 		return indexQuotaDecision{Allowed: true, Limit: limit, Charged: max(bytes, 0)}
 	}
 
 	ctx := context.Background()
-	key := indexBytesKey(tenantID)
+	key := indexBytesKey(quota.PoolID)
 	const chargeScript = `
 		local current = tonumber(redis.call('GET', KEYS[1]) or '0')
 		local requested = tonumber(ARGV[1])
@@ -621,7 +712,8 @@ func chargeIndexFiles(tenantID, orgID, tier, rootID string, files []indexQuotaFi
 			requested += file.Bytes
 		}
 	}
-	limit := resolveIndexBytesLimit(tenantID, orgID, tier)
+	quota := resolveIndexBytesQuota(tenantID, orgID, tier)
+	limit := quota.Limit
 	if requested <= 0 {
 		return indexQuotaDecision{Allowed: true, Limit: limit}
 	}
@@ -676,7 +768,7 @@ func chargeIndexFiles(tenantID, orgID, tier, rootID string, files []indexQuotaFi
 	value, err := redisClient.Eval(
 		context.Background(),
 		reserveFilesScript,
-		[]string{indexBytesKeyAt(tenantID, now), indexFileChargesKeyAt(tenantID, rootID, now)},
+		[]string{indexBytesKeyAt(quota.PoolID, now), indexFileChargesKeyAt(tenantID, rootID, now)},
 		args...,
 	).Result()
 	if err != nil {
@@ -828,7 +920,11 @@ func checkRequestQuotaDetailed(userID, orgID, tier string) requestQuotaDecision 
 	}
 
 	memberLimit := 0
-	if configured, exists := getMemberDailyLimit(orgID, userID); exists {
+	configured, exists, memberErr := getMemberDailyLimit(orgID, userID)
+	if memberErr != nil {
+		return requestQuotaDecision{Unavailable: true}
+	}
+	if exists {
 		memberLimit = configured
 	}
 	orgLimit := int64(tierDailyRequestLimit(tierFree))
@@ -837,17 +933,21 @@ func checkRequestQuotaDetailed(userID, orgID, tier string) requestQuotaDecision 
 		orgLimit = limits.Request
 	}
 	memberKey := "quota:used:org:" + orgID + ":" + userID + ":" + day
-	orgKey := "quota:used:" + orgID + ":" + day
+	poolID := orgID
+	if limits.RequestPoolID != "" {
+		poolID = limits.RequestPoolID
+	}
+	orgKey := "quota:used:" + poolID + ":" + day
 	return reserveRequestQuota(ctx, memberKey, memberLimit, orgKey, int(orgLimit))
 }
 
 // checkRequestQuota 保留既有内部调用契约；需要向客户端返回已用量和作用域时使用
 // checkRequestQuotaDetailed。
 //
-// 个人租户（orgID 空）：完全沿用旧路径（getUserDailyLimit + quota:used:{user}）。
-// 组织租户：先检查成员个人上限（org_member_quotas 有行才检查；计数键按 (org, user)，
-// 与该用户个人密钥的 quota:used:{user} 互不影响），再检查组织共享池
-// （管理员覆盖 → canonical owner 套餐/基础 tier → Free 默认；计数键按 org）。
+// 个人租户（orgID 空）：沿用 getUserDailyLimit + quota:used:{user}。
+// 组织租户：先检查按 (org, user) 隔离的成员上限，再检查权益池。显式 org_quotas
+// 使用独立组织池；继承额度则使用 canonical owner 的同一计数池，因此 owner 的
+// 个人请求及其名下多个组织不会把同一份套餐重复放大。
 func checkRequestQuota(userID, orgID, tier string) (bool, int) {
 	decision := checkRequestQuotaDetailed(userID, orgID, tier)
 	return decision.Allowed, decision.Limit

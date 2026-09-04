@@ -4,6 +4,8 @@
   "cloudToolSurface": [
     "codebase-retrieval",
     "codebase_symbol_graph",
+    "codebase_deep_graph",
+    "codebase_graph_algorithm",
     "codebase_enhance_prompt",
     "codebase_index_status",
     "codebase_git_context",
@@ -193,7 +195,11 @@
       "argument": "repo_path",
       "requiresAbsoluteGitRepository": true,
       "serializedAndDeduplicated": true,
-      "mutuallyExclusiveWith": "root_id",
+      "rootIdValidation": {
+        "whenBothProvided": "resolve_repo_path_then_compare_view_root_id",
+        "onMatch": "continue_and_forward_root_id",
+        "onMismatch": "reject_with_ROOT_NOT_RESOLVED"
+      },
       "forwardedToRelay": false
     }
   },
@@ -368,6 +374,192 @@
         "rerank": "when configured",
         "generation": "required"
       },
+      "writesIndex": false
+    }
+  },
+  "deepGraph": {
+    "$comment": "Root-scoped online deep graph reads use the Neo4j derived projection. tenant_id is injected by Relay; clients select root_id through the current branch view. Global cross-root/repository graph algorithms require a later asynchronous global generation manifest.",
+    "toolName": "codebase_deep_graph",
+    "input": {
+      "requiredFields": ["symbol"],
+      "relayRequiredFields": ["root_id", "symbol"],
+      "optionalFields": [
+        "root_id",
+        "target_symbol",
+        "query_type",
+        "direction",
+        "depth",
+        "limit",
+        "max_nodes",
+        "max_edges",
+        "max_paths",
+        "relationship_types",
+        "required_revision",
+        "allow_stale",
+        "include_evidence",
+        "response_format"
+      ],
+      "relayInjectedFields": ["tenant_id"],
+      "defaults": {
+        "query_type": "impact",
+        "direction": "outgoing",
+        "depth": 6,
+        "limit": 100,
+        "max_nodes": 1000,
+        "max_edges": 5000,
+        "max_paths": 20,
+        "relationship_types": ["CALLS", "TYPE_USES", "IMPORTS", "REFERENCES", "DECLARES"],
+        "allow_stale": false,
+        "include_evidence": false,
+        "response_format": "text"
+      }
+    },
+    "scope": "tenant_root",
+    "freshness": "The handler compares the PostgreSQL projection checkpoint with the active Neo4j generation. Lagging projections fail closed unless allow_stale=true, in which case freshness is marked stale.",
+    "onlineBudgets": {
+      "maxDepth": 64,
+      "maxNodes": 10000,
+      "maxEdges": 50000,
+      "maxPaths": 100
+    },
+    "queryTypes": ["impact", "paths", "cycles", "scc", "centrality", "global_dependencies"],
+    "globalDependencies": "GRAPH_GLOBAL_SCOPE_UNAVAILABLE until a tenant generation manifest and asynchronous global graph jobs are implemented",
+    "jsonEnvelope": {
+      "schemaVersion": "1.0",
+      "requiredFields": ["schemaVersion", "toolName", "ok", "tool", "responseFormat"],
+      "successFields": ["payload"],
+      "errorFields": ["error.message", "error.code"],
+      "errorCodes": [
+        "GRAPH_QUERY_INVALID",
+        "GRAPH_ROOT_REQUIRED",
+        "GRAPH_PROJECTION_NOT_FOUND",
+        "GRAPH_PROJECTION_LAGGING",
+        "GRAPH_SYMBOL_NOT_FOUND",
+        "GRAPH_TARGET_NOT_FOUND",
+        "GRAPH_GLOBAL_SCOPE_UNAVAILABLE",
+        "NEO4J_UNAVAILABLE",
+        "INVALID_ARGUMENTS"
+      ]
+    },
+    "costs": {
+      "readOnly": true,
+      "callsEmbeddingProvider": false,
+      "callsRerankProvider": false,
+      "callsExternalApis": false,
+      "writesIndex": false
+    }
+  },
+  "graphAlgorithms": {
+    "$comment": "Graph algorithms are an asynchronous, tenant-root-generation-scoped contract. The control plane persists jobs and exposes worker lease primitives; an optional Neo4j GDS worker becomes available only after a successful capability probe and a fresh heartbeat. There is no synchronous MCP fallback.",
+    "toolName": "codebase_graph_algorithm",
+    "operations": ["submit", "status"],
+    "input": {
+      "requiredFields": [],
+      "conditionalRequiredFields": {
+        "submit": ["root_id", "algorithm"],
+        "status": ["job_id"]
+      },
+      "optionalFields": [
+        "operation",
+        "root_id",
+        "job_id",
+        "algorithm",
+        "parameters",
+        "result_ttl_seconds",
+        "response_format"
+      ],
+      "relayInjectedFields": ["tenant_id"],
+      "defaults": {
+        "operation": "submit",
+        "parameters": {},
+        "result_ttl_seconds": 3600,
+        "response_format": "text"
+      }
+    },
+    "algorithms": ["scc", "centrality"],
+    "scope": "tenant_root_generation",
+    "jobIdentity": ["tenant_id", "root_id", "generation", "algorithm", "parameters_hash"],
+    "freshness": "A submission requires a ready Neo4j checkpoint and pins the active generation, epoch, and PostgreSQL revision; a later projection generation creates a distinct job identity.",
+    "executor": {
+      "available": false,
+      "mode": "control_plane_only",
+      "healthyMode": "async_worker",
+      "availability": "recent_worker_heartbeat",
+      "synchronousExecution": false,
+      "globalGraphExecution": false
+    },
+    "budgets": {
+      "maxParameterBytes": 16384,
+      "maxResultBytes": 4194304,
+      "minResultTtlSeconds": 60,
+      "maxResultTtlSeconds": 604800
+    },
+    "resultBounds": {
+      "scc": {
+        "componentsTruncatedField": "summary.componentsTruncated",
+        "membersTruncatedField": "components[].membersTruncated"
+      }
+    },
+    "jobFields": [
+      "jobId",
+      "tenantId",
+      "rootId",
+      "generation",
+      "epochId",
+      "revision",
+      "algorithm",
+      "parameters",
+      "resultTtlMs",
+      "parametersHash",
+      "state",
+      "attemptCount",
+      "leaseOwner",
+      "leaseExpiresAt",
+      "lastError",
+      "createdAt",
+      "updatedAt",
+      "completedAt",
+      "result",
+      "resultExpiresAt"
+    ],
+    "lifecycle": ["pending", "leased", "completed", "dead"],
+    "workerGuarantees": [
+      "FOR_UPDATE_SKIP_LOCKED_claim",
+      "lease_owner_and_expiry_fencing",
+      "bounded_retry_and_dead_letter_state",
+      "generation_bound_result_cache",
+      "bounded_result_and_error_storage",
+      "bounded_expiry_and_terminal_job_purge",
+      "gds_capability_probe_before_claim",
+      "fresh_worker_heartbeat",
+      "budget_check_before_projection",
+      "bounded_gds_projection_cleanup",
+      "bounded_scc_member_preview"
+    ],
+    "jsonEnvelope": {
+      "schemaVersion": "1.0",
+      "requiredFields": ["schemaVersion", "operation", "executor", "cacheHit", "job"],
+      "successFields": ["job"],
+      "errorFields": ["error.message", "error.code"],
+      "errorCodes": [
+        "GRAPH_ALGORITHM_GRAPH_NOT_READY",
+        "GRAPH_ALGORITHM_INVALID_ARGUMENTS",
+        "GRAPH_ALGORITHM_INVALID_PARAMETERS",
+        "GRAPH_ALGORITHM_INPUT_TOO_LARGE",
+        "GRAPH_ALGORITHM_JOB_NOT_FOUND",
+        "GRAPH_ALGORITHM_LEASE_LOST",
+        "GRAPH_ALGORITHM_QUERY_FAILED",
+        "GRAPH_ALGORITHM_BUDGET_EXCEEDED",
+        "GRAPH_ALGORITHM_PROJECTION_MISMATCH",
+        "GRAPH_ALGORITHM_EXECUTOR_UNAVAILABLE",
+        "GRAPH_ALGORITHM_CLEANUP_FAILED",
+        "INVALID_ARGUMENTS"
+      ]
+    },
+    "costs": {
+      "onlineGraphTraversal": false,
+      "providerCalls": false,
+      "writesControlPlane": true,
       "writesIndex": false
     }
   },

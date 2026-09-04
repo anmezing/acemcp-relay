@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -45,27 +46,43 @@ func TestGetOrgQuotaLimitsAllowsIndependentInheritedDimensions(t *testing.T) {
 	if !limits.IndexBytesSet || limits.IndexBytes != 50 {
 		t.Fatalf("configured byte limit lost when request is NULL: %+v", limits)
 	}
-	if cached, err := server.Get("quota:limit:orgq:org-null-request"); err != nil || cached != "v2,7,50" {
-		t.Fatalf("resolved org quota cache = %q (%v), want v2,7,50", cached, err)
+	if limits.RequestPoolID != "owner-org-null-request" || limits.IndexBytesPoolID != "org-null-request" {
+		t.Fatalf("inherited and explicit dimensions must use different pools: %+v", limits)
+	}
+	wantCache := formatOrgQuotaCache(limits)
+	if cached, err := server.Get("quota:limit:orgq:org-null-request"); err != nil || cached != wantCache {
+		t.Fatalf("resolved org quota cache = %q (%v), want %q", cached, err, wantCache)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatal(err)
 	}
 }
 
-func TestParseOrgQuotaCacheSupportsOnlyFinalV2Format(t *testing.T) {
+func TestParseOrgQuotaCacheSupportsOnlyFinalV3Format(t *testing.T) {
 	if _, ok := parseOrgQuotaCache("10,20"); ok {
 		t.Fatal("unversioned old cache data must be rejected")
 	}
 	if _, ok := parseOrgQuotaCache("v1,25,n"); ok {
 		t.Fatal("v1 nullable cache data is obsolete and must be rejected")
 	}
-	final, ok := parseOrgQuotaCache("v2,25,250")
+	if _, ok := parseOrgQuotaCache("v2,25,250"); ok {
+		t.Fatal("v2 cache lacks quota-pool identity and must be rejected")
+	}
+	encoded := formatOrgQuotaCache(orgQuotaLimits{
+		Request:          25,
+		RequestSet:       true,
+		RequestPoolID:    "owner-1",
+		IndexBytes:       250,
+		IndexBytesSet:    true,
+		IndexBytesPoolID: "org-1",
+	})
+	final, ok := parseOrgQuotaCache(encoded)
 	if !ok || !final.RequestSet || final.Request != 25 ||
-		!final.IndexBytesSet || final.IndexBytes != 250 {
+		final.RequestPoolID != "owner-1" || !final.IndexBytesSet ||
+		final.IndexBytes != 250 || final.IndexBytesPoolID != "org-1" {
 		t.Fatalf("final cache parse = %+v ok=%v", final, ok)
 	}
-	if _, ok := parseOrgQuotaCache("v2,broken,250"); ok {
+	if _, ok := parseOrgQuotaCache("v3,broken,250,b3duZXItMQ,b3JnLTE"); ok {
 		t.Fatal("invalid cache value must be rejected")
 	}
 }
@@ -82,20 +99,130 @@ func expectOrgOwnerEntitlement(
 	requestLimit, indexBytesLimit, expiresAt interface{},
 	ownerTier string,
 ) {
-	mock.ExpectQuery("SELECT subscriptions.daily_request_limit").
+	expectOrgOwnerQuotaResolution(
+		mock,
+		orgID,
+		"owner-"+orgID,
+		nil,
+		nil,
+		requestLimit,
+		indexBytesLimit,
+		expiresAt,
+		ownerTier,
+	)
+}
+
+func expectOrgOwnerQuotaResolution(
+	mock sqlmock.Sqlmock,
+	orgID, ownerID string,
+	requestOverride, indexBytesOverride interface{},
+	requestLimit, indexBytesLimit, expiresAt interface{},
+	ownerTier string,
+) {
+	mock.ExpectQuery(`SELECT canonical_owner\."userId"`).
 		WithArgs(orgID).
 		WillReturnRows(sqlmock.NewRows([]string{
+			"owner_user_id",
+			"request_override",
+			"index_bytes_override",
 			"daily_request_limit",
 			"daily_index_bytes_limit",
 			"expires_at",
 			"owner_tier",
-		}).AddRow(requestLimit, indexBytesLimit, expiresAt, ownerTier))
+		}).AddRow(
+			ownerID,
+			requestOverride,
+			indexBytesOverride,
+			requestLimit,
+			indexBytesLimit,
+			expiresAt,
+			ownerTier,
+		))
+}
+
+func TestGetOrgOwnerQuotaLimitsDoesNotInheritTierFromUnrelatedOrganization(t *testing.T) {
+	mock, _ := withTierQuotaEnv(t, 7, 70, 700, 7000)
+	mock.ExpectQuery(`(?s)SELECT canonical_owner\."userId".*WHERE keys\.user_id = canonical_owner\."userId".*AND \(keys\.org_id IS NULL OR keys\.org_id = \$1\)`).
+		WithArgs("org-target").
+		WillReturnRows(sqlmock.NewRows([]string{
+			"owner_user_id",
+			"request_override",
+			"index_bytes_override",
+			"daily_request_limit",
+			"daily_index_bytes_limit",
+			"expires_at",
+			"owner_tier",
+		}).AddRow("owner-1", nil, nil, nil, nil, nil, "free"))
+
+	limits := getOrgOwnerQuotaLimits("org-target")
+	if !limits.Found || limits.Request != 7 || limits.IndexBytes != 700 {
+		t.Fatalf("target organization must use only a personal or target-org key tier, got %+v", limits)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestMemberQuotaLimitCacheKeyContract(t *testing.T) {
 	const want = "quota:limit:member:4620fd3c76d86783329c9d16a2f45531b11dd545776ca278e57ecc43888bf922"
 	if got := memberQuotaLimitCacheKey("org-1", "user-1"); got != want {
 		t.Fatalf("member quota cache key = %q, want %q", got, want)
+	}
+}
+
+func TestCheckRequestQuotaFailsClosedWhenMemberLimitLookupFails(t *testing.T) {
+	mock, _ := withTierQuotaEnv(t, 7, 0, 100, 0)
+	mock.ExpectQuery("SELECT daily_limit FROM org_member_quotas").
+		WithArgs("org-member-db-error", "member-1").
+		WillReturnError(errors.New("member quota database unavailable"))
+
+	decision := checkRequestQuotaDetailed("member-1", "org-member-db-error", tierFree)
+	if decision.Allowed || !decision.Unavailable {
+		t.Fatalf("member quota lookup failure must fail closed, got %+v", decision)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestGetOrgQuotaLimitsFallsBackToBoundedFreePoolOnDatabaseFailure(t *testing.T) {
+	mock, server := withTierQuotaEnv(t, 7, 0, 100, 0)
+	mock.ExpectQuery("SELECT daily_request_limit, daily_index_bytes_limit FROM org_quotas").
+		WithArgs("org-db-error").
+		WillReturnError(errors.New("org quota database unavailable"))
+
+	limits := getOrgQuotaLimits("org-db-error")
+	if limits.Request != 7 || !limits.RequestSet || limits.RequestPoolID != "org-db-error" ||
+		limits.IndexBytes != 100 || !limits.IndexBytesSet || limits.IndexBytesPoolID != "org-db-error" {
+		t.Fatalf("database failure must use a bounded Free organization pool, got %+v", limits)
+	}
+	if server.Exists("quota:limit:orgq:org-db-error") {
+		t.Fatal("transient database fallback must not be cached")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestGetOrgQuotaLimitsPreservesExplicitDimensionWhenOwnerLookupFails(t *testing.T) {
+	mock, server := withTierQuotaEnv(t, 7, 0, 100, 0)
+	expectOrgQuotaRow(mock, "org-owner-db-error", int64(11), nil)
+	mock.ExpectQuery(`SELECT canonical_owner\."userId"`).
+		WithArgs("org-owner-db-error").
+		WillReturnError(errors.New("owner entitlement database unavailable"))
+
+	limits := getOrgQuotaLimits("org-owner-db-error")
+	if limits.Request != 11 || !limits.RequestSet || limits.RequestPoolID != "org-owner-db-error" {
+		t.Fatalf("explicit request quota must survive owner lookup failure, got %+v", limits)
+	}
+	if limits.IndexBytes != 100 || !limits.IndexBytesSet || limits.IndexBytesPoolID != "org-owner-db-error" {
+		t.Fatalf("unresolved byte quota must fall back to bounded Free pool, got %+v", limits)
+	}
+	if server.Exists("quota:limit:orgq:org-owner-db-error") {
+		t.Fatal("partially resolved transient fallback must not be cached")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -149,7 +276,14 @@ func TestCheckRequestQuotaFullOrgPoolDoesNotChargeMember(t *testing.T) {
 	if err := server.Set(memberQuotaLimitCacheKey(orgID, userID), "10"); err != nil {
 		t.Fatal(err)
 	}
-	if err := server.Set("quota:limit:orgq:"+orgID, "v2,1,0"); err != nil {
+	if err := server.Set("quota:limit:orgq:"+orgID, formatOrgQuotaCache(orgQuotaLimits{
+		Request:          1,
+		RequestSet:       true,
+		RequestPoolID:    orgID,
+		IndexBytes:       0,
+		IndexBytesSet:    true,
+		IndexBytesPoolID: orgID,
+	})); err != nil {
 		t.Fatal(err)
 	}
 	day := time.Now().In(quotaLocation()).Format("20060102")
@@ -164,6 +298,52 @@ func TestCheckRequestQuotaFullOrgPoolDoesNotChargeMember(t *testing.T) {
 	memberKey := "quota:used:org:" + orgID + ":" + userID + ":" + day
 	if server.Exists(memberKey) {
 		t.Fatalf("full organization pool must not charge member key %q", memberKey)
+	}
+}
+
+func TestInheritedRequestQuotaSharesOwnerPoolAcrossPersonalAndOrganizations(t *testing.T) {
+	_, server := withTierQuotaEnv(t, 3, 0, 100, 0)
+	ownerID := "shared-owner"
+	day := time.Now().In(quotaLocation()).Format("20060102")
+	if err := server.Set("quota:limit:"+ownerID, "3"); err != nil {
+		t.Fatal(err)
+	}
+	for _, pair := range []struct {
+		orgID  string
+		userID string
+	}{{"org-a", "member-a"}, {"org-b", "member-b"}} {
+		if err := server.Set(memberQuotaLimitCacheKey(pair.orgID, pair.userID), quotaCacheNoRow); err != nil {
+			t.Fatal(err)
+		}
+		if err := server.Set("quota:limit:orgq:"+pair.orgID, formatOrgQuotaCache(orgQuotaLimits{
+			Request:          3,
+			RequestSet:       true,
+			RequestPoolID:    ownerID,
+			IndexBytes:       100,
+			IndexBytesSet:    true,
+			IndexBytesPoolID: ownerID,
+		})); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if decision := checkRequestQuotaDetailed(ownerID, "", tierFree); !decision.Allowed {
+		t.Fatalf("owner personal request must use the shared pool: %+v", decision)
+	}
+	if decision := checkRequestQuotaDetailed("member-a", "org-a", tierFree); !decision.Allowed {
+		t.Fatalf("org-a request must use the owner pool: %+v", decision)
+	}
+	if decision := checkRequestQuotaDetailed("member-b", "org-b", tierFree); !decision.Allowed {
+		t.Fatalf("org-b request must use the owner pool: %+v", decision)
+	}
+	if decision := checkRequestQuotaDetailed("member-a", "org-a", tierFree); decision.Allowed || decision.Limit != 3 {
+		t.Fatalf("fourth request must be rejected by the single owner pool: %+v", decision)
+	}
+	if used, err := server.Get("quota:used:" + ownerID + ":" + day); err != nil || used != "3" {
+		t.Fatalf("shared owner counter = %q (%v), want 3", used, err)
+	}
+	if server.Exists("quota:used:org-a:"+day) || server.Exists("quota:used:org-b:"+day) {
+		t.Fatal("inherited organizations must not create independent request pools")
 	}
 }
 
@@ -264,6 +444,70 @@ func TestChargeIndexBytesOrgUsesOrgQuotaAndSharesTenantPool(t *testing.T) {
 	}
 	if decision := chargeIndexBytes("org-1", "org-1", "free", 1); decision.Allowed {
 		t.Fatal("org byte pool is shared: second charge must be rejected")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestInheritedIndexQuotaSharesOwnerPoolAcrossPersonalAndOrganizations(t *testing.T) {
+	_, server := withTierQuotaEnv(t, 0, 0, 100, 0)
+	ownerID := "shared-index-owner"
+	if err := server.Set("quota:limit:indexbytes:"+ownerID, "100"); err != nil {
+		t.Fatal(err)
+	}
+	for _, orgID := range []string{"org-index-a", "org-index-b"} {
+		if err := server.Set("quota:limit:orgq:"+orgID, formatOrgQuotaCache(orgQuotaLimits{
+			Request:          0,
+			RequestSet:       true,
+			RequestPoolID:    ownerID,
+			IndexBytes:       100,
+			IndexBytesSet:    true,
+			IndexBytesPoolID: ownerID,
+		})); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	for _, charge := range []struct {
+		tenantID string
+		orgID    string
+		bytes    int64
+	}{{ownerID, "", 40}, {"org-index-a", "org-index-a", 40}, {"org-index-b", "org-index-b", 20}} {
+		if decision := chargeIndexBytes(charge.tenantID, charge.orgID, tierFree, charge.bytes); !decision.Allowed {
+			t.Fatalf("shared index charge %+v rejected: %+v", charge, decision)
+		}
+	}
+	if decision := chargeIndexBytes("org-index-a", "org-index-a", tierFree, 1); decision.Allowed || decision.Limit != 100 {
+		t.Fatalf("owner index pool must reject bytes over the shared limit: %+v", decision)
+	}
+	if used, err := server.Get(indexBytesKey(ownerID)); err != nil || used != "100" {
+		t.Fatalf("shared owner index counter = %q (%v), want 100", used, err)
+	}
+	if server.Exists(indexBytesKey("org-index-a")) || server.Exists(indexBytesKey("org-index-b")) {
+		t.Fatal("inherited organizations must not create independent index pools")
+	}
+}
+
+func TestInheritedOrganizationQuotaUsesOwnerAdminOverrides(t *testing.T) {
+	mock, _ := withTierQuotaEnv(t, 2, 9, 100, 900)
+	expectOrgQuotaRow(mock, "org-owner-override", nil, nil)
+	expectOrgOwnerQuotaResolution(
+		mock,
+		"org-owner-override",
+		"owner-1",
+		int64(11),
+		int64(1_100),
+		int64(9),
+		int64(900),
+		time.Now().Add(time.Hour),
+		"pro",
+	)
+
+	limits := getOrgQuotaLimits("org-owner-override")
+	if limits.Request != 11 || limits.IndexBytes != 1_100 ||
+		limits.RequestPoolID != "owner-1" || limits.IndexBytesPoolID != "owner-1" {
+		t.Fatalf("owner overrides must define the inherited shared pool: %+v", limits)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatal(err)
