@@ -16,6 +16,8 @@ chmod 600 deploy/.env
 # Set POSTGRES_*, LCE_CLOUD_DATABASE_URL, LCE_TENANT_ASSERTION_SECRET,
 # BETTER_AUTH_SECRET, NEO4J_PASSWORD, and all other production secrets.
 # Keep NEO4J_PORT_BIND=127.0.0.1 unless a firewall rule is intentionally added.
+# NEO4J_PASSWORD is used by Compose to build NEO4J_AUTH; it is intentionally
+# not exported to the Neo4j container as a standalone NEO4J_PASSWORD variable.
 
 ./deploy/deploy.sh
 ```
