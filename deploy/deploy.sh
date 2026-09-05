@@ -55,6 +55,50 @@ verify_contract_snapshots() {
   done
 }
 
+verify_compose_services_stable() {
+  local settle_seconds="${DEPLOY_STABILITY_WAIT_SECONDS:-15}"
+  if [[ ! "$settle_seconds" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: DEPLOY_STABILITY_WAIT_SECONDS must be a non-negative integer" >&2
+    return 1
+  fi
+
+  local service container_id current_id state health before after
+  local -A container_ids=()
+  local -A restart_counts=()
+
+  for service in "$@"; do
+    container_id="$(docker compose "${compose_env_args[@]}" "${compose_profile_args[@]}" ps -q "$service")"
+    if [ -z "$container_id" ]; then
+      echo "ERROR: expected deployment service has no container: $service" >&2
+      return 1
+    fi
+    container_ids["$service"]="$container_id"
+    restart_counts["$service"]="$(docker inspect --format '{{.RestartCount}}' "$container_id")"
+  done
+
+  echo "=== Verifying container stability for ${settle_seconds}s ==="
+  sleep "$settle_seconds"
+
+  for service in "$@"; do
+    container_id="${container_ids[$service]}"
+    current_id="$(docker compose "${compose_env_args[@]}" "${compose_profile_args[@]}" ps -q "$service")"
+    state="$(docker inspect --format '{{.State.Status}}' "$container_id" 2>/dev/null || true)"
+    health="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$container_id" 2>/dev/null || true)"
+    before="${restart_counts[$service]}"
+    after="$(docker inspect --format '{{.RestartCount}}' "$container_id" 2>/dev/null || echo -1)"
+
+    if [ "$current_id" != "$container_id" ] || [ "$state" != "running" ] || \
+       { [ "$health" != "none" ] && [ "$health" != "healthy" ]; } || \
+       [ "$after" -gt "$before" ]; then
+      echo "ERROR: service failed post-deploy stability check: $service" >&2
+      echo "       state=$state health=$health restarts=$before->$after" >&2
+      docker compose "${compose_env_args[@]}" "${compose_profile_args[@]}" ps "$service" >&2 || true
+      docker compose "${compose_env_args[@]}" "${compose_profile_args[@]}" logs --no-color --tail=100 "$service" >&2 || true
+      return 1
+    fi
+  done
+}
+
 prune_docker_resources() {
   if [ "${DEPLOY_PRUNE_DOCKER_RESOURCES:-true}" != "true" ]; then
     echo "=== Docker resource cleanup disabled ==="
@@ -120,9 +164,11 @@ case "${DEPLOY_GRAPH_ALGORITHMS:-false}" in
     ;;
 esac
 
+deployment_services=(neo4j lce neo4j-projector relay frontend "${graph_algorithm_services[@]}")
 docker compose "${compose_env_args[@]}" "${compose_profile_args[@]}" up -d --build --wait --wait-timeout "${DEPLOY_WAIT_TIMEOUT_SECONDS:-180}" \
-  neo4j lce neo4j-projector relay frontend "${graph_algorithm_services[@]}"
+  "${deployment_services[@]}"
 
+verify_compose_services_stable "${deployment_services[@]}"
 prune_docker_resources
 
 echo "=== Done ==="

@@ -26,6 +26,17 @@ The normal deployment starts `neo4j`, `lce`, `neo4j-projector`, `relay`, and
 `frontend`. Neo4j data, logs, and the projector spool use persistent Compose
 volumes. Never run `docker compose down -v` for a routine application update.
 
+All containers that can access host-managed PostgreSQL or Redis share the
+Compose `host.docker.internal:host-gateway` mapping. Keep this mapping on the
+LCE HTTP process, projector, optional algorithm worker, relay, and frontend;
+without it, Linux Docker sidecars cannot resolve the database hostname.
+
+After Compose reports the services started, `deploy.sh` watches their container
+identity, running/health state, and restart count for 15 seconds. This catches
+services without a Docker healthcheck that start and immediately enter a crash
+loop. Set `DEPLOY_STABILITY_WAIT_SECONDS` to a different non-negative number
+only when the production rollout needs a longer observation window.
+
 The deploy script updates repositories independently: LCE follows
 `feat/multi-tenant-relay`, while relay and frontend follow `main`, unless an
 explicit `DEPLOY_REF_*` or `DEPLOY_BRANCH_*` override is supplied.
