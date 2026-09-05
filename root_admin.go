@@ -133,6 +133,8 @@ type latestIndexJobView struct {
 	StartedAt     time.Time
 }
 
+const indexRootStateEmpty = "empty"
+
 // splitRootIDView 从 root_id 派生分组视图：按最后一个 '@' 拆成 (base, branch)。
 // 无 '@'、或拆出的任一侧为空（畸形/历史数据）时不猜测，整个 root_id 作为 base，
 // 分支归入 "default" 视图。
@@ -174,10 +176,17 @@ func loadIndexRoots(ctx context.Context, userID string) ([]indexRootView, error)
 			return nil, err
 		}
 		root.IndexedAt = indexedAt.UTC().Format(time.RFC3339)
-		root.IndexAvailable = true
+		// index_workspaces is written when a job publishes, but an empty
+		// manifest can also publish successfully. An empty snapshot has no
+		// searchable content and must not be advertised as available.
+		root.IndexAvailable = root.FileCount > 0
 		root.BaseRootID, root.ViewBranch = splitRootIDView(root.RootID)
 		root.IndexState = "ready"
 		root.ProgressPercent = 100
+		if !root.IndexAvailable {
+			root.IndexState = indexRootStateEmpty
+			root.ProgressPercent = 0
+		}
 		root.IndexedFiles = int(root.FileCount)
 		root.TotalFiles = int(root.FileCount)
 		rootByKey[root.WorkspaceID+"\x00"+root.RootID] = len(roots)
@@ -313,6 +322,10 @@ func applyIndexJobToRoot(root *indexRootView, job latestIndexJobView) {
 	root.TotalFiles = job.TotalFiles
 	root.FailedFiles = job.FailedFiles
 	root.ProgressPercent = indexProgressPercent(job.IndexedFiles, job.TotalFiles, job.Status)
+	if job.Status == indexJobStatusCompleted && !root.IndexAvailable {
+		root.IndexState = indexRootStateEmpty
+		root.ProgressPercent = 0
+	}
 	root.IndexError = job.Error
 	applyIndexFailureDiagnostic(root, job.Status, job.Error, job.ErrorCode, job.ErrorOrigin, job.Recovery)
 	root.SyncRevision = job.Revision

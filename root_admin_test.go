@@ -218,10 +218,29 @@ func TestHandleListRootsAggregatesFilesAndKeepsEmptyWorkspaceZero(t *testing.T) 
 		}
 		// 空 workspace 的聚合列必须是 0，而不是 null 或缺字段
 		second := response.Roots[2]
-		if second.FileCount != 0 || second.TotalSizeBytes != 0 {
+		if second.FileCount != 0 || second.TotalSizeBytes != 0 || second.IndexAvailable ||
+			second.IndexState != indexRootStateEmpty || second.ProgressPercent != 0 {
 			t.Fatalf("empty workspace must aggregate to zero: %+v", second)
 		}
 	})
+}
+
+func TestApplyIndexJobToRootMarksCompletedEmptySnapshotUnavailable(t *testing.T) {
+	root := indexRootView{
+		FileCount:      0,
+		IndexAvailable: false,
+		IndexState:     indexRootStateEmpty,
+	}
+	applyIndexJobToRoot(&root, latestIndexJobView{
+		Status:       indexJobStatusCompleted,
+		Phase:        "done",
+		TotalFiles:   0,
+		IndexedFiles: 0,
+	})
+
+	if root.IndexState != indexRootStateEmpty || root.IndexAvailable || root.ProgressPercent != 0 {
+		t.Fatalf("completed empty snapshot must remain unavailable: %+v", root)
+	}
 }
 
 func TestLoadIndexRootsMergesLatestProgressAndKeepsUnpublishedFailuresVisible(t *testing.T) {
