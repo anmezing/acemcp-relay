@@ -693,7 +693,7 @@ func handleDeleteRoot(c *gin.Context) {
 	}
 
 	deletedFiles := relayDeleted
-	if lceCount, ok := extractLCEDeletedFiles(result.Content); ok {
+	if lceCount, ok := extractLCEDeletedFiles(result.Content); ok && lceCount > 0 {
 		deletedFiles = lceCount
 	}
 	c.JSON(http.StatusOK, gin.H{"deleted": true, "deleted_files": deletedFiles})

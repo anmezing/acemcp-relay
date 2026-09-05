@@ -735,6 +735,25 @@ func TestHandleDeleteRootPrefersLCEDeletedFileCount(t *testing.T) {
 	})
 }
 
+func TestHandleDeleteRootFallsBackWhenLCEReportsZero(t *testing.T) {
+	resetDeleteRootRateLimit()
+	stubLCEClearIndexRoot(t, func(ctx context.Context, userID, rootID string) (*mcpToolResult, error) {
+		return &mcpToolResult{Content: []byte(`{"deletedFiles":0}`)}, nil
+	})
+	withMockDB(t, func(mock sqlmock.Sqlmock) {
+		mock.ExpectQuery("SELECT EXISTS").
+			WithArgs("user-1", "repo-a").
+			WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
+		expectDeleteRootTx(mock, "user-1", "repo-a", 17)
+
+		c, recorder := newRootAdminContext(t, "user-1", "POST", `{"root_id":"repo-a"}`)
+		handleDeleteRoot(c)
+		if recorder.Code != 200 || !strings.Contains(recorder.Body.String(), `"deleted_files":17`) {
+			t.Fatalf("expected Relay fallback count, got %d %s", recorder.Code, recorder.Body.String())
+		}
+	})
+}
+
 func TestExtractLCEDeletedFiles(t *testing.T) {
 	cases := []struct {
 		content string
