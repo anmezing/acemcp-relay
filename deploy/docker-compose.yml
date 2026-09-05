@@ -5,6 +5,7 @@ services:
   neo4j:
     # Production must pin and review the Neo4j image tag/digest explicitly.
     image: ${NEO4J_IMAGE:?set NEO4J_IMAGE to a validated Neo4j image tag or digest}
+    container_name: neo4j
     restart: unless-stopped
     environment:
       # NEO4J_PASSWORD is a Compose input only. Do not pass it into the Neo4j
@@ -104,6 +105,7 @@ services:
 
   neo4j-projector:
     build: ../../lce
+    container_name: lce-projector
     restart: unless-stopped
     extra_hosts: *host-gateway
     command: ["node", "dist/cloud/neo4jProjectorEntry.js"]
