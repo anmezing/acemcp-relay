@@ -41,6 +41,14 @@ The deploy script updates repositories independently: LCE follows
 `feat/multi-tenant-relay`, while relay and frontend follow `main`, unless an
 explicit `DEPLOY_REF_*` or `DEPLOY_BRANCH_*` override is supplied.
 
+Model configuration saves have a 90-second Relay deadline. Concurrent saves
+return a conflict instead of queueing. Prompt-enhancement and rerank updates
+do not acquire the index-reset barrier, and MCP notification SSE connections
+do not hold that barrier. Embedding switches retain exclusive index protection;
+when an index operation is active, saving returns a conflict without clearing
+indexes or switching configuration. A lost save response is not proof that the
+write failed: reload the current configuration before retrying.
+
 ## HTTP access rollout
 
 Phase 1: the base Compose file does not inject `LCE_HTTP_ALLOWED_HOSTS` or

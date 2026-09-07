@@ -15,6 +15,7 @@ import (
 )
 
 const maxPlatformModelConfigBody = 64 << 10
+const platformModelConfigSaveTimeout = 90 * time.Second
 
 var platformModelConfigSections = map[string]struct{}{
 	"embeddings":     {},
@@ -29,6 +30,10 @@ var (
 
 func platformModelConfigReadBarrier() gin.HandlerFunc {
 	return func(c *gin.Context) {
+		if c.Request.Method == http.MethodGet && c.Request.URL.Path == "/mcp" {
+			c.Next()
+			return
+		}
 		platformModelConfigBarrier.RLock()
 		defer platformModelConfigBarrier.RUnlock()
 		c.Next()
@@ -203,9 +208,12 @@ func handleSavePlatformModelConfig(c *gin.Context) {
 		return
 	}
 
-	platformModelConfigAdminMu.Lock()
+	if !platformModelConfigAdminMu.TryLock() {
+		c.JSON(http.StatusConflict, gin.H{"error": "已有模型配置正在验证或保存，请等待结果后重试"})
+		return
+	}
 	defer platformModelConfigAdminMu.Unlock()
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 6*time.Minute)
+	ctx, cancel := context.WithTimeout(c.Request.Context(), platformModelConfigSaveTimeout)
 	defer cancel()
 
 	config, err := parsePlatformModelConfigPatch(request.Section, request.Config)
@@ -222,11 +230,19 @@ func handleSavePlatformModelConfig(c *gin.Context) {
 		"config": config,
 	})
 	if err != nil {
+		if ctx.Err() != nil {
+			c.JSON(http.StatusGatewayTimeout, gin.H{"error": "模型连接验证已超时或取消，配置未保存"})
+			return
+		}
 		c.JSON(http.StatusBadGateway, gin.H{"error": "LCE 模型连接验证失败"})
 		return
 	}
 	if validatedStatus < 200 || validatedStatus >= 300 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": lceConfigError(validatedData, "模型配置验证失败")})
+		status := http.StatusBadRequest
+		if validatedStatus == http.StatusGatewayTimeout {
+			status = http.StatusGatewayTimeout
+		}
+		c.JSON(status, gin.H{"error": lceConfigError(validatedData, "模型配置验证失败")})
 		return
 	}
 	var validated struct {
@@ -245,8 +261,17 @@ func handleSavePlatformModelConfig(c *gin.Context) {
 		return
 	}
 
-	platformModelConfigBarrier.Lock()
-	defer platformModelConfigBarrier.Unlock()
+	if ctx.Err() != nil {
+		c.JSON(http.StatusGatewayTimeout, gin.H{"error": "模型配置请求已超时或取消，配置未保存"})
+		return
+	}
+	if validated.EmbeddingChanged {
+		if !platformModelConfigBarrier.TryLock() {
+			c.JSON(http.StatusConflict, gin.H{"error": "索引请求正在处理中，未清理索引或切换配置，请稍后重试"})
+			return
+		}
+		defer platformModelConfigBarrier.Unlock()
+	}
 	clearedRelay := clearedRelayIndexes{}
 	if validated.EmbeddingChanged {
 		clearedRelay, err = clearAllRelayIndexState(ctx)
@@ -262,11 +287,15 @@ func handleSavePlatformModelConfig(c *gin.Context) {
 		"validationTicket":      validated.ValidationTicket,
 	})
 	if err != nil {
-		message := "LCE 未切换模型配置；请重试保存"
+		message := "未能确认 LCE 是否已保存配置，请刷新配置核对后再重试"
 		if validated.EmbeddingChanged {
-			message = "Relay 索引状态已清理，但 LCE 未切换配置；请重试保存"
+			message = "Relay 索引状态已清理，但未能确认 LCE 是否已切换配置，请刷新配置核对后再重试"
 		}
-		c.JSON(http.StatusBadGateway, gin.H{
+		status := http.StatusBadGateway
+		if ctx.Err() != nil {
+			status = http.StatusGatewayTimeout
+		}
+		c.JSON(status, gin.H{
 			"error": message,
 		})
 		return

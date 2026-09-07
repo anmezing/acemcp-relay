@@ -4,11 +4,152 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	sqlmock "github.com/DATA-DOG/go-sqlmock"
+	"github.com/gin-gonic/gin"
 )
+
+func platformConfigSaveTestRouter(t *testing.T, embeddingChanged bool) (*gin.Engine, *atomic.Int32) {
+	t.Helper()
+	previousToken, previousURL, previousConfigToken, previousClient := trustedConsoleToken, lcePlatformConfigURL, lcePlatformConfigToken, lce
+	t.Cleanup(func() {
+		trustedConsoleToken, lcePlatformConfigURL, lcePlatformConfigToken, lce = previousToken, previousURL, previousConfigToken, previousClient
+	})
+	configureTrustedConsole("platform-save-test")
+	var saves atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		var body struct {
+			Action string `json:"action"`
+		}
+		if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+			t.Error(err)
+			writer.WriteHeader(400)
+			return
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		if body.Action == "validate" {
+			_ = json.NewEncoder(writer).Encode(map[string]interface{}{"embeddingChanged": embeddingChanged, "validationTicket": "test-ticket"})
+		} else {
+			saves.Add(1)
+			_, _ = writer.Write([]byte(`{"config":{"promptEnhancer":{"enabled":true}}}`))
+		}
+	}))
+	t.Cleanup(upstream.Close)
+	lcePlatformConfigURL, lcePlatformConfigToken = upstream.URL, "config-test-token"
+	lce = &mcpClient{http: upstream.Client()}
+	router := gin.New()
+	router.POST("/internal/platform-model-config", handleSavePlatformModelConfig)
+	return router, &saves
+}
+
+func platformSaveTestRequest() *http.Request {
+	request := httptest.NewRequest(http.MethodPost, "/internal/platform-model-config", strings.NewReader(`{"section":"promptEnhancer","config":{"promptEnhancer":{"enabled":true}}}`))
+	request.Header.Set(consoleTokenHeader, trustedConsoleToken)
+	request.Header.Set("Content-Type", "application/json")
+	return request
+}
+
+func TestPromptConfigSaveDoesNotWaitForIndexReaders(t *testing.T) {
+	router, saves := platformConfigSaveTestRouter(t, false)
+	platformModelConfigBarrier.RLock()
+	released := false
+	defer func() {
+		if !released {
+			platformModelConfigBarrier.RUnlock()
+		}
+	}()
+	recorder := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() { defer close(done); router.ServeHTTP(recorder, platformSaveTestRequest()) }()
+	select {
+	case <-done:
+		if recorder.Code != http.StatusOK || saves.Load() != 1 {
+			t.Fatalf("save status=%d calls=%d body=%s", recorder.Code, saves.Load(), recorder.Body.String())
+		}
+	case <-time.After(time.Second):
+		platformModelConfigBarrier.RUnlock()
+		released = true
+		<-done
+		t.Fatal("prompt-only save waited for the global index barrier")
+	}
+}
+
+func TestPlatformConfigBarrierDoesNotHoldSSEReadLock(t *testing.T) {
+	router := gin.New()
+	router.Use(platformModelConfigReadBarrier())
+	var acquired bool
+	router.GET("/mcp", func(c *gin.Context) {
+		acquired = platformModelConfigBarrier.TryLock()
+		if acquired {
+			platformModelConfigBarrier.Unlock()
+		}
+		c.Status(http.StatusOK)
+	})
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/mcp", nil))
+	if !acquired {
+		t.Fatal("SSE notification handler holds an index read lock for the lifetime of the connection")
+	}
+}
+
+func TestPlatformConfigBarrierStillProtectsDataRequests(t *testing.T) {
+	router := gin.New()
+	router.Use(platformModelConfigReadBarrier())
+	var acquired bool
+	router.POST("/mcp", func(c *gin.Context) {
+		acquired = platformModelConfigBarrier.TryLock()
+		if acquired {
+			platformModelConfigBarrier.Unlock()
+		}
+		c.Status(http.StatusOK)
+	})
+	router.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/mcp", nil))
+	if acquired {
+		t.Fatal("data requests must retain the index read barrier")
+	}
+}
+
+func TestConcurrentPlatformSaveReturnsConflictWithoutQueueing(t *testing.T) {
+	router, saves := platformConfigSaveTestRouter(t, false)
+	platformModelConfigAdminMu.Lock()
+	defer platformModelConfigAdminMu.Unlock()
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, platformSaveTestRequest())
+	if recorder.Code != http.StatusConflict || saves.Load() != 0 {
+		t.Fatalf("status=%d saves=%d", recorder.Code, saves.Load())
+	}
+}
+
+func TestCancelledPlatformValidationNeverSaves(t *testing.T) {
+	router, saves := platformConfigSaveTestRouter(t, false)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, platformSaveTestRequest().WithContext(ctx))
+	if recorder.Code != http.StatusGatewayTimeout || saves.Load() != 0 {
+		t.Fatalf("status=%d saves=%d body=%s", recorder.Code, saves.Load(), recorder.Body.String())
+	}
+}
+
+func TestEmbeddingConfigSaveFailsBeforeClearingAnActiveIndex(t *testing.T) {
+	router, saves := platformConfigSaveTestRouter(t, true)
+	platformModelConfigBarrier.RLock()
+	defer platformModelConfigBarrier.RUnlock()
+	request := httptest.NewRequest(http.MethodPost, "/internal/platform-model-config", strings.NewReader(`{"section":"embeddings","config":{"embeddings":{}},"confirmEmbeddingReset":true}`))
+	request.Header.Set(consoleTokenHeader, trustedConsoleToken)
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusConflict || saves.Load() != 0 {
+		t.Fatalf("status=%d saves=%d", recorder.Code, saves.Load())
+	}
+}
 
 func TestParsePlatformModelConfigPatch(t *testing.T) {
 	tests := []struct {
