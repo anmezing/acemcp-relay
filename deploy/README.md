@@ -41,6 +41,42 @@ The deploy script updates repositories independently: LCE follows
 `feat/multi-tenant-relay`, while relay and frontend follow `main`, unless an
 explicit `DEPLOY_REF_*` or `DEPLOY_BRANCH_*` override is supplied.
 
+## HTTP access rollout
+
+Phase 1: the base Compose file does not inject `LCE_HTTP_ALLOWED_HOSTS` or
+`LCE_HTTP_ALLOWED_ORIGINS`. Authenticated tenant-only mode logs at INFO; missing
+Host/Origin configuration still warns. Filesystem restrictions, tenant
+assertions, and header acceptance remain unchanged in this default rollout.
+Keep LCE on the private network. Do not add `--allow-root` to remove a warning.
+Do not set these new keys in the LCE container's own environment or persisted
+`/data/.env` during phase 1: the cloud entry would explicitly enable them.
+
+Phase 2 is deferred until the Host received by LCE has been confirmed. The
+standard Relay endpoint sends `Host: lce:3000` and no Origin. Additional proxies
+may change Host; the frontend's public domain is not necessarily the right
+value. Uncomment and adjust the example allowlists in `deploy/.env` only after
+this check, then explicitly include the optional overlay. From this directory:
+
+```bash
+docker compose --env-file .env -f docker-compose.yml -f docker-compose.http-access.yml config --quiet
+docker compose --env-file .env -f docker-compose.yml -f docker-compose.http-access.yml up -d --no-deps --build --wait lce
+```
+
+The overlay refuses empty lists instead of guessing defaults. Verify tools/list,
+an authenticated existing-index retrieval, and an isolated test upload after
+activation. Health/readiness probes alone do not verify Host/Origin acceptance.
+Requests without Origin remain accepted; mismatched headers return 403. No index
+rebuild or data-volume removal is involved.
+
+Keep the same explicit `-f` list on subsequent allowlisted deployments. Normal
+`deploy.sh` uses only the base file and will remove overlay-provided allowlists
+when it recreates LCE. To deliberately return to phase 1, recreate only LCE with
+the base file; do not run `down -v` or delete indexes:
+
+```bash
+docker compose --env-file .env -f docker-compose.yml up -d --no-deps --wait lce
+```
+
 ## Enabling graph algorithms
 
 The algorithm worker is not started by the normal rollout. This is deliberate:

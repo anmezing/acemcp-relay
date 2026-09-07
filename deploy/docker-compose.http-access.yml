@@ -1,0 +1,7 @@
+# Phase 2 only: include explicitly after verifying the headers received by LCE.
+# The base deployment intentionally does not load this file.
+services:
+  lce:
+    environment:
+      LCE_HTTP_ALLOWED_HOSTS: "${LCE_HTTP_ALLOWED_HOSTS:?verify the Host forwarded to LCE before enabling HTTP allowlists}"
+      LCE_HTTP_ALLOWED_ORIGINS: "${LCE_HTTP_ALLOWED_ORIGINS:?set the HTTP origins intentionally allowed at LCE}"

@@ -129,6 +129,8 @@ go build -o acemcp-relay .
 
 存活探测走 LCE 的 `GET {LCE_MCP_URL}/health`；部署编排的就绪探测走 `GET {LCE_MCP_URL}/ready`，后者还会确认 PostgreSQL/pgvector schema 与平台 embedding provider 可用。两者都不建立 MCP session。
 
+HTTP 调整分两阶段：默认部署只调整租户模式日志，不注入 Host/Origin 白名单，未配置白名单的安全警告继续保留。确认 LCE 实际收到的请求头后，才通过独立的 `deploy/docker-compose.http-access.yml` 启用白名单，步骤见 [部署说明](deploy/README.md#http-access-rollout)。Relay 不发送 Origin；白名单配错会返回 403。此配置不授予本地文件权限、不改变租户鉴权，也不要求重建索引；不要为了消除日志而添加 `--allow-root`。
+
 升级顺序：先部署 relay（LCE 未配密钥时会忽略该请求头），再给 LCE 配上同一个密钥。反过来会在 relay 更新前中断租户调用。
 
 ### PostgreSQL 配置
