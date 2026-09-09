@@ -49,6 +49,37 @@ when an index operation is active, saving returns a conflict without clearing
 indexes or switching configuration. A lost save response is not proof that the
 write failed: reload the current configuration before retrying.
 
+## Root deletion jobs
+
+Deploy the Cloud deletion deadlines before or together with Relay and the console.
+Relay creates `root_deletion_jobs` during its normal database migration. The
+console now uses `POST /mcp/root-deletions` through `/api/roots/delete`; it returns
+`202` with a durable `deletion` object. `GET /mcp/root-deletions` returns the current
+tenant's active jobs and the latest job per root completed within the last day
+(at most 100, active jobs first). Organization owners can submit; members can read.
+The existing `/mcp/delete-root` endpoint retains its synchronous response contract.
+
+Each Relay process runs two deletion workers. Admission takes at most five seconds
+and returns `409` when the tenant is indexing or deleting another root. Repeating
+an active deletion returns the same task. The persistent active task also blocks
+new indexing until the result is settled, including across Relay restarts.
+Successful Cloud deletion and Relay cleanup keep their original ordering; Relay
+cleanup and the successful task status commit in one transaction.
+
+Cloud deletion has a five-second lock timeout, a 300-second statement limit and
+a 300-second overall cancellation deadline. Other Cloud transactions retain their
+existing limits. Relay allows 400 seconds per attempt, with a 15-minute claim
+window covering a late Cloud call after worker interruption. Lost replies remain
+`running` with an explicit uncertainty message and retry after the claim expires;
+they are not reported as completed or rolled back. Explicit Cloud errors become
+`failed` and may be retried by the user. Terminal task history is pruned in bounded
+batches after seven days; active tasks are never pruned. Inspect `[DELETE_ROOT]`
+logs by job ID for the Cloud and Relay stages and their errors.
+
+Deploying only the new console before Relay makes the task endpoint unavailable;
+it must not silently fall back to long synchronous deletion. Do not remove active
+task rows or release their protection manually after a transport timeout.
+
 ## HTTP access rollout
 
 Phase 1: the base Compose file does not inject `LCE_HTTP_ALLOWED_HOSTS` or

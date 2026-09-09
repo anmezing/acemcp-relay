@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"log"
 	"net/http"
 	"strings"
@@ -444,7 +445,7 @@ type deleteRootOperationLease interface {
 }
 
 var acquireDeleteRootOperation = func(ctx context.Context, tenantID string) (deleteRootOperationLease, error) {
-	return acquireExclusiveIndexOperation(ctx, tenantID, "delete-root")
+	return tryExclusiveIndexOperation(ctx, tenantID, "delete-root")
 }
 
 var acquireDismissRootFailureOperation = func(ctx context.Context, tenantID string) (deleteRootOperationLease, error) {
@@ -637,8 +638,12 @@ func handleDeleteRoot(c *gin.Context) {
 
 	lease, err := acquireDeleteRootOperation(c.Request.Context(), tenantID)
 	if err != nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "索引正在执行其他操作: " + err.Error()})
-		completeRequestLogAsync(getRequestLogEntry(c, http.StatusServiceUnavailable))
+		status := http.StatusServiceUnavailable
+		if errors.Is(err, errIndexOperationBusy) {
+			status = http.StatusConflict
+		}
+		c.JSON(status, gin.H{"error": "索引正在执行其他操作，请稍后重试"})
+		completeRequestLogAsync(getRequestLogEntry(c, status))
 		return
 	}
 	defer lease.Release()

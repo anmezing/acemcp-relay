@@ -116,6 +116,8 @@ func TestInspectActiveIndexJobReclaimsExpiredOwnerBeforeReplacement(t *testing.T
 func TestCreateIndexJobReturnsBusyWithoutCreatingProviderWork(t *testing.T) {
 	now := time.Now()
 	withMockDB(t, func(mock sqlmock.Sqlmock) {
+		mock.ExpectQuery("SELECT EXISTS\\(SELECT 1 FROM root_deletion_jobs").
+			WithArgs("user-a").WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
 		// The request first owns the distributed start-decision lease.
 		expectIndexUserLock(mock, "user-a")
 		mock.ExpectQuery("WITH expired AS").
@@ -171,6 +173,8 @@ func TestCreateIndexJobReturnsBusyWithoutCreatingProviderWork(t *testing.T) {
 
 func TestCreateIndexJobReturnsUnchangedWithoutCreatingProviderWork(t *testing.T) {
 	withMockDB(t, func(mock sqlmock.Sqlmock) {
+		mock.ExpectQuery("SELECT EXISTS\\(SELECT 1 FROM root_deletion_jobs").
+			WithArgs("user-a").WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
 		// Distributed exclusive lease: this serializes the complete start decision
 		// across relay instances, including the no-op fast path.
 		expectIndexUserLock(mock, "user-a")

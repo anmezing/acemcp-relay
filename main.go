@@ -3156,6 +3156,7 @@ func main() {
 
 	go startMCPSessionSweeper(ctx)
 	go startIndexJobSweeper(ctx)
+	go startRootDeletionWorkers(ctx)
 	go startRequestLogReconciler(ctx)
 
 	go func() {
@@ -3234,6 +3235,8 @@ func main() {
 	r.GET("/mcp/roots", handleListRoots)
 	r.POST("/mcp/dismiss-root-failure", handleDismissRootFailure)
 	r.POST("/mcp/delete-root", handleDeleteRoot)
+	r.POST("/mcp/root-deletions", handleCreateRootDeletion)
+	r.GET("/mcp/root-deletions", handleListRootDeletions)
 
 	r.NoRoute(func(c *gin.Context) {
 		if shouldDebugCapture(c.Request.URL.Path) {

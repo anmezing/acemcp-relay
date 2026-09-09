@@ -239,6 +239,28 @@ func migrateIndexingTables() error {
 		CREATE INDEX IF NOT EXISTS idx_index_operation_leases_user
 			ON index_operation_leases(user_id, lease_expires_at);
 
+		CREATE TABLE IF NOT EXISTS root_deletion_jobs (
+			id UUID PRIMARY KEY,
+			user_id VARCHAR(255) NOT NULL,
+			actor_id VARCHAR(255) NOT NULL,
+			root_id VARCHAR(128) NOT NULL,
+			status VARCHAR(16) NOT NULL CHECK (status IN ('queued', 'running', 'succeeded', 'failed')),
+			attempt_id UUID,
+			claim_until TIMESTAMPTZ,
+			deleted_files BIGINT NOT NULL DEFAULT 0,
+			error TEXT NOT NULL DEFAULT '',
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		);
+		CREATE UNIQUE INDEX IF NOT EXISTS idx_root_deletion_jobs_active_tenant
+			ON root_deletion_jobs(user_id) WHERE status IN ('queued', 'running');
+		CREATE INDEX IF NOT EXISTS idx_root_deletion_jobs_tenant_recent
+			ON root_deletion_jobs(user_id, root_id, created_at DESC);
+		CREATE INDEX IF NOT EXISTS idx_root_deletion_jobs_dispatch
+			ON root_deletion_jobs(claim_until, created_at) WHERE status IN ('queued', 'running');
+		CREATE INDEX IF NOT EXISTS idx_root_deletion_jobs_history
+			ON root_deletion_jobs(updated_at) WHERE status IN ('succeeded', 'failed');
+
 		-- 存量库补列。CREATE TABLE IF NOT EXISTS 对已存在的表不生效，
 		-- 因此列的新增必须同时出现在 CREATE 文本（新库）和 ALTER（旧库）两处；
 		-- 只改 CREATE 文本会让升级后的旧库在引用新列的 SQL 上直接报错。

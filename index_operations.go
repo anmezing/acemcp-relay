@@ -2,12 +2,15 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
 )
+
+var errIndexOperationBusy = errors.New("index operation is busy")
 
 type indexOperationMode string
 
@@ -68,22 +71,25 @@ func acquireIndexOperation(
 	}
 	token := uuid.NewString()
 	for {
+		if kind != "delete-root-job" {
+			checkCtx, cancel := context.WithTimeout(ctx, rootDeletionRequestTimeout)
+			var deleting bool
+			err := db.QueryRowContext(checkCtx, `SELECT EXISTS(SELECT 1 FROM root_deletion_jobs
+				WHERE user_id = $1 AND status IN ('queued', 'running'))`, userID).Scan(&deleting)
+			cancel()
+			if err != nil {
+				return nil, err
+			}
+			if deleting {
+				return nil, fmt.Errorf("index deletion in progress; retry after deletion completes: %w", errIndexOperationBusy)
+			}
+		}
 		acquired, err := tryAcquireIndexOperation(ctx, userID, resource, kind, token, mode)
 		if err != nil {
 			return nil, err
 		}
 		if acquired {
-			leaseCtx, cancel := context.WithCancel(ctx)
-			lease := &indexOperationLease{
-				userID: userID,
-				token:  token,
-				ctx:    leaseCtx,
-				cancel: cancel,
-				stop:   make(chan struct{}),
-				done:   make(chan struct{}),
-			}
-			go lease.renew()
-			return lease, nil
+			return newIndexOperationLease(ctx, userID, token), nil
 		}
 
 		timer := time.NewTimer(indexOperationAcquirePoll)
@@ -94,6 +100,32 @@ func acquireIndexOperation(
 		case <-timer.C:
 		}
 	}
+}
+
+func newIndexOperationLease(ctx context.Context, userID, token string) *indexOperationLease {
+	leaseCtx, cancel := context.WithCancel(ctx)
+	lease := &indexOperationLease{
+		userID: userID, token: token, ctx: leaseCtx, cancel: cancel,
+		stop: make(chan struct{}), done: make(chan struct{}),
+	}
+	go lease.renew()
+	return lease
+}
+
+// Only acquisition has a short deadline; the lease belongs to the caller's
+// operation context and must survive that acquisition deadline.
+func tryExclusiveIndexOperation(ctx context.Context, tenantID, kind string) (*indexOperationLease, error) {
+	acquireCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	token := uuid.NewString()
+	acquired, err := tryAcquireIndexOperation(acquireCtx, tenantID, "*", kind, token, indexOperationExclusive)
+	if err != nil {
+		return nil, err
+	}
+	if !acquired {
+		return nil, errIndexOperationBusy
+	}
+	return newIndexOperationLease(ctx, tenantID, token), nil
 }
 
 func tryAcquireIndexOperation(
@@ -116,12 +148,17 @@ func tryAcquireIndexOperation(
 			INSERT INTO index_operation_leases (
 				lease_token, user_id, resource, mode, kind, lease_expires_at
 			)
-			SELECT $1, $2, $3, $4::text, $5, NOW() + ($6 * INTERVAL '1 millisecond')
+			SELECT $1, $2, $3, $4::text, $5::text, NOW() + ($6 * INTERVAL '1 millisecond')
 			WHERE NOT EXISTS (
 				SELECT 1 FROM index_operation_leases
 				WHERE user_id = $2
 				  AND lease_expires_at > NOW()
 				  AND (mode = $7::text OR $4::text = $7::text OR resource = $3)
+			)
+			AND NOT EXISTS (
+				SELECT 1 FROM root_deletion_jobs
+				WHERE user_id = $2 AND status IN ('queued', 'running')
+				  AND $5::text <> 'delete-root-job'
 			)
 			RETURNING 1
 		)
