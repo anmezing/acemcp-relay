@@ -111,7 +111,16 @@ type cloudProtocolContract struct {
 			RelayRequiredFields []string `json:"relayRequiredFields"`
 			OptionalFields      []string `json:"optionalFields"`
 			RelayInjectedFields []string `json:"relayInjectedFields"`
+			Defaults            struct {
+				RelationshipTypes []string `json:"relationship_types"`
+			} `json:"defaults"`
 		} `json:"input"`
+		RelationshipTypes []string `json:"relationshipTypes"`
+		Semantics         string   `json:"semantics"`
+		Freshness         string   `json:"freshness"`
+		JSONEnvelope      struct {
+			ErrorCodes []string `json:"errorCodes"`
+		} `json:"jsonEnvelope"`
 	} `json:"deepGraph"`
 	GraphAlgorithms struct {
 		ToolName string `json:"toolName"`
@@ -533,6 +542,41 @@ func TestContractPinDeepGraphAndAlgorithmPolicies(t *testing.T) {
 		if !reflect.DeepEqual(check.injected, []string{"tenant_id"}) {
 			t.Errorf("unexpected %s relay-injected fields: %v", check.label, check.injected)
 		}
+	}
+	if diff := diffStringSets(
+		"deep graph default relationship types",
+		contract.DeepGraph.Input.Defaults.RelationshipTypes,
+		[]string{"CALLS", "DISPATCHES_TO", "CALL_BOUNDARY"},
+	); diff != "" {
+		t.Error(diff)
+	}
+	if diff := diffStringSets(
+		"deep graph relationship types",
+		contract.DeepGraph.RelationshipTypes,
+		[]string{"CALLS", "DISPATCHES_TO", "CALL_BOUNDARY", "TYPE_USES", "IMPLEMENTS", "EXTENDS", "IMPORTS", "REFERENCES", "DECLARES"},
+	); diff != "" {
+		t.Error(diff)
+	}
+	if !strings.Contains(contract.DeepGraph.Semantics, "target_symbol is optional") ||
+		!strings.Contains(contract.DeepGraph.Semantics, "bounded open discovery") ||
+		!strings.Contains(contract.DeepGraph.Semantics, "Freshness is synchronization") {
+		t.Errorf("deep graph semantics do not document bounded open discovery and freshness honesty: %q", contract.DeepGraph.Semantics)
+	}
+	if !reflect.DeepEqual(contract.DeepGraph.JSONEnvelope.ErrorCodes, []string{
+		"GRAPH_QUERY_INVALID",
+		"GRAPH_QUERY_TIMEOUT",
+		"GRAPH_ROOT_REQUIRED",
+		"GRAPH_PROJECTION_NOT_FOUND",
+		"GRAPH_PROJECTION_LAGGING",
+		"GRAPH_PROJECTION_UPDATING",
+		"GRAPH_PROJECTION_CHANGED",
+		"GRAPH_SYMBOL_NOT_FOUND",
+		"GRAPH_TARGET_NOT_FOUND",
+		"GRAPH_GLOBAL_SCOPE_UNAVAILABLE",
+		"NEO4J_UNAVAILABLE",
+		"INVALID_ARGUMENTS",
+	}) {
+		t.Errorf("deep graph error-code vocabulary drifted: %v", contract.DeepGraph.JSONEnvelope.ErrorCodes)
 	}
 	if !reflect.DeepEqual(contract.GraphAlgorithms.Input.ConditionalRequiredFields, map[string][]string{
 		"submit": {"root_id", "algorithm"},

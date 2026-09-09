@@ -408,14 +408,16 @@
         "max_nodes": 1000,
         "max_edges": 5000,
         "max_paths": 20,
-        "relationship_types": ["CALLS", "TYPE_USES", "IMPORTS", "REFERENCES", "DECLARES"],
+        "relationship_types": ["CALLS", "DISPATCHES_TO", "CALL_BOUNDARY"],
         "allow_stale": false,
         "include_evidence": false,
         "response_format": "text"
       }
     },
     "scope": "tenant_root",
-    "freshness": "The handler compares the PostgreSQL projection checkpoint with the active Neo4j generation. Lagging projections fail closed unless allow_stale=true, in which case freshness is marked stale.",
+    "relationshipTypes": ["CALLS", "DISPATCHES_TO", "CALL_BOUNDARY", "TYPE_USES", "IMPLEMENTS", "EXTENDS", "IMPORTS", "REFERENCES", "DECLARES"],
+    "semantics": "Default traversal follows calls, compiler-confirmed implementation candidates, and terminal external/unresolved call boundaries. DISPATCHES_TO is not a CALLS edge and does not prove runtime receiver or Spring bean selection. TYPE_USES, IMPORTS, DECLARES, REFERENCES, IMPLEMENTS and EXTENDS require explicit opt-in. For paths, target_symbol is optional: omit it for bounded open discovery, or supply it for bounded paths to that target. Mixed-direction or structural paths are classified as associations, never execution chains. Responses expose semantics.direction, relationshipTypes, entryPoints, dispatch, callCoverage, boundaryCount, extractorVersion and each path's classification/direction. Freshness is synchronization, not call-graph completeness.",
+    "freshness": "The handler compares the PostgreSQL projection checkpoint with the active Neo4j generation. Ordinary source lag fails closed unless allow_stale=true. During a proven graph-only stored-source upgrade, the complete prior generation remains readable with stale freshness and readMode=previous_graph_during_upgrade; a newly activated generation can report upgraded_graph_awaiting_acknowledgement. This exception requires the exact upgrade epoch/base/published revision, proven readableRevision floor and projection task, never bypasses required_revision, and rejects a concurrent source change. freshness.upgrade reports state, targetVersion, epochId, baseRevision, readableRevision, publishedRevision and projectionTaskId; it does not grant tenants platform upgrade controls.",
     "onlineBudgets": {
       "maxDepth": 64,
       "maxNodes": 10000,
@@ -431,9 +433,12 @@
       "errorFields": ["error.message", "error.code"],
       "errorCodes": [
         "GRAPH_QUERY_INVALID",
+        "GRAPH_QUERY_TIMEOUT",
         "GRAPH_ROOT_REQUIRED",
         "GRAPH_PROJECTION_NOT_FOUND",
         "GRAPH_PROJECTION_LAGGING",
+        "GRAPH_PROJECTION_UPDATING",
+        "GRAPH_PROJECTION_CHANGED",
         "GRAPH_SYMBOL_NOT_FOUND",
         "GRAPH_TARGET_NOT_FOUND",
         "GRAPH_GLOBAL_SCOPE_UNAVAILABLE",
