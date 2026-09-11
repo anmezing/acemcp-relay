@@ -1235,6 +1235,20 @@ func completeIndexJob(ctx context.Context, userID, jobID string) (indexJobView, 
 		if result.IsError {
 			return indexJobView{}, lceIndexToolError("LCE cloud index publish failed", result.Content)
 		}
+		// LCE publication is durable and intentionally asynchronous. Keep the Relay
+		// job running so the client polls instead of treating an accepted publish as
+		// a completed revision.
+		if publishAccepted(result.Content) {
+			if _, updateErr := db.ExecContext(opCtx, `UPDATE index_jobs SET phase = 'publishing', heartbeat_at = NOW() WHERE id = $1 AND user_id = $2 AND status = $3`, jobID, userID, indexJobStatusRunning); updateErr != nil {
+				return indexJobView{}, updateErr
+			}
+			job, loadErr := loadIndexJob(opCtx, userID, jobID)
+			if loadErr != nil {
+				return indexJobView{}, loadErr
+			}
+			job.Phase, job.Status = "publishing", indexJobStatusRunning
+			return job, nil
+		}
 		cloudRevision, err = extractCloudRevision(result.Content)
 		if err != nil {
 			return indexJobView{}, newIndexUpstreamError("LCE cloud index publish returned an invalid revision: %w", err)
@@ -1334,6 +1348,18 @@ func completeIndexJob(ctx context.Context, userID, jobID string) (indexJobView, 
 		return indexJobView{}, err
 	}
 	return job, nil
+}
+
+func publishAccepted(content []byte) bool {
+	var value map[string]interface{}
+	if json.Unmarshal(content, &value) != nil {
+		return false
+	}
+	if payload, ok := value["payload"].(map[string]interface{}); ok {
+		value = payload
+	}
+	state, _ := value["state"].(string)
+	return state == "publishing"
 }
 
 func beginLCEIndexJob(ctx context.Context, userID, jobID, rootID string, replaceRoot bool) error {

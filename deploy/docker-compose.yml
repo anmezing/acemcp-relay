@@ -144,7 +144,7 @@ services:
       LCE_NEO4J_PROJECTOR_OUTBOX_PURGE_BATCH_SIZE: ${LCE_NEO4J_PROJECTOR_OUTBOX_PURGE_BATCH_SIZE:-1000}
 
   neo4j-algorithm-worker:
-    # Algorithms are an explicit production capability, not part of the normal
+   # Algorithms are an explicit production capability, not part of the normal
     # application rollout. Start with --profile graph-algorithms only after the
     # target Neo4j deployment exposes gds.version().
     profiles: ["graph-algorithms"]
@@ -191,6 +191,30 @@ services:
       LCE_NEO4J_ALGORITHM_JOB_RETENTION_MS: ${LCE_NEO4J_ALGORITHM_JOB_RETENTION_MS:-604800000}
       LCE_NEO4J_ALGORITHM_JOB_PURGE_INTERVAL_MS: ${LCE_NEO4J_ALGORITHM_JOB_PURGE_INTERVAL_MS:-3600000}
       LCE_NEO4J_ALGORITHM_JOB_PURGE_BATCH_SIZE: ${LCE_NEO4J_ALGORITHM_JOB_PURGE_BATCH_SIZE:-100}
+
+  index-publication-worker:
+    build: ../../lce
+    container_name: lce-index-publication-worker
+    restart: unless-stopped
+    command: ["node", "dist/cloud/indexPublicationEntry.js"]
+    extra_hosts: *host-gateway
+    volumes:
+      - lce_data:/data
+    environment:
+      LCE_HOME: /data
+      LCE_CLOUD_DATABASE_URL: ${LCE_CLOUD_DATABASE_URL:?set a PostgreSQL URL whose server has pgvector installed}
+      EMBEDDINGS_PROVIDER: ${EMBEDDINGS_PROVIDER:-}
+      EMBEDDINGS_MODEL: ${EMBEDDINGS_MODEL:-}
+      EMBEDDINGS_BASE_URL: ${EMBEDDINGS_BASE_URL:-}
+      EMBEDDINGS_API_KEY: ${EMBEDDINGS_API_KEY:-}
+      EMBEDDINGS_API_KEYS: ${EMBEDDINGS_API_KEYS:-}
+      EMBEDDINGS_DIMENSIONS: ${EMBEDDINGS_DIMENSIONS:-1024}
+      EMBEDDINGS_OUTPUT_DIMENSION: ${EMBEDDINGS_OUTPUT_DIMENSION:-}
+      EMBEDDINGS_OUTPUT_DTYPE: ${EMBEDDINGS_OUTPUT_DTYPE:-}
+      LCE_CLOUD_DB_POOL_MAX: ${LCE_CLOUD_DB_POOL_MAX:-4}
+    depends_on:
+      lce:
+        condition: service_healthy
 
   relay:
     build: ../
