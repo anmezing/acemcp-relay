@@ -203,6 +203,8 @@ services:
     environment:
       LCE_HOME: /data
       LCE_CLOUD_DATABASE_URL: ${LCE_CLOUD_DATABASE_URL:?set a PostgreSQL URL whose server has pgvector installed}
+      # Decrypts the persisted platform model config this worker loads each iteration.
+      LCE_TENANT_ASSERTION_SECRET: ${LCE_TENANT_ASSERTION_SECRET:?set LCE_TENANT_ASSERTION_SECRET in .env (>=32 chars, shared with lce)}
       EMBEDDINGS_PROVIDER: ${EMBEDDINGS_PROVIDER:-}
       EMBEDDINGS_MODEL: ${EMBEDDINGS_MODEL:-}
       EMBEDDINGS_BASE_URL: ${EMBEDDINGS_BASE_URL:-}
