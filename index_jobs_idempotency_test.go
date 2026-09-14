@@ -38,6 +38,9 @@ func TestIndexJobHeartbeatExpiredUsesShortCreatedWindow(t *testing.T) {
 	if indexJobHeartbeatExpired("indexing", createdHeartbeat, now) {
 		t.Fatal("active upload/index work must retain the normal heartbeat window")
 	}
+	if indexJobHeartbeatExpired("publishing", now.Add(-time.Hour), now) {
+		t.Fatal("server-owned publication must be reconciled from durable status, not expired as client heartbeat")
+	}
 	if got := timedOutIndexJobError("created"); got != "index client disconnected before first upload" {
 		t.Fatalf("unexpected created timeout error: %q", got)
 	}

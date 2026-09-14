@@ -477,6 +477,9 @@ type expiredActiveIndexJob struct {
 }
 
 func indexJobHeartbeatExpired(phase string, heartbeatAt, now time.Time) bool {
+	if phase == "publishing" {
+		return false
+	} // Durable server-owned work; reconciled independently.
 	timeout := indexJobHeartbeatTimeout
 	if phase == "created" {
 		timeout = indexJobInitialUploadTimeout
@@ -911,7 +914,7 @@ func uploadIndexBatch(ctx context.Context, userID string, req indexUploadRequest
 	heartbeatResult, err := db.ExecContext(opCtx, `
 		UPDATE index_jobs
 		SET phase = 'uploading', heartbeat_at = NOW()
-		WHERE id = $1 AND user_id = $2 AND status = $3
+		WHERE id = $1 AND user_id = $2 AND status = $3 AND phase <> 'publishing'
 	`, job.ID, userID, indexJobStatusRunning)
 	if err != nil {
 		return indexBatchResponse{}, err
@@ -1211,6 +1214,9 @@ func completeIndexJob(ctx context.Context, userID, jobID string) (indexJobView, 
 	if err != nil {
 		return indexJobView{}, err
 	}
+	if preStatus == indexJobStatusCompleted {
+		return loadIndexJob(opCtx, userID, jobID)
+	}
 	if preStatus != indexJobStatusRunning {
 		return indexJobView{}, fmt.Errorf("index job is %s", preStatus)
 	}
@@ -1219,6 +1225,16 @@ func completeIndexJob(ctx context.Context, userID, jobID string) (indexJobView, 
 	}
 	if preDeletedCount > 0 && !preDeletionsSent {
 		return indexJobView{}, fmt.Errorf("index job still has pending deletions")
+	}
+	// Commit the handoff BEFORE the network call. A lost response or a Relay
+	// restart must leave recoverable intent, not a client-owned expiring job.
+	intent, err := db.ExecContext(opCtx, `UPDATE index_jobs SET phase = 'publishing', heartbeat_at = NOW()
+		WHERE id = $1 AND user_id = $2 AND status = $3`, jobID, userID, indexJobStatusRunning)
+	if err != nil {
+		return indexJobView{}, err
+	}
+	if count, err := intent.RowsAffected(); err != nil || count != 1 {
+		return indexJobView{}, fmt.Errorf("publication handoff lost running job: %v", err)
 	}
 	var cloudRevision int64
 	if preCloudRevision > 0 {
@@ -1234,6 +1250,9 @@ func completeIndexJob(ctx context.Context, userID, jobID string) (indexJobView, 
 		}
 		if result.IsError {
 			return indexJobView{}, lceIndexToolError("LCE cloud index publish failed", result.Content)
+		}
+		if failure, terminal := publicationFailure(result.Content); terminal {
+			return finishFailedPublication(opCtx, userID, jobID, failure)
 		}
 		// LCE publication is durable and intentionally asynchronous. Keep the Relay
 		// job running so the client polls instead of treating an accepted publish as
@@ -1439,6 +1458,132 @@ func extractCloudRevision(content []byte) (int64, error) {
 	return rev, nil
 }
 
+func publicationFailure(content []byte) (string, bool) {
+	var value map[string]interface{}
+	if json.Unmarshal(content, &value) != nil {
+		return "", false
+	}
+	if payload, ok := value["payload"].(map[string]interface{}); ok {
+		value = payload
+	}
+	state, _ := value["state"].(string)
+	if state != "failed" && state != "cancelled" {
+		return "", false
+	}
+	errText, _ := value["error"].(string)
+	if strings.TrimSpace(errText) == "" {
+		errText = "cloud publication " + state
+	}
+	return errText, true
+}
+
+func publicationState(content []byte) string {
+	var value map[string]interface{}
+	if json.Unmarshal(content, &value) != nil {
+		return ""
+	}
+	if payload, ok := value["payload"].(map[string]interface{}); ok {
+		value = payload
+	}
+	state, _ := value["state"].(string)
+	return state
+}
+
+func finishFailedPublication(ctx context.Context, userID, jobID, failure string) (indexJobView, error) {
+	diagnostic := classifyIndexFailure(indexJobStatusFailed, failure)
+	tx, err := beginLockedIndexUserTx(ctx, userID)
+	if err != nil {
+		return indexJobView{}, err
+	}
+	defer tx.Rollback()
+	updated, err := tx.ExecContext(ctx, `UPDATE index_jobs
+		SET status = $1, phase = 'done', failed_files = total_files - indexed_files,
+			error = $2, error_code = $3, error_origin = $4, recovery = $5,
+			heartbeat_at = NOW(), completed_at = NOW()
+		WHERE id = $6 AND user_id = $7 AND status = $8`,
+		indexJobStatusFailed, failure, diagnostic.Code, diagnostic.Origin, diagnostic.Recovery,
+		jobID, userID, indexJobStatusRunning)
+	if err != nil {
+		return indexJobView{}, err
+	}
+	if count, err := updated.RowsAffected(); err != nil || count != 1 {
+		_ = tx.Rollback()
+		return loadIndexJob(ctx, userID, jobID)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM index_job_files WHERE job_id = $1`, jobID); err != nil {
+		return indexJobView{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return indexJobView{}, err
+	}
+	return loadIndexJob(ctx, userID, jobID)
+}
+
+// Reconcile server-owned publication jobs independently of a connected client.
+// The LCE status operation is idempotent and returns the durable terminal result.
+func reconcileIndexPublications(ctx context.Context) {
+	ctx, stop := context.WithTimeout(ctx, 45*time.Second)
+	defer stop()
+	rows, err := db.QueryContext(ctx, `SELECT id::text, user_id, root_id
+		FROM index_jobs WHERE status = $1 AND phase = 'publishing'
+		ORDER BY heartbeat_at ASC LIMIT 8`, indexJobStatusRunning)
+	if err != nil {
+		log.Printf("[INDEX] publication reconciliation query failed: %v", err)
+		return
+	}
+	defer rows.Close()
+	type candidate struct{ id, user, root string }
+	var jobs []candidate
+	for rows.Next() {
+		var j candidate
+		if err := rows.Scan(&j.id, &j.user, &j.root); err != nil {
+			log.Printf("[INDEX] publication reconciliation scan failed: %v", err)
+			return
+		}
+		jobs = append(jobs, j)
+	}
+	if err := rows.Err(); err != nil {
+		log.Printf("[INDEX] publication reconciliation rows failed: %v", err)
+		return
+	}
+	rows.Close() // Never hold the selection connection over upstream I/O.
+	for _, j := range jobs {
+		if ctx.Err() != nil {
+			return
+		}
+		// Rotate through pending/outage jobs so one oldest task cannot starve others.
+		if _, err := db.ExecContext(ctx, `UPDATE index_jobs SET heartbeat_at = NOW()
+			WHERE id = $1 AND user_id = $2 AND status = $3 AND phase = 'publishing'`, j.id, j.user, indexJobStatusRunning); err != nil {
+			log.Printf("[INDEX] publication scheduling failed job_id=%s: %v", j.id, err)
+			continue
+		}
+		callCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		args := lceIndexJobArgs(j.user, j.id, j.root, "status")
+		result, callErr := lce.callToolWithTimeout(callCtx, "codebase_remote_index", args, 10*time.Second)
+		cancel()
+		if callErr != nil || result == nil || result.IsError {
+			log.Printf("[INDEX] publication status unavailable job_id=%s: %v", j.id, callErr)
+			continue
+		}
+		content := result.Content
+		if failure, terminal := publicationFailure(content); terminal {
+			if _, err := finishFailedPublication(ctx, j.user, j.id, failure); err != nil {
+				log.Printf("[INDEX] publication failure reconciliation failed job_id=%s: %v", j.id, err)
+			}
+			continue
+		}
+		state := publicationState(content)
+		if state == "completed" || state == "not_submitted" {
+			completeCtx, cancelComplete := context.WithTimeout(ctx, 15*time.Second)
+			_, err := completeIndexJob(completeCtx, j.user, j.id)
+			cancelComplete()
+			if err != nil {
+				log.Printf("[INDEX] publication completion reconciliation failed job_id=%s: %v", j.id, err)
+			}
+		}
+	}
+}
+
 type indexJobFailureExecer interface {
 	ExecContext(context.Context, string, ...interface{}) (sql.Result, error)
 }
@@ -1481,6 +1626,15 @@ func failIndexJob(ctx context.Context, userID, jobID, failure string, diagnostic
 	}
 	defer lease.Release()
 	opCtx := lease.Context()
+	// A client timeout/disconnect is not cancellation of server-owned work.
+	// Explicit root deletion retains its own exclusive deletion workflow.
+	current, err := loadIndexJob(opCtx, userID, jobID)
+	if err != nil {
+		return indexJobView{}, err
+	}
+	if current.Phase == "publishing" || current.Status == indexJobStatusCompleted {
+		return current, nil
+	}
 	tx, err := beginLockedIndexUserTx(opCtx, userID)
 	if err != nil {
 		return indexJobView{}, err
@@ -1603,7 +1757,7 @@ func sweepExpiredIndexJobs(ctx context.Context) {
 			FROM index_jobs
 			WHERE status = $2 AND (
 				(phase = 'created' AND heartbeat_at < $3) OR
-				(phase <> 'created' AND heartbeat_at < $4)
+				(phase NOT IN ('created', 'publishing') AND heartbeat_at < $4)
 			)
 			FOR UPDATE SKIP LOCKED
 		)
@@ -1691,6 +1845,7 @@ func startIndexJobSweeper(ctx context.Context) {
 	// 启动后立即收敛上一次进程留下的陈旧任务，不再额外等待首个 ticker。
 	platformModelConfigBarrier.RLock()
 	sweepExpiredIndexJobs(ctx)
+	reconcileIndexPublications(ctx)
 	platformModelConfigBarrier.RUnlock()
 	ticker := time.NewTicker(indexJobSweepInterval)
 	defer ticker.Stop()
@@ -1701,6 +1856,7 @@ func startIndexJobSweeper(ctx context.Context) {
 		case <-ticker.C:
 			platformModelConfigBarrier.RLock()
 			sweepExpiredIndexJobs(ctx)
+			reconcileIndexPublications(ctx)
 			platformModelConfigBarrier.RUnlock()
 		}
 	}

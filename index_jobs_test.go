@@ -313,8 +313,8 @@ func TestAppendCodebaseIndexToolExposesExpectedTools(t *testing.T) {
 	}
 	schema := tools[5]["inputSchema"].(map[string]interface{})
 	operations := schema["oneOf"].([]interface{})
-	if len(operations) != 5 {
-		t.Fatalf("index tool must advertise five lifecycle operations, got %d", len(operations))
+	if len(operations) != 6 {
+		t.Fatalf("index tool must advertise six lifecycle operations, got %d", len(operations))
 	}
 }
 

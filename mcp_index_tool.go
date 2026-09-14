@@ -214,7 +214,7 @@ func codebaseIndexToolDefinition() (json.RawMessage, error) {
 			"The Agent must read the workspace with its native file tools, exclude secrets/binaries/generated dependencies, and call operations in order: " +
 			"start with the complete UTF-8 file manifest and stable root_id; upload only pending_files in bounded batches; " +
 			"call upload once with an empty files array when start reports only deletions; complete after every pending file is accepted; " +
-			"call fail if the workflow cannot finish. status renews both Relay and cloud staging leases. The server injects tenant identity and enforces " +
+			"call fail if upload cannot finish. heartbeat renews active upload leases; status is read-only. After complete, publication is owned and reconciled by the server even if the client disconnects. The server injects tenant identity and enforces " +
 			"SHA-256 content matching, manifest and batch limits, byte quota, model fingerprint, root isolation, deletion handling, and graph finalization.",
 		"inputSchema": map[string]interface{}{
 			"type": "object",
@@ -246,6 +246,7 @@ func codebaseIndexToolDefinition() (json.RawMessage, error) {
 					},
 				},
 				jobOperation("status"),
+				jobOperation("heartbeat"),
 				jobOperation("complete"),
 				map[string]interface{}{
 					"type":                 "object",
@@ -481,7 +482,7 @@ func handleCodebaseIndex(ctx context.Context, userID string, raw map[string]inte
 			Files:  files,
 		})
 
-	case "status":
+	case "status", "heartbeat":
 		var input mcpIndexJobArgs
 		if err := decodeStrictIndexArgs(raw, &input); err != nil {
 			return nil, err
@@ -492,6 +493,31 @@ func handleCodebaseIndex(ctx context.Context, userID string, raw map[string]inte
 		job, err := getIndexJob(ctx, userID, input.JobID)
 		if err != nil {
 			return nil, err
+		}
+		if input.Operation == "heartbeat" {
+			if job.Status == indexJobStatusRunning && job.Phase != "publishing" {
+				_, err = db.ExecContext(ctx, `UPDATE index_jobs SET heartbeat_at = NOW() WHERE id = $1 AND user_id = $2 AND status = $3 AND phase <> 'publishing'`, input.JobID, userID, indexJobStatusRunning)
+				if err != nil {
+					return nil, err
+				}
+				renewCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+				result, renewErr := lce.callToolWithTimeout(renewCtx, "codebase_remote_index",
+					lceIndexJobArgs(userID, input.JobID, job.RootID, "renew"), 10*time.Second)
+				cancel()
+				if renewErr != nil {
+					return nil, newIndexUpstreamError("cloud staging lease renewal failed: %w", renewErr)
+				}
+				if result == nil {
+					return nil, newIndexUpstreamError("cloud staging lease renewal returned no result")
+				}
+				if result.IsError {
+					return nil, lceIndexToolError("cloud staging lease renewal failed", result.Content)
+				}
+				job, err = loadIndexJob(ctx, userID, input.JobID)
+				if err != nil {
+					return nil, err
+				}
+			}
 		}
 		return map[string]interface{}{"job": job}, nil
 
@@ -534,6 +560,6 @@ func handleCodebaseIndex(ctx context.Context, userID string, raw map[string]inte
 		return map[string]interface{}{"job": job}, nil
 
 	default:
-		return nil, fmt.Errorf("operation must be one of: start, upload, status, complete, fail")
+		return nil, fmt.Errorf("operation must be one of: start, upload, status, heartbeat, complete, fail")
 	}
 }
