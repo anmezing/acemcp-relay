@@ -149,6 +149,7 @@ services:
     # target Neo4j deployment exposes gds.version().
     profiles: ["graph-algorithms"]
     build: ../../lce
+    container_name: lce-algo
     restart: unless-stopped
     extra_hosts: *host-gateway
     command: ["node", "dist/cloud/neo4jAlgorithmEntry.js"]
@@ -194,7 +195,7 @@ services:
 
   index-publication-worker:
     build: ../../lce
-    container_name: lce-index-publication-worker
+    container_name: lce-index
     restart: unless-stopped
     command: ["node", "dist/cloud/indexPublicationEntry.js"]
     extra_hosts: *host-gateway
