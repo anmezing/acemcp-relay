@@ -1573,12 +1573,21 @@ func reconcileIndexPublications(ctx context.Context) {
 			continue
 		}
 		state := publicationState(content)
-		if state == "completed" || state == "not_submitted" {
+		if state == "completed" {
 			completeCtx, cancelComplete := context.WithTimeout(ctx, 15*time.Second)
 			_, err := completeIndexJob(completeCtx, j.user, j.id)
 			cancelComplete()
 			if err != nil {
 				log.Printf("[INDEX] publication completion reconciliation failed job_id=%s: %v", j.id, err)
+			}
+		} else if state == "not_submitted" {
+			// The handoff marker was persisted locally, but LCE has no durable
+			// publication for this job. Treating this as completed would publish a
+			// manifest without a cloud revision. Surface a retryable terminal error
+			// so the client can start a fresh index job.
+			if _, err := finishFailedPublication(ctx, j.user, j.id,
+				"cloud publication was not submitted; retry indexing"); err != nil {
+				log.Printf("[INDEX] missing publication reconciliation failed job_id=%s: %v", j.id, err)
 			}
 		}
 	}
