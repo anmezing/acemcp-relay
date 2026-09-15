@@ -27,7 +27,13 @@ import (
 type cloudProtocolContract struct {
 	SchemaVersion    string   `json:"schemaVersion"`
 	CloudToolSurface []string `json:"cloudToolSurface"`
-	CodebaseIndex    struct {
+	ClientSyncTools  []string `json:"clientSyncTools"`
+	SwiftSync        struct {
+		RequiredFields      []string `json:"requiredFields"`
+		OptionalFields      []string `json:"optionalFields"`
+		RelayInjectedFields []string `json:"relayInjectedFields"`
+	} `json:"swiftSync"`
+	CodebaseIndex struct {
 		Operations         []string            `json:"operations"`
 		RequiredFields     map[string][]string `json:"requiredFields"`
 		OptionalFields     map[string][]string `json:"optionalFields"`
@@ -356,8 +362,8 @@ func TestContractPinIndexLimitNegotiation(t *testing.T) {
 
 func TestContractPinIndexStartOutcomes(t *testing.T) {
 	contract := loadCloudProtocolContract(t)
-	if contract.SchemaVersion != "1.9" {
-		t.Fatalf("cloud protocol schema version: got %q, want 1.9", contract.SchemaVersion)
+	if contract.SchemaVersion != "1.10" {
+		t.Fatalf("cloud protocol schema version: got %q, want 1.10", contract.SchemaVersion)
 	}
 	outcomes := contract.CodebaseIndex.StartOutcomes
 	if !reflect.DeepEqual(outcomes.Created.RequiredFields, []string{"job"}) ||
@@ -507,11 +513,34 @@ func TestContractPinRelayServerToolSurfaceMatchesContract(t *testing.T) {
 		}
 	}
 	got := make([]string, 0, len(chatMCPToolPolicies))
+	want = append(want, contract.ClientSyncTools...)
 	for tool := range chatMCPToolPolicies {
 		got = append(got, tool)
 	}
 	if diff := diffStringSets("relay server tool surface", got, want); diff != "" {
 		t.Error(diff)
+	}
+}
+
+func TestContractPinSwiftSyncPolicy(t *testing.T) {
+	contract := loadCloudProtocolContract(t)
+	policy := chatMCPToolPolicies["codebase_swift_sync"]
+	var got []string
+	for key := range policy.arguments {
+		got = append(got, key)
+	}
+	want := append(append([]string{}, contract.SwiftSync.RequiredFields...), contract.SwiftSync.OptionalFields...)
+	if diff := diffStringSets("Swift sync arguments", got, want); diff != "" {
+		t.Fatal(diff)
+	}
+	if !reflect.DeepEqual(contract.SwiftSync.RelayInjectedFields, []string{"tenant_id"}) {
+		t.Fatal("Swift sync must inject authenticated tenant")
+	}
+	if err := validateChatMCPToolArgs("codebase_swift_sync", map[string]interface{}{"operation": "manifest", "root_id": "repo@main", "tenant_id": "forged"}); err == nil {
+		t.Fatal("accepted caller-supplied tenant")
+	}
+	if err := validateChatMCPToolArgs("codebase_swift_sync", map[string]interface{}{"operation": "manifest", "root_id": "repo@main"}); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -553,7 +582,7 @@ func TestContractPinDeepGraphAndAlgorithmPolicies(t *testing.T) {
 	if diff := diffStringSets(
 		"deep graph relationship types",
 		contract.DeepGraph.RelationshipTypes,
-		[]string{"CALLS", "DISPATCHES_TO", "CALL_BOUNDARY", "TYPE_USES", "IMPLEMENTS", "EXTENDS", "IMPORTS", "REFERENCES", "DECLARES"},
+		[]string{"CALLS", "DISPATCHES_TO", "CALL_BOUNDARY", "TYPE_USES", "IMPLEMENTS", "EXTENDS", "IMPORTS", "REFERENCES", "DECLARES", "CONTAINS"},
 	); diff != "" {
 		t.Error(diff)
 	}

@@ -86,6 +86,7 @@ func TestRelayOwnsIndexStatusWhenUpstreamAlsoExposesIt(t *testing.T) {
 		{"name":"codebase_deep_graph","inputSchema":{"type":"object","properties":{"root_id":{"type":"string"},"symbol":{"type":"string"}}}},
 		{"name":"codebase_graph_algorithm","inputSchema":{"type":"object","properties":{"operation":{"type":"string"},"root_id":{"type":"string"},"job_id":{"type":"string"},"algorithm":{"type":"string"}}}},
 		{"name":"codebase_enhance_prompt","inputSchema":{"type":"object","properties":{"prompt":{"type":"string"}}}},
+		{"name":"codebase_swift_sync","inputSchema":{"type":"object","properties":{"operation":{"type":"string"},"root_id":{"type":"string"}}}},
 		{"name":"codebase_index_status","inputSchema":{"type":"object","properties":{"repo_path":{"type":"string"}}}}
 	]`)
 

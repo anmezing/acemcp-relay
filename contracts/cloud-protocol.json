@@ -1,6 +1,16 @@
 {
   "$comment": "三仓库（lce / relay / 前端）共享云协议契约的单一源头。relay 与前端提交本文件的精确快照，独立 CI 直接读取快照且缺失即失败；修改本文件必须三仓同步。",
-  "schemaVersion": "1.9",
+  "schemaVersion": "1.10",
+  "clientSyncTools": ["codebase_swift_sync"],
+  "swiftSync": {
+    "operations": ["manifest", "plan", "begin", "upload", "publish", "status", "abort"],
+    "requiredFields": ["operation", "root_id"],
+    "optionalFields": ["epoch_id", "revision", "path", "job_id", "snapshot_hash", "byte_count", "part_count", "part", "data", "response_format"],
+    "relayInjectedFields": ["tenant_id"],
+    "partBytes": 262144,
+    "maxParts": 512,
+    "sourceReadinessIndependent": true
+  },
   "cloudToolSurface": [
     "codebase-retrieval",
     "codebase_symbol_graph",
@@ -231,6 +241,7 @@
       "ROOT_NOT_A_GIT_REPO"
     ],
     "statusFields": [
+      "compiler_status",
       "root_id",
       "phase",
       "index_available",
@@ -360,14 +371,14 @@
         "payload.enhancedPrompt",
         "payload.references",
         "payload.warnings",
-        "payload.retrieval"
+        "payload.retrieval",
+        "payload.retrieval.mode"
       ],
       "errorFields": [
         "error.message",
         "error.code"
       ],
       "errorCodes": [
-        "PROMPT_ENHANCER_NOT_CONFIGURED",
         "INVALID_ARGUMENTS",
         "TENANT_ACCESS_DENIED"
       ]
@@ -377,7 +388,7 @@
       "providerCalls": {
         "embedding": "required",
         "rerank": "when configured",
-        "generation": "required"
+        "generation": "when configured; otherwise deterministic fallback with no generation call"
       },
       "writesIndex": false
     }
@@ -420,8 +431,8 @@
       }
     },
     "scope": "tenant_root",
-    "relationshipTypes": ["CALLS", "DISPATCHES_TO", "CALL_BOUNDARY", "TYPE_USES", "IMPLEMENTS", "EXTENDS", "IMPORTS", "REFERENCES", "DECLARES"],
-    "semantics": "Default traversal follows calls, compiler-confirmed implementation candidates, and terminal external/unresolved call boundaries. DISPATCHES_TO is not a CALLS edge and does not prove runtime receiver or Spring bean selection. TYPE_USES, IMPORTS, DECLARES, REFERENCES, IMPLEMENTS and EXTENDS require explicit opt-in. For paths, target_symbol is optional: omit it for bounded open discovery, or supply it for bounded paths to that target. Mixed-direction or structural paths are classified as associations, never execution chains. Responses expose semantics.direction, relationshipTypes, entryPoints, dispatch, callCoverage, boundaryCount, extractorVersion and each path's classification/direction. Freshness is synchronization, not call-graph completeness.",
+    "relationshipTypes": ["CALLS", "DISPATCHES_TO", "CALL_BOUNDARY", "TYPE_USES", "IMPLEMENTS", "EXTENDS", "IMPORTS", "REFERENCES", "DECLARES", "CONTAINS"],
+    "semantics": "Default traversal follows calls, compiler-confirmed implementation candidates, and terminal external/unresolved call boundaries. DISPATCHES_TO is not a CALLS edge and does not prove runtime receiver or Spring bean selection. TYPE_USES, IMPORTS, DECLARES, REFERENCES, IMPLEMENTS and EXTENDS require explicit opt-in. For paths, target_symbol is optional: omit it for bounded open discovery, or supply it for bounded paths to that target. Mixed-direction or structural paths are classified as associations, never execution chains. Online centrality is undirected degree over the bounded neighborhood before display packing; asynchronous graph algorithms have their own explicit method/orientation parameters. Responses expose semantics.direction, relationshipTypes, entryPoints, dispatch, callCoverage, boundaryCount, extractorVersion and each path's classification/direction. Freshness is synchronization, not call-graph completeness.",
     "freshness": "The handler compares the PostgreSQL projection checkpoint with the active Neo4j generation. Ordinary source lag fails closed unless allow_stale=true. During a proven graph-only stored-source upgrade, the complete prior generation remains readable with stale freshness and readMode=previous_graph_during_upgrade; a newly activated generation can report upgraded_graph_awaiting_acknowledgement. This exception requires the exact upgrade epoch/base/published revision, proven readableRevision floor and projection task, never bypasses required_revision, and rejects a concurrent source change. freshness.upgrade reports state, targetVersion, epochId, baseRevision, readableRevision, publishedRevision and projectionTaskId; it does not grant tenants platform upgrade controls.",
     "onlineBudgets": {
       "maxDepth": 64,

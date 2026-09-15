@@ -1730,6 +1730,11 @@ var chatMCPToolPolicies = map[string]chatMCPToolPolicy{
 		),
 		required: stringSet(),
 	},
+	"codebase_swift_sync": {
+		description: "Automatic build-host Swift compiler synchronization. Source manifest and plan preparation, bounded snapshot upload, and asynchronous publication. The service supplies authenticated tenant identity.",
+		arguments:   stringSet("operation", "root_id", "epoch_id", "revision", "path", "job_id", "snapshot_hash", "byte_count", "part_count", "part", "data", "response_format"),
+		required:    stringSet("operation", "root_id"),
+	},
 	"codebase_enhance_prompt": {
 		description: "Use when the user explicitly asks to enhance or refine a coding prompt, or asks for a code-grounded implementation brief before coding. Pass the complete original request in prompt and known symbols, file names, or error codes in technical_terms. The result contains goals, requirements, constraints, verified code references, verification steps, and open questions. Treat it as supplemental: the original request remains authoritative. Do not call automatically for every ordinary coding task. The service supplies tenant identity; root_id may scope the request to one indexed branch view.",
 		arguments: stringSet(

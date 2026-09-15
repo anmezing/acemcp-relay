@@ -179,6 +179,7 @@ func TestFilterChatMCPToolsHidesIndexManagementTools(t *testing.T) {
 		{"name":"codebase_enhance_prompt","description":"enhance","inputSchema":{"type":"object","properties":{"prompt":{"type":"string"},"technical_terms":{"type":"array"},"root_id":{"type":"string"},"output_language":{"type":"string"},"response_format":{"type":"string"},"tenant_id":{"type":"string"}},"required":["tenant_id","prompt"]}},
 		{"name":"codebase_tenant_stats","description":"stats","inputSchema":{"type":"object","properties":{"response_format":{"type":"string"}}}},
 		{"name":"future_admin_tool","description":"must stay private"}
+		,{"name":"codebase_swift_sync","inputSchema":{"type":"object","properties":{"tenant_id":{"type":"string"},"operation":{"type":"string"},"root_id":{"type":"string"}}}}
 	]`)
 	filtered, err := filterChatMCPTools(raw)
 	if err != nil {
@@ -194,7 +195,7 @@ func TestFilterChatMCPToolsHidesIndexManagementTools(t *testing.T) {
 	for i, tool := range tools {
 		got[i] = tool.Name
 	}
-	if !reflect.DeepEqual(got, []string{"codebase-retrieval", "codebase_symbol_graph", "codebase_deep_graph", "codebase_graph_algorithm", "codebase_enhance_prompt"}) {
+	if !reflect.DeepEqual(got, []string{"codebase-retrieval", "codebase_symbol_graph", "codebase_deep_graph", "codebase_graph_algorithm", "codebase_enhance_prompt", "codebase_swift_sync"}) {
 		t.Fatalf("unexpected chat MCP tools: %#v", got)
 	}
 }
@@ -242,7 +243,8 @@ func TestPromptEnhancementPolicyHidesTenantAndRejectsCallerOverride(t *testing.T
 		{"name":"codebase_symbol_graph","inputSchema":{"type":"object","properties":{"root_id":{"type":"string"},"symbol":{"type":"string"}}}},
 		{"name":"codebase_deep_graph","inputSchema":{"type":"object","properties":{"tenant_id":{"type":"string"},"root_id":{"type":"string"},"symbol":{"type":"string"}}}},
 		{"name":"codebase_graph_algorithm","inputSchema":{"type":"object","properties":{"tenant_id":{"type":"string"},"operation":{"type":"string"}}}},
-		{"name":"codebase_enhance_prompt","inputSchema":{"type":"object","properties":{"tenant_id":{"type":"string"},"prompt":{"type":"string"},"root_id":{"type":"string"}},"required":["tenant_id","prompt"]}}
+		{"name":"codebase_enhance_prompt","inputSchema":{"type":"object","properties":{"tenant_id":{"type":"string"},"prompt":{"type":"string"},"root_id":{"type":"string"}},"required":["tenant_id","prompt"]}},
+		{"name":"codebase_swift_sync","inputSchema":{"type":"object","properties":{"operation":{"type":"string"},"root_id":{"type":"string"}}}}
 	]`)
 	filtered, err := filterChatMCPTools(raw)
 	if err != nil {
@@ -291,7 +293,8 @@ func TestAppendCodebaseIndexToolExposesExpectedTools(t *testing.T) {
 		{"name":"codebase_symbol_graph","inputSchema":{"type":"object","properties":{"root_id":{"type":"string"},"symbol":{"type":"string"}}}},
 		{"name":"codebase_deep_graph","inputSchema":{"type":"object","properties":{"root_id":{"type":"string"},"symbol":{"type":"string"}}}},
 		{"name":"codebase_graph_algorithm","inputSchema":{"type":"object","properties":{}}},
-		{"name":"codebase_enhance_prompt","inputSchema":{"type":"object","properties":{"prompt":{"type":"string"}}}}
+		{"name":"codebase_enhance_prompt","inputSchema":{"type":"object","properties":{"prompt":{"type":"string"}}}},
+		{"name":"codebase_swift_sync","inputSchema":{"type":"object","properties":{"operation":{"type":"string"},"root_id":{"type":"string"}}}}
 	]`)
 	filtered, err := filterChatMCPTools(raw)
 	if err != nil {
@@ -305,13 +308,13 @@ func TestAppendCodebaseIndexToolExposesExpectedTools(t *testing.T) {
 	if err := json.Unmarshal(combined, &tools); err != nil {
 		t.Fatal(err)
 	}
-	if len(tools) != 6 {
-		t.Fatalf("remote MCP must expose exactly six tools, got %d", len(tools))
+	if len(tools) != 7 {
+		t.Fatalf("remote MCP must expose exactly seven tools, got %d", len(tools))
 	}
-	if tools[5]["name"] != codebaseIndexToolName {
-		t.Fatalf("sixth tool must be %s, got %#v", codebaseIndexToolName, tools[5]["name"])
+	if tools[6]["name"] != codebaseIndexToolName {
+		t.Fatalf("seventh tool must be %s, got %#v", codebaseIndexToolName, tools[6]["name"])
 	}
-	schema := tools[5]["inputSchema"].(map[string]interface{})
+	schema := tools[6]["inputSchema"].(map[string]interface{})
 	operations := schema["oneOf"].([]interface{})
 	if len(operations) != 6 {
 		t.Fatalf("index tool must advertise six lifecycle operations, got %d", len(operations))
