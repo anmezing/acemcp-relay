@@ -3,6 +3,7 @@ WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download
 COPY *.go ./
+COPY contracts/cloud-index-path-policy.json ./contracts/cloud-index-path-policy.json
 RUN CGO_ENABLED=0 go build -o lce-relay .
 
 FROM alpine:3

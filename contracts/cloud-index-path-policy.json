@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "caseSensitive": false,
+  "excludedSegments": [".git", "node_modules", ".turbo", "dist", "build", ".next", "__pycache__"],
+  "excludedBasenames": [".env", "package-lock.json", "yarn.lock", "pnpm-lock.yaml"],
+  "excludedBasenamePrefixes": [".env."],
+  "excludedBasenameSuffixes": [".min.js", ".min.css"],
+  "excludedExtensions": [".pyc", ".class", ".o", ".so", ".dll", ".exe", ".wasm", ".map", ".pem", ".key", ".cert", ".png", ".jpg", ".jpeg", ".gif", ".ico", ".svg", ".woff", ".woff2", ".ttf", ".eot", ".mp3", ".mp4", ".zip", ".tar", ".gz", ".rar", ".pdf"]
+}

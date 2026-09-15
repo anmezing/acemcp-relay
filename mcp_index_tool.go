@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"path"
 	"regexp"
 	"strings"
 	"sync"
@@ -331,24 +330,7 @@ func validateIndexSourcePath(value string) (string, error) {
 	if normalized == "" {
 		return "", fmt.Errorf("index path is required")
 	}
-	lower := strings.ToLower(normalized)
-	segments := strings.Split(lower, "/")
-	for _, segment := range segments {
-		switch segment {
-		case ".git", "node_modules", ".turbo", "dist", "build", ".next", "__pycache__":
-			return "", fmt.Errorf("index path is excluded: %s", normalized)
-		}
-	}
-	base := path.Base(lower)
-	if base == ".env" || strings.HasPrefix(base, ".env.") ||
-		base == "package-lock.json" || base == "yarn.lock" || base == "pnpm-lock.yaml" ||
-		strings.HasSuffix(base, ".min.js") || strings.HasSuffix(base, ".min.css") {
-		return "", fmt.Errorf("index path is excluded: %s", normalized)
-	}
-	switch path.Ext(base) {
-	case ".pyc", ".class", ".o", ".so", ".dll", ".exe", ".wasm", ".map", ".pem", ".key", ".cert",
-		".png", ".jpg", ".jpeg", ".gif", ".ico", ".svg", ".woff", ".woff2", ".ttf", ".eot", ".mp3",
-		".mp4", ".zip", ".tar", ".gz", ".rar", ".pdf":
+	if isCloudIndexPathExcluded(normalized) {
 		return "", fmt.Errorf("index path is excluded: %s", normalized)
 	}
 	return normalized, nil
