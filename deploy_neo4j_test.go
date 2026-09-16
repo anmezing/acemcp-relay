@@ -65,6 +65,16 @@ func TestProductionHostDatabaseServicesMapDockerHostGateway(t *testing.T) {
 	}
 }
 
+func TestProductionDrainingServicesHaveShutdownGrace(t *testing.T) {
+	compose := readProductionCompose(t)
+	for _, service := range []string{"index-publication-worker", "relay"} {
+		serviceBlock := productionComposeService(t, compose, service)
+		if !strings.Contains(serviceBlock, "\n    stop_grace_period: 45s\n") {
+			t.Errorf("%s must allow its bounded shutdown drain to finish before Docker kills it", service)
+		}
+	}
+}
+
 func TestProductionDeployDetectsImmediateContainerCrashLoops(t *testing.T) {
 	raw, err := os.ReadFile("deploy/deploy.sh")
 	if err != nil {

@@ -53,6 +53,12 @@ verify_contract_snapshots() {
       return 1
     fi
   done
+  canonical="$LCE_DIR/docs/contracts/cloud-index-path-policy.json"
+  snapshot="$RELAY_DIR/contracts/cloud-index-path-policy.json"
+  if [ ! -f "$canonical" ] || [ ! -f "$snapshot" ] || ! cmp -s "$canonical" "$snapshot"; then
+    echo "ERROR: cloud index path policy snapshot is missing or stale: $snapshot" >&2
+    return 1
+  fi
 }
 
 verify_compose_services_stable() {
@@ -144,6 +150,11 @@ cd "$SCRIPT_DIR"
 # intentionally a separate opt-in Compose profile; enabling it requires a
 # validated GDS capability and an explicit operator action.
 compose_env_args=(--env-file "$DEPLOY_ENV_FILE")
+case "${DEPLOY_HTTP_ACCESS:-false}" in
+  false) ;;
+  true) compose_env_args+=(-f "$SCRIPT_DIR/docker-compose.yml" -f "$SCRIPT_DIR/docker-compose.http-access.yml") ;;
+  *) echo "ERROR: DEPLOY_HTTP_ACCESS must be true or false" >&2; exit 1 ;;
+esac
 compose_profile_args=()
 graph_algorithm_services=()
 case "${DEPLOY_GRAPH_ALGORITHMS:-false}" in
@@ -164,7 +175,7 @@ case "${DEPLOY_GRAPH_ALGORITHMS:-false}" in
     ;;
 esac
 
-deployment_services=(neo4j lce neo4j-projector relay frontend "${graph_algorithm_services[@]}")
+deployment_services=(neo4j lce index-publication-worker neo4j-projector relay frontend "${graph_algorithm_services[@]}")
 docker compose "${compose_env_args[@]}" "${compose_profile_args[@]}" up -d --build --wait --wait-timeout "${DEPLOY_WAIT_TIMEOUT_SECONDS:-180}" \
   "${deployment_services[@]}"
 

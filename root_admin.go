@@ -439,6 +439,14 @@ var lceClearIndexRoot = func(ctx context.Context, userID, rootID string) (*mcpTo
 	}, remoteIndexMCPCallTimeout)
 }
 
+var lceClearIndexRootOperation = func(ctx context.Context, tenantID, rootID, operationID string) (*mcpToolResult, error) {
+	return lce.callToolWithTimeout(ctx, "codebase_clear_index", map[string]interface{}{
+		"tenant_id":    tenantID,
+		"root_id":      lceIndexRootID(rootID),
+		"operation_id": operationID,
+	}, remoteIndexMCPCallTimeout)
+}
+
 type deleteRootOperationLease interface {
 	Context() context.Context
 	Release()

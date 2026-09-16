@@ -26,6 +26,10 @@ const ContextKeyMetricsPath = "metrics_path"
 var metricsRegistry = prometheus.NewRegistry()
 
 var (
+	metricPublicationRecovery = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "relay_publication_recovery_total",
+		Help: "Publication recovery observations; overdue work retains its fence until cancellation is confirmed.",
+	}, []string{"result"})
 	metricHTTPRequests = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "relay_http_requests_total",
 		Help: "Total HTTP requests handled by the relay, by normalized route template.",
@@ -62,6 +66,7 @@ var (
 
 func init() {
 	metricsRegistry.MustRegister(
+		metricPublicationRecovery,
 		metricHTTPRequests,
 		metricHTTPDuration,
 		metricVersionGate,

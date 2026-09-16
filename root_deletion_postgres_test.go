@@ -14,7 +14,8 @@ import (
 	"github.com/lib/pq"
 )
 
-func TestRootDeletionPostgres(t *testing.T) {
+func withIsolatedRelayPostgres(t *testing.T) {
+	t.Helper()
 	dsn := os.Getenv("LCE_RELAY_TEST_DATABASE_URL")
 	if dsn == "" {
 		t.Skip("LCE_RELAY_TEST_DATABASE_URL is required for isolated PostgreSQL tests")
@@ -27,16 +28,16 @@ func TestRootDeletionPostgres(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer admin.Close()
+	t.Cleanup(func() { admin.Close() })
 	schema := "root_deletion_test_" + uuid.New().String()
 	if _, err := admin.Exec("CREATE SCHEMA " + pq.QuoteIdentifier(schema)); err != nil {
 		t.Fatal(err)
 	}
-	defer func() {
+	t.Cleanup(func() {
 		if _, err := admin.Exec("DROP SCHEMA " + pq.QuoteIdentifier(schema) + " CASCADE"); err != nil {
 			t.Error(err)
 		}
-	}()
+	})
 	query := u.Query()
 	query.Set("search_path", schema)
 	u.RawQuery = query.Encode()
@@ -44,13 +45,17 @@ func TestRootDeletionPostgres(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer isolated.Close()
+	t.Cleanup(func() { isolated.Close() })
 	previous := db
 	db = isolated
-	defer func() { db = previous }()
+	t.Cleanup(func() { db = previous })
 	if err := migrateIndexingTables(); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestRootDeletionPostgres(t *testing.T) {
+	withIsolatedRelayPostgres(t)
 	ctx := context.Background()
 	resetDeleteRootRateLimit()
 	seed := func(tenant, root string) {
@@ -116,7 +121,7 @@ func TestRootDeletionPostgres(t *testing.T) {
 		if tenant != "alice" || root != "repo-a" {
 			t.Fatalf("wrong cloud deletion identity: %s/%s", tenant, root)
 		}
-		return &mcpToolResult{Content: []byte(`{"deleted_files":7}`)}, nil
+		return rootDeletionCloudResult(newAttempt, 7), nil
 	})
 	processRootDeletion(ctx, oldAttempt)
 	if calls != 0 || files("alice") != 1 {
@@ -144,7 +149,7 @@ func TestRootDeletionPostgres(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	lceClearIndexRoot = func(context.Context, string, string) (*mcpToolResult, error) {
+	lceClearIndexRootOperation = func(context.Context, string, string, string) (*mcpToolResult, error) {
 		return nil, errors.New("response lost")
 	}
 	processRootDeletion(ctx, uncertain)
@@ -161,8 +166,18 @@ func TestRootDeletionPostgres(t *testing.T) {
 
 	// A cleanup failure after Cloud success must roll back both the file deletes
 	// and the terminal status; the durable marker remains for a later retry.
-	lceClearIndexRoot = func(context.Context, string, string) (*mcpToolResult, error) {
-		return &mcpToolResult{Content: []byte(`{"deleted_files":1}`)}, nil
+	lceClearIndexRootOperation = func(context.Context, string, string, string) (*mcpToolResult, error) {
+		return rootDeletionCloudResult(uncertain, 1), nil
+	}
+	reclaim := func() {
+		t.Helper()
+		if _, err := db.Exec(`UPDATE root_deletion_jobs SET next_attempt_at=NOW(), claim_until=NOW()-INTERVAL '1 second' WHERE id=$1`, uncertain.ID); err != nil {
+			t.Fatal(err)
+		}
+		uncertain, err = claimRootDeletion(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
 	if _, err := db.Exec(`CREATE FUNCTION reject_deletion_success() RETURNS trigger LANGUAGE plpgsql AS $$
 		BEGIN IF NEW.status = 'succeeded' THEN RAISE EXCEPTION 'test rollback'; END IF; RETURN NEW; END $$;
@@ -170,6 +185,7 @@ func TestRootDeletionPostgres(t *testing.T) {
 		FOR EACH ROW EXECUTE FUNCTION reject_deletion_success()`); err != nil {
 		t.Fatal(err)
 	}
+	reclaim()
 	processRootDeletion(ctx, uncertain)
 	if files("uncertain") != 1 {
 		t.Fatal("Relay rows escaped a failed completion transaction")
@@ -177,9 +193,57 @@ func TestRootDeletionPostgres(t *testing.T) {
 	if _, err := db.Exec(`DROP TRIGGER reject_deletion_success ON root_deletion_jobs`); err != nil {
 		t.Fatal(err)
 	}
+	reclaim()
 	processRootDeletion(ctx, uncertain)
 	if files("uncertain") != 0 {
 		t.Fatal("retry did not complete after rollback")
+	}
+
+	// A crash on the last allowed attempt also pauses automatically. Recovery
+	// restarts the original operation, and stale recovery requests never enqueue.
+	paused, err := enqueueRootDeletion(ctx, "paused", "owner", "repo-c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE root_deletion_jobs SET status='running', attempt_count=$2,
+		claim_until=NOW()-INTERVAL '1 second' WHERE id=$1`, paused.ID, rootDeletionMaxAttempts); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := claimRootDeletion(ctx); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("exhausted job was claimed: %v", err)
+	}
+	jobs, err = loadRootDeletions(ctx, "paused")
+	if err != nil || len(jobs) != 1 || !jobs[0].RecoveryRequired || jobs[0].Status != "running" {
+		t.Fatalf("missing recovery state: %+v %v", jobs, err)
+	}
+	if _, err := acquireExclusiveIndexOperation(ctx, "paused", "create-job"); !errors.Is(err, errIndexOperationBusy) {
+		t.Fatalf("paused task released fence: %v", err)
+	}
+	resumed, err := submitRootDeletion(ctx, "paused", "owner", "repo-c", paused.ID)
+	if err != nil || resumed.ID != paused.ID || resumed.AttemptCount != 0 || resumed.RecoveryRequired {
+		t.Fatalf("resume: %+v %v", resumed, err)
+	}
+	resumed, err = claimRootDeletion(ctx)
+	if err != nil || resumed.ID != paused.ID {
+		t.Fatalf("resumed dispatch: %+v %v", resumed, err)
+	}
+	if err := finishRootDeletion(ctx, resumed, 0); err != nil {
+		t.Fatal(err)
+	}
+	replayed, err := submitRootDeletion(ctx, "paused", "owner", "repo-c", paused.ID)
+	if err != nil || replayed.Status != "succeeded" {
+		t.Fatalf("late recovery enqueued another deletion: %+v %v", replayed, err)
+	}
+
+	deferred, err := enqueueRootDeletion(ctx, "deferred", "owner", "repo-d")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE root_deletion_jobs SET next_attempt_at=NOW()+INTERVAL '1 hour' WHERE id=$1`, deferred.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := claimRootDeletion(ctx); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("backoff was ignored: %v", err)
 	}
 	if rootDeletionClaimDuration <= rootDeletionRunTimeout+time.Minute {
 		t.Fatal("recovery grace must outlive the worker deadline")

@@ -25,7 +25,8 @@ func platformConfigSaveTestRouter(t *testing.T, embeddingChanged bool) (*gin.Eng
 	var saves atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		var body struct {
-			Action string `json:"action"`
+			Action      string `json:"action"`
+			OperationID string `json:"operationId"`
 		}
 		if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
 			t.Error(err)
@@ -37,7 +38,10 @@ func platformConfigSaveTestRouter(t *testing.T, embeddingChanged bool) (*gin.Eng
 			_ = json.NewEncoder(writer).Encode(map[string]interface{}{"embeddingChanged": embeddingChanged, "validationTicket": "test-ticket"})
 		} else {
 			saves.Add(1)
-			_, _ = writer.Write([]byte(`{"config":{"promptEnhancer":{"enabled":true}}}`))
+			if body.Action != "prepare" {
+				t.Errorf("unexpected mutation during admission: %s", body.Action)
+			}
+			_ = json.NewEncoder(writer).Encode(map[string]interface{}{"operation": cloudPlatformConfigOperation{OperationID: body.OperationID, State: "prepared", EmbeddingChanged: embeddingChanged}})
 		}
 	}))
 	t.Cleanup(upstream.Close)
@@ -56,28 +60,36 @@ func platformSaveTestRequest() *http.Request {
 }
 
 func TestPromptConfigSaveDoesNotWaitForIndexReaders(t *testing.T) {
-	router, saves := platformConfigSaveTestRouter(t, false)
-	platformModelConfigBarrier.RLock()
-	released := false
-	defer func() {
-		if !released {
+	withMockDB(t, func(mock sqlmock.Sqlmock) {
+		router, saves := platformConfigSaveTestRouter(t, false)
+		mock.ExpectBegin()
+		mock.ExpectExec("pg_advisory_xact_lock").WillReturnResult(sqlmock.NewResult(0, 1))
+		mock.ExpectQuery("FROM platform_config_jobs WHERE id=").WithArgs(sqlmock.AnyArg()).WillReturnRows(platformConfigTestRows())
+		mock.ExpectQuery("SELECT.*").WithArgs(false).WillReturnRows(sqlmock.NewRows([]string{"busy"}).AddRow(false))
+		mock.ExpectQuery("INSERT INTO platform_config_jobs").WithArgs(sqlmock.AnyArg(), "promptEnhancer", false).WillReturnRows(platformConfigTestRows(platformConfigTestJob(false)))
+		mock.ExpectCommit()
+		platformModelConfigBarrier.RLock()
+		released := false
+		defer func() {
+			if !released {
+				platformModelConfigBarrier.RUnlock()
+			}
+		}()
+		recorder := httptest.NewRecorder()
+		done := make(chan struct{})
+		go func() { defer close(done); router.ServeHTTP(recorder, platformSaveTestRequest()) }()
+		select {
+		case <-done:
+			if recorder.Code != http.StatusAccepted || saves.Load() != 1 {
+				t.Fatalf("save status=%d calls=%d body=%s", recorder.Code, saves.Load(), recorder.Body.String())
+			}
+		case <-time.After(time.Second):
 			platformModelConfigBarrier.RUnlock()
+			released = true
+			<-done
+			t.Fatal("prompt-only save waited for the global index barrier")
 		}
-	}()
-	recorder := httptest.NewRecorder()
-	done := make(chan struct{})
-	go func() { defer close(done); router.ServeHTTP(recorder, platformSaveTestRequest()) }()
-	select {
-	case <-done:
-		if recorder.Code != http.StatusOK || saves.Load() != 1 {
-			t.Fatalf("save status=%d calls=%d body=%s", recorder.Code, saves.Load(), recorder.Body.String())
-		}
-	case <-time.After(time.Second):
-		platformModelConfigBarrier.RUnlock()
-		released = true
-		<-done
-		t.Fatal("prompt-only save waited for the global index barrier")
-	}
+	})
 }
 
 func TestPlatformConfigBarrierDoesNotHoldSSEReadLock(t *testing.T) {

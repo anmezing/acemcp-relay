@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -24,34 +25,41 @@ const (
 	rootDeletionClaimDuration = 15 * time.Minute
 	rootDeletionWorkerCount   = 2
 	rootDeletionPollInterval  = 2 * time.Second
+	rootDeletionMaxAttempts   = 5
 )
 
 var errRootDeletionRateLimited = errors.New("root deletion rate limited")
 
 type rootDeletionJob struct {
-	ID           string    `json:"id"`
-	TenantID     string    `json:"-"`
-	ActorID      string    `json:"-"`
-	RootID       string    `json:"root_id"`
-	Status       string    `json:"status"`
-	AttemptID    string    `json:"-"`
-	DeletedFiles int64     `json:"deleted_files"`
-	Error        string    `json:"error,omitempty"`
-	CreatedAt    time.Time `json:"created_at"`
-	UpdatedAt    time.Time `json:"updated_at"`
+	ID               string    `json:"id"`
+	TenantID         string    `json:"-"`
+	ActorID          string    `json:"-"`
+	RootID           string    `json:"root_id"`
+	Status           string    `json:"status"`
+	AttemptID        string    `json:"-"`
+	AttemptCount     int       `json:"attempt_count"`
+	RecoveryRequired bool      `json:"recovery_required"`
+	DeletedFiles     int64     `json:"deleted_files"`
+	Error            string    `json:"error,omitempty"`
+	CreatedAt        time.Time `json:"created_at"`
+	UpdatedAt        time.Time `json:"updated_at"`
 }
 
 const rootDeletionColumns = `id::text, user_id, actor_id, root_id, status,
-	COALESCE(attempt_id::text, '') AS attempt_id, deleted_files, error, created_at, updated_at`
+	COALESCE(attempt_id::text, '') AS attempt_id, deleted_files, error, created_at, updated_at, attempt_count, recovery_required`
 
 func scanRootDeletion(row interface{ Scan(...interface{}) error }) (rootDeletionJob, error) {
 	var job rootDeletionJob
 	err := row.Scan(&job.ID, &job.TenantID, &job.ActorID, &job.RootID, &job.Status,
-		&job.AttemptID, &job.DeletedFiles, &job.Error, &job.CreatedAt, &job.UpdatedAt)
+		&job.AttemptID, &job.DeletedFiles, &job.Error, &job.CreatedAt, &job.UpdatedAt, &job.AttemptCount, &job.RecoveryRequired)
 	return job, err
 }
 
 func enqueueRootDeletion(ctx context.Context, tenantID, actorID, rootID string) (rootDeletionJob, error) {
+	return submitRootDeletion(ctx, tenantID, actorID, rootID, "")
+}
+
+func submitRootDeletion(ctx context.Context, tenantID, actorID, rootID, retryJobID string) (rootDeletionJob, error) {
 	tx, err := beginLockedIndexUserTx(ctx, tenantID)
 	if err != nil {
 		return rootDeletionJob{}, err
@@ -60,13 +68,31 @@ func enqueueRootDeletion(ctx context.Context, tenantID, actorID, rootID string) 
 	job, err := scanRootDeletion(tx.QueryRowContext(ctx, `SELECT `+rootDeletionColumns+`
 		FROM root_deletion_jobs WHERE user_id = $1 AND status IN ('queued', 'running')`, tenantID))
 	if err == nil {
-		if job.RootID != rootID {
+		if job.RootID != rootID || (retryJobID != "" && retryJobID != job.ID) {
 			return rootDeletionJob{}, errIndexOperationBusy
+		}
+		if retryJobID != "" && job.RecoveryRequired {
+			job, err = scanRootDeletion(tx.QueryRowContext(ctx, `UPDATE root_deletion_jobs
+				SET recovery_required=FALSE, attempt_count=0, error='', next_attempt_at=NOW(), updated_at=NOW()
+				WHERE id=$1 AND user_id=$2 AND recovery_required RETURNING `+rootDeletionColumns, job.ID, tenantID))
+			if err != nil {
+				return rootDeletionJob{}, err
+			}
 		}
 		return job, tx.Commit()
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		return rootDeletionJob{}, err
+	}
+	if retryJobID != "" {
+		// A repeated recovery request after completion returns the old result; it
+		// must never become a new deletion against a recreated root.
+		job, err = scanRootDeletion(tx.QueryRowContext(ctx, `SELECT `+rootDeletionColumns+`
+			FROM root_deletion_jobs WHERE id=$1 AND user_id=$2 AND root_id=$3`, retryJobID, tenantID, rootID))
+		if err != nil {
+			return rootDeletionJob{}, err
+		}
+		return job, tx.Commit()
 	}
 
 	// Admission and the durable marker use the same tenant lock as lease
@@ -74,7 +100,8 @@ func enqueueRootDeletion(ctx context.Context, tenantID, actorID, rootID string) 
 	var busy bool
 	err = tx.QueryRowContext(ctx, `SELECT
 		EXISTS(SELECT 1 FROM index_operation_leases WHERE user_id = $1 AND lease_expires_at > NOW())
-		OR EXISTS(SELECT 1 FROM index_jobs WHERE user_id = $1 AND status = 'running')`,
+		OR EXISTS(SELECT 1 FROM index_jobs WHERE user_id = $1 AND status = 'running')
+		OR EXISTS(SELECT 1 FROM platform_config_jobs WHERE embedding_changed AND status IN ('pending','running'))`,
 		tenantID).Scan(&busy)
 	if err != nil {
 		return rootDeletionJob{}, err
@@ -103,22 +130,33 @@ func handleCreateRootDeletion(c *gin.Context) {
 		return
 	}
 	var req struct {
-		RootID string `json:"root_id"`
+		RootID     string `json:"root_id"`
+		RetryJobID string `json:"retry_job_id"`
 	}
 	if c.ShouldBindJSON(&req) != nil || strings.TrimSpace(req.RootID) == "" || utf8.RuneCountInString(strings.TrimSpace(req.RootID)) > 128 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "root_id is required and must be at most 128 characters"})
 		completeRequestLogAsync(getRequestLogEntry(c, http.StatusBadRequest))
 		return
 	}
+	if req.RetryJobID != "" {
+		parsed, err := uuid.Parse(req.RetryJobID)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "retry_job_id must be a UUID"})
+			return
+		}
+		req.RetryJobID = parsed.String()
+	}
 	if rejectNonOwnerIndexDeletion(c) {
 		return
 	}
 	ctx, cancel := context.WithTimeout(c.Request.Context(), rootDeletionRequestTimeout)
 	defer cancel()
-	job, err := enqueueRootDeletion(ctx, requestTenantID(c), actorID, lceIndexRootID(req.RootID))
+	job, err := submitRootDeletion(ctx, requestTenantID(c), actorID, lceIndexRootID(req.RootID), req.RetryJobID)
 	if err != nil {
 		status, message := http.StatusServiceUnavailable, "删除服务暂时不可用，请稍后重试"
 		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			status, message = http.StatusNotFound, "删除任务已不存在，请刷新状态"
 		case errors.Is(err, errIndexOperationBusy):
 			status, message = http.StatusConflict, "索引正在执行其他操作，请等待其结束后再删除"
 		case errors.Is(err, errRootDeletionRateLimited):
@@ -180,14 +218,21 @@ func loadRootDeletions(ctx context.Context, tenantID string) ([]rootDeletionJob,
 }
 
 func claimRootDeletion(ctx context.Context) (rootDeletionJob, error) {
-	return scanRootDeletion(db.QueryRowContext(ctx, `WITH candidate AS (
+	return scanRootDeletion(db.QueryRowContext(ctx, `WITH exhausted AS (
+		UPDATE root_deletion_jobs SET recovery_required=TRUE, updated_at=NOW(),
+			error='自动恢复已暂停，删除结果仍未确认。请恢复此任务；索引保护将继续保留。'
+		WHERE id IN (SELECT id FROM root_deletion_jobs
+			WHERE status='running' AND claim_until < NOW() AND attempt_count >= $3 AND NOT recovery_required
+			ORDER BY created_at LIMIT 100 FOR UPDATE SKIP LOCKED)
+	), candidate AS (
 		SELECT id AS candidate_id FROM root_deletion_jobs
-		WHERE status = 'queued' OR (status = 'running' AND claim_until < NOW())
+		WHERE (status = 'queued' OR (status = 'running' AND claim_until < NOW()))
+			AND next_attempt_at <= NOW() AND NOT recovery_required AND attempt_count < $3
 		ORDER BY created_at LIMIT 1 FOR UPDATE SKIP LOCKED
 	) UPDATE root_deletion_jobs SET status = 'running', attempt_id = $1,
-		claim_until = NOW() + ($2 * INTERVAL '1 millisecond'), updated_at = NOW()
+		claim_until = NOW() + ($2 * INTERVAL '1 millisecond'), updated_at = NOW(), attempt_count=attempt_count+1
 	FROM candidate WHERE id = candidate_id RETURNING `+rootDeletionColumns,
-		uuid.NewString(), rootDeletionClaimDuration.Milliseconds()))
+		uuid.NewString(), rootDeletionClaimDuration.Milliseconds(), rootDeletionMaxAttempts))
 }
 
 func rootDeletionAttemptCurrent(ctx context.Context, job rootDeletionJob) (bool, error) {
@@ -198,19 +243,29 @@ func rootDeletionAttemptCurrent(ctx context.Context, job rootDeletionJob) (bool,
 	return current, err
 }
 
-func recordRootDeletionError(job rootDeletionJob, definitive bool, detail string) {
+func recordRootDeletionError(job rootDeletionJob, deferOnly bool, detail string) {
 	status := "running"
 	message := "删除结果暂无法确认，后台将自动重试。"
-	if definitive {
-		status, message = "failed", "清除云端索引失败，请重试；若持续失败请联系管理员。"
+	attempts := job.AttemptCount
+	if deferOnly {
+		attempts = max(0, attempts-1)
+	}
+	recoveryRequired := attempts >= rootDeletionMaxAttempts
+	if recoveryRequired {
+		message = "自动恢复已暂停，删除结果仍未确认。请恢复此任务；索引保护将继续保留。"
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), rootDeletionRequestTimeout)
 	defer cancel()
-	_, err := db.ExecContext(ctx, `UPDATE root_deletion_jobs SET status = $4, error = $5, updated_at = NOW()
+	_, err := db.ExecContext(ctx, `UPDATE root_deletion_jobs SET status = $4, error = $5, updated_at = NOW(),
+		attempt_count=$6, recovery_required=$7, claim_until=NOW(), next_attempt_at=NOW()+($8 * INTERVAL '1 millisecond')
 		WHERE id = $1 AND user_id = $2 AND attempt_id = $3 AND status = 'running' AND claim_until > NOW()`,
-		job.ID, job.TenantID, job.AttemptID, status, message)
+		job.ID, job.TenantID, job.AttemptID, status, message, attempts, recoveryRequired, rootDeletionRetryDelay(attempts).Milliseconds())
 	log.Printf("[DELETE_ROOT] job=%s tenant=%s root=%s state=%s error=%s record_error=%v",
 		job.ID, job.TenantID, job.RootID, status, detail, err)
+}
+
+func rootDeletionRetryDelay(attempts int) time.Duration {
+	return min(10*time.Minute, 5*time.Second*time.Duration(1<<min(max(attempts-1, 0), 7)))
 }
 
 // Success and Relay cleanup commit together, so a restarted worker cannot
@@ -249,7 +304,7 @@ func finishRootDeletion(ctx context.Context, job rootDeletionJob, cloudCount int
 }
 
 var acquireRootDeletionLease = func(ctx context.Context, tenantID string) (deleteRootOperationLease, error) {
-	return acquireExclusiveIndexOperation(ctx, tenantID, "delete-root-job")
+	return tryExclusiveIndexOperation(ctx, tenantID, "delete-root-job")
 }
 
 func processRootDeletion(parent context.Context, job rootDeletionJob) {
@@ -261,17 +316,17 @@ func processRootDeletion(parent context.Context, job rootDeletionJob) {
 		}
 	}()
 	// Background work needs the same model-config protection as HTTP handlers.
-	for !platformModelConfigBarrier.TryRLock() {
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(indexOperationAcquirePoll):
-		}
+	if ctx.Err() != nil {
+		return
+	}
+	if !platformModelConfigBarrier.TryRLock() {
+		recordRootDeletionError(job, true, "model configuration change in progress")
+		return
 	}
 	defer platformModelConfigBarrier.RUnlock()
 	lease, err := acquireRootDeletionLease(ctx, job.TenantID)
 	if err != nil {
-		recordRootDeletionError(job, false, err.Error())
+		recordRootDeletionError(job, true, err.Error())
 		return
 	}
 	defer lease.Release()
@@ -282,7 +337,7 @@ func processRootDeletion(parent context.Context, job rootDeletionJob) {
 	}
 	started := time.Now()
 	log.Printf("[DELETE_ROOT] job=%s tenant=%s root=%s stage=cloud", job.ID, job.TenantID, job.RootID)
-	result, err := lceClearIndexRoot(ctx, job.TenantID, job.RootID)
+	result, err := lceClearIndexRootOperation(ctx, job.TenantID, job.RootID, job.ID)
 	if err != nil || result == nil {
 		// A missing reply is not proof of rollback. Keep the durable marker and
 		// retry idempotently after the claim expires, even after process restart.
@@ -290,14 +345,35 @@ func processRootDeletion(parent context.Context, job rootDeletionJob) {
 		return
 	}
 	if result.IsError {
-		recordRootDeletionError(job, true, string(result.Content))
+		// An error from this call cannot disprove a prior timed-out attempt.
+		recordRootDeletionError(job, false, string(result.Content))
 		return
 	}
-	count, _ := extractLCEDeletedFiles(result.Content)
+	count, err := rootDeletionReceipt(result.Content, job)
+	if err != nil {
+		recordRootDeletionError(job, false, err.Error())
+		return
+	}
 	log.Printf("[DELETE_ROOT] job=%s stage=relay cloud_ms=%d", job.ID, time.Since(started).Milliseconds())
 	if err := finishRootDeletion(ctx, job, count); err != nil {
 		recordRootDeletionError(job, false, "relay cleanup: "+err.Error())
 	}
+}
+
+func rootDeletionReceipt(content []byte, job rootDeletionJob) (int64, error) {
+	var receipt struct {
+		OperationID  string `json:"operationId"`
+		RootID       string `json:"rootId"`
+		Deleted      *bool  `json:"deleted"`
+		DeletedFiles *int64 `json:"deletedFiles"`
+	}
+	if err := json.Unmarshal(content, &receipt); err != nil {
+		return 0, fmt.Errorf("invalid deletion receipt: %w", err)
+	}
+	if receipt.OperationID != job.ID || receipt.RootID != job.RootID || receipt.Deleted == nil || receipt.DeletedFiles == nil || *receipt.DeletedFiles < 0 {
+		return 0, errors.New("deletion receipt does not confirm this operation")
+	}
+	return *receipt.DeletedFiles, nil
 }
 
 func pruneRootDeletionHistory(ctx context.Context) error {

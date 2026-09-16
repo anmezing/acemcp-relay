@@ -31,6 +31,7 @@ const (
 	indexJobInitialUploadTimeout = 2 * time.Minute
 	indexJobHeartbeatTimeout     = 10 * time.Minute
 	indexJobSweepInterval        = time.Minute
+	indexPublicationMaxAge       = time.Hour
 	maxIndexManifestFiles        = 100000
 	maxIndexBatchFiles           = 50
 	// 单个文件的内容上限。源码文件极少接近这个量级，而 embedding 本身也有
@@ -247,11 +248,19 @@ func migrateIndexingTables() error {
 			status VARCHAR(16) NOT NULL CHECK (status IN ('queued', 'running', 'succeeded', 'failed')),
 			attempt_id UUID,
 			claim_until TIMESTAMPTZ,
+			attempt_count INTEGER NOT NULL DEFAULT 0,
+			recovery_required BOOLEAN NOT NULL DEFAULT FALSE,
+			next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			deleted_files BIGINT NOT NULL DEFAULT 0,
 			error TEXT NOT NULL DEFAULT '',
 			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 		);
+		ALTER TABLE root_deletion_jobs ADD COLUMN IF NOT EXISTS attempt_count INTEGER NOT NULL DEFAULT 0;
+		ALTER TABLE root_deletion_jobs ADD COLUMN IF NOT EXISTS recovery_required BOOLEAN NOT NULL DEFAULT FALSE;
+		ALTER TABLE root_deletion_jobs ADD COLUMN IF NOT EXISTS next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+		CREATE INDEX IF NOT EXISTS idx_root_deletion_jobs_retry
+			ON root_deletion_jobs(next_attempt_at, created_at) WHERE status IN ('queued', 'running') AND NOT recovery_required;
 		CREATE UNIQUE INDEX IF NOT EXISTS idx_root_deletion_jobs_active_tenant
 			ON root_deletion_jobs(user_id) WHERE status IN ('queued', 'running');
 		CREATE INDEX IF NOT EXISTS idx_root_deletion_jobs_tenant_recent
@@ -261,6 +270,24 @@ func migrateIndexingTables() error {
 		CREATE INDEX IF NOT EXISTS idx_root_deletion_jobs_history
 			ON root_deletion_jobs(updated_at) WHERE status IN ('succeeded', 'failed');
 
+		CREATE TABLE IF NOT EXISTS platform_config_jobs (
+			id UUID PRIMARY KEY,
+			section TEXT NOT NULL,
+			embedding_changed BOOLEAN NOT NULL,
+			status TEXT NOT NULL CHECK (status IN ('pending','running','succeeded','rejected')),
+			attempt_id UUID,
+			claim_until TIMESTAMPTZ,
+			attempt_count INTEGER NOT NULL DEFAULT 0,
+			recovery_required BOOLEAN NOT NULL DEFAULT FALSE,
+			next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			error TEXT NOT NULL DEFAULT '',
+			result JSONB,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		);
+		CREATE UNIQUE INDEX IF NOT EXISTS idx_platform_config_jobs_active
+			ON platform_config_jobs((TRUE)) WHERE status IN ('pending','running');
+
 		-- 存量库补列。CREATE TABLE IF NOT EXISTS 对已存在的表不生效，
 		-- 因此列的新增必须同时出现在 CREATE 文本（新库）和 ALTER（旧库）两处；
 		-- 只改 CREATE 文本会让升级后的旧库在引用新列的 SQL 上直接报错。
@@ -269,6 +296,9 @@ func migrateIndexingTables() error {
 		ALTER TABLE index_jobs ADD COLUMN IF NOT EXISTS error_code VARCHAR(64) NOT NULL DEFAULT '';
 		ALTER TABLE index_jobs ADD COLUMN IF NOT EXISTS error_origin VARCHAR(32) NOT NULL DEFAULT '';
 		ALTER TABLE index_jobs ADD COLUMN IF NOT EXISTS recovery VARCHAR(64) NOT NULL DEFAULT '';
+		ALTER TABLE index_jobs ADD COLUMN IF NOT EXISTS publishing_since TIMESTAMPTZ;
+		UPDATE index_jobs SET publishing_since = heartbeat_at
+			WHERE phase = 'publishing' AND publishing_since IS NULL;
 	`)
 	if err != nil {
 		return fmt.Errorf("failed to migrate indexing tables: %w", err)
@@ -399,7 +429,9 @@ func diffManifest(previous map[string]indexManifestFile, current []indexManifest
 
 func lockIndexUserTx(ctx context.Context, tx *sql.Tx, userID string) error {
 	_, err := tx.ExecContext(ctx, `
-		SELECT pg_advisory_xact_lock(hashtext('acemcp:index-user'), hashtext($1))
+		WITH platform AS MATERIALIZED (
+			SELECT pg_advisory_xact_lock_shared(hashtext('acemcp:platform-config'))
+		) SELECT pg_advisory_xact_lock(hashtext('acemcp:index-user'), hashtext($1)) FROM platform
 	`, userID)
 	return err
 }
@@ -1194,15 +1226,18 @@ func completeIndexJob(ctx context.Context, userID, jobID string) (indexJobView, 
 		return indexJobView{}, err
 	}
 	defer lease.Release()
-	opCtx := lease.Context()
+	return completeIndexJobUnderLease(lease.Context(), userID, jobID, nil)
+}
 
+// Callers own the job resource lease through both upstream I/O and local commit.
+func completeIndexJobUnderLease(opCtx context.Context, userID, jobID string, knownRevision *int64) (indexJobView, error) {
 	// Validate first without holding a transaction, publish the staged PostgreSQL revision,
 	// then revalidate every completion invariant before committing Relay's manifest snapshot.
 	var preStatus, rootID string
 	var preTotalFiles, preIndexedFiles, preDeletedCount int
 	var preDeletionsSent bool
 	var preCloudRevision int64
-	err = db.QueryRowContext(opCtx, `
+	err := db.QueryRowContext(opCtx, `
 		SELECT status, root_id, total_files, indexed_files, deleted_count, deletions_sent, cloud_revision
 		FROM index_jobs WHERE id = $1 AND user_id = $2
 	`, jobID, userID).Scan(
@@ -1228,7 +1263,8 @@ func completeIndexJob(ctx context.Context, userID, jobID string) (indexJobView, 
 	}
 	// Commit the handoff BEFORE the network call. A lost response or a Relay
 	// restart must leave recoverable intent, not a client-owned expiring job.
-	intent, err := db.ExecContext(opCtx, `UPDATE index_jobs SET phase = 'publishing', heartbeat_at = NOW()
+	intent, err := db.ExecContext(opCtx, `UPDATE index_jobs SET phase = 'publishing', heartbeat_at = NOW(),
+		publishing_since = COALESCE(publishing_since, NOW())
 		WHERE id = $1 AND user_id = $2 AND status = $3`, jobID, userID, indexJobStatusRunning)
 	if err != nil {
 		return indexJobView{}, err
@@ -1237,7 +1273,12 @@ func completeIndexJob(ctx context.Context, userID, jobID string) (indexJobView, 
 		return indexJobView{}, fmt.Errorf("publication handoff lost running job: %v", err)
 	}
 	var cloudRevision int64
-	if preCloudRevision > 0 {
+	if knownRevision != nil {
+		cloudRevision = *knownRevision
+		if cloudRevision < 1 || (preCloudRevision > 0 && preCloudRevision != cloudRevision) {
+			return indexJobView{}, fmt.Errorf("publication result conflicts with recorded revision")
+		}
+	} else if preCloudRevision > 0 {
 		cloudRevision = preCloudRevision
 	} else {
 		args := lceIndexJobArgs(userID, jobID, rootID, "publish")
@@ -1524,7 +1565,7 @@ func finishFailedPublication(ctx context.Context, userID, jobID, failure string)
 func reconcileIndexPublications(ctx context.Context) {
 	ctx, stop := context.WithTimeout(ctx, 45*time.Second)
 	defer stop()
-	rows, err := db.QueryContext(ctx, `SELECT id::text, user_id, root_id
+	rows, err := db.QueryContext(ctx, `SELECT id::text, user_id, root_id, publishing_since
 		FROM index_jobs WHERE status = $1 AND phase = 'publishing'
 		ORDER BY heartbeat_at ASC LIMIT 8`, indexJobStatusRunning)
 	if err != nil {
@@ -1532,11 +1573,10 @@ func reconcileIndexPublications(ctx context.Context) {
 		return
 	}
 	defer rows.Close()
-	type candidate struct{ id, user, root string }
-	var jobs []candidate
+	var jobs []publicationCandidate
 	for rows.Next() {
-		var j candidate
-		if err := rows.Scan(&j.id, &j.user, &j.root); err != nil {
+		var j publicationCandidate
+		if err := rows.Scan(&j.id, &j.user, &j.root, &j.since); err != nil {
 			log.Printf("[INDEX] publication reconciliation scan failed: %v", err)
 			return
 		}
@@ -1557,40 +1597,97 @@ func reconcileIndexPublications(ctx context.Context) {
 			log.Printf("[INDEX] publication scheduling failed job_id=%s: %v", j.id, err)
 			continue
 		}
-		callCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-		args := lceIndexJobArgs(j.user, j.id, j.root, "status")
-		result, callErr := lce.callToolWithTimeout(callCtx, "codebase_remote_index", args, 10*time.Second)
-		cancel()
-		if callErr != nil || result == nil || result.IsError {
-			log.Printf("[INDEX] publication status unavailable job_id=%s: %v", j.id, callErr)
-			continue
-		}
-		content := result.Content
-		if failure, terminal := publicationFailure(content); terminal {
-			if _, err := finishFailedPublication(ctx, j.user, j.id, failure); err != nil {
-				log.Printf("[INDEX] publication failure reconciliation failed job_id=%s: %v", j.id, err)
-			}
-			continue
-		}
-		state := publicationState(content)
-		if state == "completed" {
-			completeCtx, cancelComplete := context.WithTimeout(ctx, 15*time.Second)
-			_, err := completeIndexJob(completeCtx, j.user, j.id)
-			cancelComplete()
-			if err != nil {
-				log.Printf("[INDEX] publication completion reconciliation failed job_id=%s: %v", j.id, err)
-			}
-		} else if state == "not_submitted" {
-			// The handoff marker was persisted locally, but LCE has no durable
-			// publication for this job. Treating this as completed would publish a
-			// manifest without a cloud revision. Surface a retryable terminal error
-			// so the client can start a fresh index job.
-			if _, err := finishFailedPublication(ctx, j.user, j.id,
-				"cloud publication was not submitted; retry indexing"); err != nil {
-				log.Printf("[INDEX] missing publication reconciliation failed job_id=%s: %v", j.id, err)
-			}
+		if err := reconcileIndexPublication(ctx, j); err != nil {
+			metricPublicationRecovery.WithLabelValues("deferred").Inc()
+			log.Printf("[INDEX] publication recovery deferred job_id=%s age=%s: %v", j.id, time.Since(j.since.Time), err)
 		}
 	}
+}
+
+type publicationCandidate struct {
+	id, user, root string
+	since          sql.NullTime
+}
+
+func reconcileIndexPublication(ctx context.Context, job publicationCandidate) error {
+	lease, err := tryIndexOperation(ctx, job.user, indexJobOperationResource(job.id), "reconcile-publication", indexOperationShared)
+	if err != nil {
+		return err
+	}
+	defer lease.Release()
+	ctx = lease.Context()
+	// Revalidate after acquiring the lease: the selection may predate a completed handoff.
+	var active bool
+	if err := db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM index_jobs
+		WHERE id=$1 AND user_id=$2 AND status='running' AND phase='publishing')`, job.id, job.user).Scan(&active); err != nil {
+		return err
+	}
+	if !active {
+		return nil
+	}
+	result, statusErr := publicationCall(ctx, job, "status")
+	if statusErr == nil {
+		if failure, terminal := publicationFailure(result.Content); terminal {
+			_, err := finishFailedPublication(ctx, job.user, job.id, failure)
+			return err
+		}
+		if publicationState(result.Content) == "completed" {
+			revision, err := extractCloudRevision(result.Content)
+			if err != nil {
+				return err
+			}
+			_, err = completeIndexJobUnderLease(ctx, job.user, job.id, &revision)
+			return err
+		}
+	}
+	if job.since.Valid && time.Since(job.since.Time) >= indexPublicationMaxAge {
+		metricPublicationRecovery.WithLabelValues("overdue").Inc()
+		// An abort holds LCE's job lock and fences its publication lease. A timeout
+		// is not cancellation confirmation; keep the local fence until a terminal reply.
+		aborted, err := publicationCall(ctx, job, "abort")
+		if err != nil {
+			return err
+		}
+		switch publicationState(aborted.Content) {
+		case "aborted", "cancelled":
+			_, err = finishFailedPublication(ctx, job.user, job.id, "cloud publication deadline exceeded; cancellation confirmed")
+			return err
+		case "published", "completed":
+			// The atomic publish won the cancellation race. Read its durable revision next sweep.
+			return nil
+		default:
+			return fmt.Errorf("cloud publication cancellation is unconfirmed")
+		}
+	}
+	if statusErr != nil {
+		return statusErr
+	}
+	if publicationState(result.Content) == "not_submitted" {
+		// Resume the persisted intent. Submission is idempotent, including a late
+		// response from an earlier process whose operation lease has expired.
+		_, err = completeIndexJobUnderLease(ctx, job.user, job.id, nil)
+		return err
+	}
+	switch publicationState(result.Content) {
+	case "pending", "leased", "publishing":
+		return nil
+	default:
+		return fmt.Errorf("invalid publication status response")
+	}
+}
+
+func publicationCall(ctx context.Context, job publicationCandidate, operation string) (*mcpToolResult, error) {
+	result, err := lce.callToolWithTimeout(ctx, "codebase_remote_index", lceIndexJobArgs(job.user, job.id, job.root, operation), 10*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	if result == nil {
+		return nil, fmt.Errorf("empty publication %s response", operation)
+	}
+	if result.IsError {
+		return nil, lceIndexToolError("cloud publication "+operation, result.Content)
+	}
+	return result, nil
 }
 
 type indexJobFailureExecer interface {

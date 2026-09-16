@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/json"
-	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -202,7 +201,15 @@ func TestFilterChatMCPToolsHidesIndexManagementTools(t *testing.T) {
 
 func TestFilterChatMCPToolsRequiresExactRemoteContract(t *testing.T) {
 	validTool := func(name string) string {
-		return fmt.Sprintf(`{"name":%q,"inputSchema":{"type":"object","properties":{}}}`, name)
+		properties := make(map[string]interface{})
+		for field := range chatMCPToolPolicies[name].arguments {
+			properties[field] = map[string]string{"type": "string"}
+		}
+		encoded, err := json.Marshal(map[string]interface{}{"name": name, "inputSchema": map[string]interface{}{"type": "object", "properties": properties}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(encoded)
 	}
 	missing := json.RawMessage("[" + validTool("codebase-retrieval") + "]")
 	if _, err := filterChatMCPTools(missing); err == nil {
@@ -215,6 +222,15 @@ func TestFilterChatMCPToolsRequiresExactRemoteContract(t *testing.T) {
 	}, ",") + "]")
 	if _, err := filterChatMCPTools(duplicate); err == nil {
 		t.Fatal("duplicate remote tools must fail the Relay contract")
+	}
+	var required []string
+	for name, policy := range chatMCPToolPolicies {
+		if !policy.optional {
+			required = append(required, validTool(name))
+		}
+	}
+	if _, err := filterChatMCPTools(json.RawMessage("[" + strings.Join(required, ",") + "]")); err != nil {
+		t.Fatalf("optional compiler sync must not break retrieval during rollout: %v", err)
 	}
 }
 

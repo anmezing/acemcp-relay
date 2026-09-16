@@ -1,0 +1,13 @@
+# Root deletion recovery
+
+`POST /mcp/root-deletions` accepts a durable task and returns HTTP 202. The task ID is also the LCE `codebase_clear_index.operation_id`. LCE commits the root cascade, projection deletion task and result receipt together. A replay returns that receipt even if the root has since been recreated. Relay accepts only a receipt matching both task ID and root ID before committing its local cleanup and success marker.
+
+An operation receipt has no root foreign key and no time-based pruning. It is a small tenant-scoped tombstone, retained for the tenant's lifetime. Removing it while old callers may replay would allow a late request to delete new data. Backup/restore and tenant-erasure procedures must handle these receipts together with tenant identity; do not delete them as ordinary task history. Relay terminal task history is pruned after seven days; an explicit recovery request for pruned history returns 404 and never creates a new deletion.
+
+Workers try the tenant lease once, then reschedule on contention. Dispatch respects `next_attempt_at`. A model configuration barrier or lease conflict refunds the dispatch attempt. Unconfirmed cloud outcomes retry with delays of 5, 10, 20 and 40 seconds, up to five attempts. A crashed worker retains its 15-minute claim before recovery. After the attempt budget is exhausted, `status` remains `running` and `recovery_required` becomes true. Index admission remains fenced and the console displays a recovery action. This state is visible in the authenticated task list and worker logs.
+
+After repairing connectivity or the reported upstream cause, the owner can recover through the console or submit `{ "root_id": "...", "retry_job_id": "<original-task-id>" }` to the same endpoint. This resets the automatic attempt budget without changing the deletion identity. Duplicate recovery after success returns the original task; it cannot initiate another deletion. A generic MCP error or HTTP timeout is never treated as proof that an earlier request cannot commit.
+
+Deploy LCE with migration 21 before Relay's new workers. An older strict LCE schema rejects `operation_id`; Relay retains the fence and surfaces recovery rather than falling back to deletion without identity. The deployment contract comparison must pass. No operator should mark an uncertain task succeeded/failed manually to unlock indexing.
+
+Validation covers real PostgreSQL concurrent replay, root recreation, receipt failure rollback, tenant isolation, crash exhaustion, explicit recovery and delayed dispatch, plus worker/HTTP unit tests. No production database is needed for these checks.

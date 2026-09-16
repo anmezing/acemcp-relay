@@ -3,7 +3,9 @@ package main
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -12,6 +14,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 )
 
 const maxPlatformModelConfigBody = 64 << 10
@@ -34,7 +37,11 @@ func platformModelConfigReadBarrier() gin.HandlerFunc {
 			c.Next()
 			return
 		}
-		platformModelConfigBarrier.RLock()
+		if !platformModelConfigBarrier.TryRLock() {
+			c.Header("Retry-After", "5")
+			c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{"error": "Platform configuration is being reconciled"})
+			return
+		}
 		defer platformModelConfigBarrier.RUnlock()
 		c.Next()
 	}
@@ -89,6 +96,20 @@ func handleGetPlatformModelConfig(c *gin.Context) {
 	}
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
 	defer cancel()
+	if id := c.Query("operation"); id != "" {
+		job, err := loadPlatformConfigJob(ctx, id)
+		if errors.Is(err, sql.ErrNoRows) {
+			c.JSON(http.StatusOK, gin.H{"operation": nil})
+			return
+		}
+		if err != nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Configuration operation status unavailable"})
+			return
+		}
+		c.Header("Cache-Control", "no-store")
+		c.JSON(http.StatusOK, gin.H{"operation": job})
+		return
+	}
 	data, status, err := callLCEPlatformConfig(ctx, http.MethodGet, nil)
 	if err != nil {
 		c.JSON(http.StatusBadGateway, gin.H{"error": "读取 LCE 模型配置失败"})
@@ -110,6 +131,14 @@ func clearAllRelayIndexState(ctx context.Context) (clearedRelayIndexes, error) {
 		return clearedRelayIndexes{}, err
 	}
 	defer tx.Rollback()
+	cleared, err := clearAllRelayIndexStateTx(ctx, tx)
+	if err != nil {
+		return clearedRelayIndexes{}, err
+	}
+	return cleared, tx.Commit()
+}
+
+func clearAllRelayIndexStateTx(ctx context.Context, tx *sql.Tx) (clearedRelayIndexes, error) {
 	var cleared clearedRelayIndexes
 	statements := []struct {
 		query string
@@ -126,9 +155,6 @@ func clearAllRelayIndexState(ctx context.Context) (clearedRelayIndexes, error) {
 			return clearedRelayIndexes{}, execErr
 		}
 		*statement.count, _ = result.RowsAffected()
-	}
-	if err := tx.Commit(); err != nil {
-		return clearedRelayIndexes{}, err
 	}
 	return cleared, nil
 }
@@ -181,9 +207,25 @@ func handleSavePlatformModelConfig(c *gin.Context) {
 		APIKey                string          `json:"apiKey"`
 		Config                json.RawMessage `json:"config"`
 		ConfirmEmbeddingReset bool            `json:"confirmEmbeddingReset"`
+		OperationID           string          `json:"operationId"`
 	}
 	if err := c.ShouldBindJSON(&request); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+	if request.Action == "recover" {
+		if _, err := uuid.Parse(request.OperationID); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "operationId must be a UUID"})
+			return
+		}
+		ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+		defer cancel()
+		job, err := recoverPlatformConfigJob(ctx, request.OperationID)
+		if err != nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Configuration recovery unavailable"})
+			return
+		}
+		c.JSON(http.StatusAccepted, gin.H{"operation": job})
 		return
 	}
 	if request.Action == "models" {
@@ -206,6 +248,25 @@ func handleSavePlatformModelConfig(c *gin.Context) {
 	if len(request.Config) == 0 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "config is required"})
 		return
+	}
+	if request.OperationID != "" {
+		parsed, parseErr := uuid.Parse(request.OperationID)
+		if parseErr != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "operationId must be a UUID"})
+			return
+		}
+		request.OperationID = parsed.String()
+		ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+		existing, lookupErr := loadPlatformConfigJob(ctx, request.OperationID)
+		cancel()
+		if lookupErr == nil {
+			c.JSON(http.StatusAccepted, gin.H{"operation": existing})
+			return
+		}
+		if !errors.Is(lookupErr, sql.ErrNoRows) {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Configuration operation status unavailable"})
+			return
+		}
 	}
 
 	if !platformModelConfigAdminMu.TryLock() {
@@ -272,49 +333,45 @@ func handleSavePlatformModelConfig(c *gin.Context) {
 		}
 		defer platformModelConfigBarrier.Unlock()
 	}
-	clearedRelay := clearedRelayIndexes{}
-	if validated.EmbeddingChanged {
-		clearedRelay, err = clearAllRelayIndexState(ctx)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "清理旧索引失败，配置未切换"})
-			return
-		}
+	operationID := request.OperationID
+	if operationID == "" {
+		operationID = uuid.NewString()
 	}
-	savedData, savedStatus, err := callLCEPlatformConfig(ctx, http.MethodPost, map[string]interface{}{
-		"action":                "save",
+	if _, err := uuid.Parse(operationID); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "operationId must be a UUID"})
+		return
+	}
+	preparedData, preparedStatus, err := callLCEPlatformConfig(ctx, http.MethodPost, map[string]interface{}{
+		"action":                "prepare",
+		"operationId":           operationID,
 		"config":                config,
 		"confirmEmbeddingReset": request.ConfirmEmbeddingReset,
 		"validationTicket":      validated.ValidationTicket,
 	})
 	if err != nil {
-		message := "未能确认 LCE 是否已保存配置，请刷新配置核对后再重试"
-		if validated.EmbeddingChanged {
-			message = "Relay 索引状态已清理，但未能确认 LCE 是否已切换配置，请刷新配置核对后再重试"
-		}
-		status := http.StatusBadGateway
-		if ctx.Err() != nil {
-			status = http.StatusGatewayTimeout
-		}
-		c.JSON(status, gin.H{
-			"error": message,
-		})
+		c.JSON(http.StatusBadGateway, gin.H{"error": "配置准备失败，未启动保存任务"})
 		return
 	}
-	if savedStatus < 200 || savedStatus >= 300 {
-		message := lceConfigError(savedData, "保存模型配置失败")
-		if validated.EmbeddingChanged {
-			message = "Relay 索引状态已清理，但 LCE 未切换配置；请重试保存"
+	if preparedStatus != http.StatusOK {
+		c.JSON(preparedStatus, gin.H{"error": lceConfigError(preparedData, "配置准备失败")})
+		return
+	}
+	var prepared struct {
+		Operation cloudPlatformConfigOperation `json:"operation"`
+	}
+	if json.Unmarshal(preparedData, &prepared) != nil || prepared.Operation.OperationID != operationID || prepared.Operation.State != "prepared" || prepared.Operation.EmbeddingChanged != validated.EmbeddingChanged {
+		c.JSON(http.StatusBadGateway, gin.H{"error": "LCE 返回了无效的准备响应"})
+		return
+	}
+	job, err := enqueuePlatformConfigJob(ctx, operationID, request.Section, validated.EmbeddingChanged)
+	if err != nil {
+		if errors.Is(err, errIndexOperationBusy) {
+			c.JSON(http.StatusConflict, gin.H{"error": "索引或配置任务正在执行，请等待完成后重试"})
+			return
 		}
-		c.JSON(savedStatus, gin.H{"error": message})
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "无法确认保存任务是否已受理，请查询任务状态", "operationId": operationID})
 		return
 	}
-	var saved map[string]interface{}
-	if json.Unmarshal(savedData, &saved) != nil {
-		c.JSON(http.StatusBadGateway, gin.H{"error": "LCE 返回了无效的保存响应"})
-		return
-	}
-	if validated.EmbeddingChanged {
-		saved["clearedRelay"] = clearedRelay
-	}
-	c.JSON(http.StatusOK, saved)
+	c.Header("Cache-Control", "no-store")
+	c.JSON(http.StatusAccepted, gin.H{"operation": job})
 }

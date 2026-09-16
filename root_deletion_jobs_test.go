@@ -18,18 +18,19 @@ func rootDeletionTestJob(status string) rootDeletionJob {
 	return rootDeletionJob{
 		ID: "1aa907f1-5a18-4559-8939-ac6f6db93091", TenantID: "tenant-a", ActorID: "actor-a",
 		RootID: "repo-a", Status: status, AttemptID: "ea47c3d4-e29e-4571-ac34-88779d01e478",
-		CreatedAt: time.Date(2026, time.September, 8, 1, 0, 0, 0, time.UTC),
-		UpdatedAt: time.Date(2026, time.September, 8, 1, 1, 0, 0, time.UTC),
+		AttemptCount: 1,
+		CreatedAt:    time.Date(2026, time.September, 8, 1, 0, 0, 0, time.UTC),
+		UpdatedAt:    time.Date(2026, time.September, 8, 1, 1, 0, 0, time.UTC),
 	}
 }
 
 func rootDeletionTestRows(jobs ...rootDeletionJob) *sqlmock.Rows {
 	rows := sqlmock.NewRows([]string{
-		"id", "user_id", "actor_id", "root_id", "status", "attempt_id", "deleted_files", "error", "created_at", "updated_at",
+		"id", "user_id", "actor_id", "root_id", "status", "attempt_id", "deleted_files", "error", "created_at", "updated_at", "attempt_count", "recovery_required",
 	})
 	for _, job := range jobs {
 		rows.AddRow(job.ID, job.TenantID, job.ActorID, job.RootID, job.Status,
-			job.AttemptID, job.DeletedFiles, job.Error, job.CreatedAt, job.UpdatedAt)
+			job.AttemptID, job.DeletedFiles, job.Error, job.CreatedAt, job.UpdatedAt, job.AttemptCount, job.RecoveryRequired)
 	}
 	return rows
 }
@@ -50,7 +51,7 @@ func expectRootDeletionCurrent(mock sqlmock.Sqlmock, job rootDeletionJob, curren
 
 func expectRootDeletionError(mock sqlmock.Sqlmock, job rootDeletionJob, status string) {
 	mock.ExpectExec(`(?s)UPDATE root_deletion_jobs SET status = \$4, error = \$5.*id = \$1 AND user_id = \$2 AND attempt_id = \$3 AND status = 'running' AND claim_until > NOW\(\)`).
-		WithArgs(job.ID, job.TenantID, job.AttemptID, status, sqlmock.AnyArg()).
+		WithArgs(job.ID, job.TenantID, job.AttemptID, status, sqlmock.AnyArg(), sqlmock.AnyArg(), job.AttemptCount >= rootDeletionMaxAttempts, sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 }
 
@@ -289,14 +290,14 @@ func TestRootDeletionListUnauthenticatedAndDatabaseErrors(t *testing.T) {
 func TestRootDeletionClaimUsesSkipLockedAndRecoversExpiredRunningTasks(t *testing.T) {
 	withMockDB(t, func(mock sqlmock.Sqlmock) {
 		job := rootDeletionTestJob("running")
-		mock.ExpectQuery(`(?s)WITH candidate AS \(.*status = 'queued' OR \(status = 'running' AND claim_until < NOW\(\)\).*LIMIT 1 FOR UPDATE SKIP LOCKED.*SET status = 'running', attempt_id = \$1.*claim_until = NOW\(\) \+ \(\$2 \* INTERVAL '1 millisecond'\)`).
-			WithArgs(sqlmock.AnyArg(), rootDeletionClaimDuration.Milliseconds()).WillReturnRows(rootDeletionTestRows(job))
+		mock.ExpectQuery(`(?s)WITH exhausted AS \(.*candidate AS \(.*status = 'queued' OR \(status = 'running' AND claim_until < NOW\(\)\).*next_attempt_at <= NOW\(\) AND NOT recovery_required AND attempt_count < \$3.*LIMIT 1 FOR UPDATE SKIP LOCKED.*SET status = 'running', attempt_id = \$1.*claim_until = NOW\(\) \+ \(\$2 \* INTERVAL '1 millisecond'\)`).
+			WithArgs(sqlmock.AnyArg(), rootDeletionClaimDuration.Milliseconds(), rootDeletionMaxAttempts).WillReturnRows(rootDeletionTestRows(job))
 		claimed, err := claimRootDeletion(context.Background())
 		if err != nil || claimed.ID != job.ID || claimed.AttemptID != job.AttemptID || claimed.Status != "running" {
 			t.Fatalf("claim=%+v error=%v", claimed, err)
 		}
-		mock.ExpectQuery("WITH candidate AS").
-			WithArgs(sqlmock.AnyArg(), rootDeletionClaimDuration.Milliseconds()).WillReturnRows(rootDeletionTestRows())
+		mock.ExpectQuery("WITH exhausted AS").
+			WithArgs(sqlmock.AnyArg(), rootDeletionClaimDuration.Milliseconds(), rootDeletionMaxAttempts).WillReturnRows(rootDeletionTestRows())
 		if _, err := claimRootDeletion(context.Background()); !errors.Is(err, sql.ErrNoRows) {
 			t.Fatalf("empty queue error=%v", err)
 		}
@@ -358,14 +359,14 @@ func TestRootDeletionUnknownOutcomeRetainsRunningMarker(t *testing.T) {
 	}
 }
 
-func TestRootDeletionDefinitiveCloudFailureMarksTaskFailed(t *testing.T) {
+func TestRootDeletionCloudErrorCannotDisproveAnEarlierAttempt(t *testing.T) {
 	withMockDB(t, func(mock sqlmock.Sqlmock) {
 		job := rootDeletionTestJob("running")
 		stubRootDeletionLease(t, func(ctx context.Context, _ string) (deleteRootOperationLease, error) {
 			return noopDeleteRootLease{ctx: ctx}, nil
 		})
 		expectRootDeletionCurrent(mock, job, true)
-		expectRootDeletionError(mock, job, "failed")
+		expectRootDeletionError(mock, job, "running")
 		stubLCEClearIndexRoot(t, func(context.Context, string, string) (*mcpToolResult, error) {
 			return &mcpToolResult{IsError: true, Content: []byte(`{"error":"transaction rolled back"}`)}, nil
 		})
@@ -431,7 +432,7 @@ func TestRootDeletionRequestCancellationDoesNotCancelQueuedWork(t *testing.T) {
 			if !ok || time.Until(deadline) <= 0 || time.Until(deadline) > rootDeletionRunTimeout {
 				t.Fatal("worker must have its own bounded operation deadline")
 			}
-			return &mcpToolResult{Content: []byte(`{"deleted":true}`)}, nil
+			return rootDeletionCloudResult(job, 7), nil
 		})
 		processRootDeletion(context.Background(), job)
 		if !called {
@@ -479,7 +480,7 @@ func TestRootDeletionCleanupFailureRollsBackAndKeepsMarkerForRetry(t *testing.T)
 		mock.ExpectRollback()
 		expectRootDeletionError(mock, job, "running")
 		stubLCEClearIndexRoot(t, func(context.Context, string, string) (*mcpToolResult, error) {
-			return &mcpToolResult{Content: []byte(`{"deleted_files":12}`)}, nil
+			return rootDeletionCloudResult(job, 12), nil
 		})
 		processRootDeletion(context.Background(), job)
 	})

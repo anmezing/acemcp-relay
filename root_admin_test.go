@@ -79,8 +79,15 @@ func newRootAdminContext(t *testing.T, userID, method, body string) (*gin.Contex
 func stubLCEClearIndexRoot(t *testing.T, fn func(ctx context.Context, userID, rootID string) (*mcpToolResult, error)) {
 	t.Helper()
 	previous := lceClearIndexRoot
+	previousOperation := lceClearIndexRootOperation
 	lceClearIndexRoot = fn
-	t.Cleanup(func() { lceClearIndexRoot = previous })
+	lceClearIndexRootOperation = func(ctx context.Context, tenant, root, operation string) (*mcpToolResult, error) {
+		if operation == "" {
+			t.Fatal("durable deletion requires an operation identity")
+		}
+		return fn(ctx, tenant, root)
+	}
+	t.Cleanup(func() { lceClearIndexRoot = previous; lceClearIndexRootOperation = previousOperation })
 }
 
 func activeJobRows() *sqlmock.Rows {

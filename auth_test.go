@@ -5,6 +5,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
+	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
@@ -71,7 +73,7 @@ func TestAuthenticateRequestMD5KeyStillAuthenticates(t *testing.T) {
 	mock.ExpectQuery("SELECT keys.user_id, COALESCE").WithArgs(md5Hex, sha256Hex).
 		WillReturnRows(sqlmock.NewRows([]string{"user_id", "tier", "org_id"}).AddRow("user-md5", "free", ""))
 
-	if id, ok := authenticateRequest(context); !ok || id.UserID != "user-md5" {
+	if id, ok, _ := authenticateRequest(context); !ok || id.UserID != "user-md5" {
 		t.Fatalf("expected MD5 key to authenticate, got user=%q ok=%v", id.UserID, ok)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
@@ -89,7 +91,7 @@ func TestAuthenticateRequestSHA256KeyAuthenticates(t *testing.T) {
 	mock.ExpectQuery("SELECT keys.user_id, COALESCE").WithArgs(md5Hex, sha256Hex).
 		WillReturnRows(sqlmock.NewRows([]string{"user_id", "tier", "org_id"}).AddRow("user-sha", "free", ""))
 
-	if id, ok := authenticateRequest(context); !ok || id.UserID != "user-sha" {
+	if id, ok, _ := authenticateRequest(context); !ok || id.UserID != "user-sha" {
 		t.Fatalf("expected SHA-256 key to authenticate, got user=%q ok=%v", id.UserID, ok)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
@@ -108,7 +110,7 @@ func TestAuthenticateRequestCacheHitSkipsDatabase(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"user_id", "tier", "org_id"}).AddRow("user-1", "free", ""))
 
 	for i := 0; i < 3; i++ {
-		if id, ok := authenticateRequest(context); !ok || id.UserID != "user-1" {
+		if id, ok, _ := authenticateRequest(context); !ok || id.UserID != "user-1" {
 			t.Fatalf("attempt %d: expected cache-backed auth, got user=%q ok=%v", i, id.UserID, ok)
 		}
 	}
@@ -128,15 +130,15 @@ func TestAuthenticateRequestTTLExpiryRequeriesAndRevokesRotatedKey(t *testing.T)
 	mock.ExpectQuery("SELECT keys.user_id, COALESCE").WithArgs(md5Hex, sha256Hex).
 		WillReturnRows(sqlmock.NewRows([]string{"user_id", "tier", "org_id"}))
 
-	if id, ok := authenticateRequest(context); !ok || id.UserID != "user-1" {
+	if id, ok, _ := authenticateRequest(context); !ok || id.UserID != "user-1" {
 		t.Fatalf("expected current key to authenticate, got user=%q ok=%v", id.UserID, ok)
 	}
 	// TTL 内旧 key 仍可通过缓存认证（撤销延迟 ≤30s，已定案语义）
-	if _, ok := authenticateRequest(context); !ok {
+	if _, ok, _ := authenticateRequest(context); !ok {
 		t.Fatal("within TTL the cached key should still authenticate")
 	}
 	backdateAuthCacheEntry(t, token)
-	if id, ok := authenticateRequest(context); ok || id.UserID != "" {
+	if id, ok, _ := authenticateRequest(context); ok || id.UserID != "" {
 		t.Fatalf("after TTL expiry rotated key must stop authenticating, got user=%q ok=%v", id.UserID, ok)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
@@ -155,7 +157,7 @@ func TestAuthenticateRequestNegativeCacheSuppressesRepeatedMisses(t *testing.T) 
 		WillReturnRows(sqlmock.NewRows([]string{"user_id", "tier", "org_id"}))
 
 	for i := 0; i < 3; i++ {
-		if _, ok := authenticateRequest(context); ok {
+		if _, ok, _ := authenticateRequest(context); ok {
 			t.Fatalf("attempt %d: unknown key must not authenticate", i)
 		}
 	}
@@ -167,7 +169,7 @@ func TestAuthenticateRequestNegativeCacheSuppressesRepeatedMisses(t *testing.T) 
 	mock.ExpectQuery("SELECT keys.user_id, COALESCE").WithArgs(md5Hex, sha256Hex).
 		WillReturnRows(sqlmock.NewRows([]string{"user_id", "tier", "org_id"}).AddRow("user-2", "free", ""))
 	backdateAuthCacheEntry(t, token)
-	if id, ok := authenticateRequest(context); !ok || id.UserID != "user-2" {
+	if id, ok, _ := authenticateRequest(context); !ok || id.UserID != "user-2" {
 		t.Fatalf("after negative TTL expiry expected re-query to authenticate, got user=%q ok=%v", id.UserID, ok)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
@@ -187,14 +189,36 @@ func TestAuthenticateRequestDatabaseErrorFailsClosedWithoutCaching(t *testing.T)
 	mock.ExpectQuery("SELECT keys.user_id, COALESCE").WithArgs(md5Hex, sha256Hex).
 		WillReturnRows(sqlmock.NewRows([]string{"user_id", "tier", "org_id"}).AddRow("user-3", "free", ""))
 
-	if _, ok := authenticateRequest(context); ok {
-		t.Fatal("DB error must fail closed")
+	if _, ok, err := authenticateRequest(context); ok || err == nil {
+		t.Fatal("DB error must fail closed and remain distinguishable from invalid credentials")
 	}
-	if id, ok := authenticateRequest(context); !ok || id.UserID != "user-3" {
+	if id, ok, _ := authenticateRequest(context); !ok || id.UserID != "user-3" {
 		t.Fatalf("after DB recovery expected auth to succeed, got user=%q ok=%v", id.UserID, ok)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestAuthMiddlewareDatabaseOutageReturnsServiceUnavailable(t *testing.T) {
+	for _, organization := range []bool{false, true} {
+		t.Run(fmt.Sprint(organization), func(t *testing.T) {
+			c, mock, cleanup := newAuthTestContext(t, "outage-token")
+			defer cleanup()
+			if organization {
+				mock.ExpectQuery("SELECT keys.user_id, COALESCE").WillReturnRows(sqlmock.NewRows([]string{"user_id", "tier", "org_id"}).AddRow("member", "free", "org"))
+				mock.ExpectQuery("WITH target_membership").WillReturnError(errors.New("database unavailable"))
+			} else {
+				mock.ExpectQuery("SELECT keys.user_id, COALESCE").WillReturnError(errors.New("database unavailable"))
+			}
+			authMiddleware()(c)
+			if c.Writer.Status() != http.StatusServiceUnavailable {
+				t.Fatalf("status=%d", c.Writer.Status())
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }
 
@@ -278,11 +302,11 @@ func TestAuthenticateRequestReadsTierAndCachesIt(t *testing.T) {
 	mock.ExpectQuery("SELECT keys.user_id, COALESCE").WithArgs(md5Hex, sha256Hex).
 		WillReturnRows(sqlmock.NewRows([]string{"user_id", "tier", "org_id"}).AddRow("user-pro", "pro", ""))
 
-	proIdentity, ok := authenticateRequest(context)
+	proIdentity, ok, _ := authenticateRequest(context)
 	if !ok || proIdentity.UserID != "user-pro" || proIdentity.Tier != tierPro {
 		t.Fatalf("expected pro tier auth, got user=%q tier=%q ok=%v", proIdentity.UserID, proIdentity.Tier, ok)
 	}
-	if cached, ok := authenticateRequest(context); !ok || cached.Tier != tierPro {
+	if cached, ok, _ := authenticateRequest(context); !ok || cached.Tier != tierPro {
 		t.Fatalf("cached auth must keep the tier, got tier=%q ok=%v", cached.Tier, ok)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
@@ -299,7 +323,7 @@ func TestAuthenticateRequestUnknownTierFallsBackToFree(t *testing.T) {
 	mock.ExpectQuery("SELECT keys.user_id, COALESCE").WithArgs(md5Hex, sha256Hex).
 		WillReturnRows(sqlmock.NewRows([]string{"user_id", "tier", "org_id"}).AddRow("user-w", "platinum", ""))
 
-	if weird, ok := authenticateRequest(context); !ok || weird.Tier != tierFree {
+	if weird, ok, _ := authenticateRequest(context); !ok || weird.Tier != tierFree {
 		t.Fatalf("unknown tier must normalize to free, got tier=%q ok=%v", weird.Tier, ok)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
@@ -337,14 +361,14 @@ func TestAuthenticateRequestCachesOrgKeyButRevalidatesDynamicAuthorization(t *te
 	expectOrgAuthorization(mock, "org-1", "user-m", "member", "owner-1", 3, 1)
 	expectOrgAuthorization(mock, "org-1", "user-m", "member", "owner-1", 3, 1)
 
-	identity, ok := authenticateRequest(context)
+	identity, ok, _ := authenticateRequest(context)
 	if !ok || identity.OrgID != "org-1" || identity.OrgRole != "member" {
 		t.Fatalf("expected org identity, got %+v ok=%v", identity, ok)
 	}
 	if identity.TenantID() != "org-1" {
 		t.Fatalf("tenant must resolve to org_id, got %q", identity.TenantID())
 	}
-	if cached, ok := authenticateRequest(context); !ok || cached.OrgID != "org-1" || cached.OrgRole != "member" {
+	if cached, ok, _ := authenticateRequest(context); !ok || cached.OrgID != "org-1" || cached.OrgRole != "member" {
 		t.Fatalf("cached key must retain org identity after revalidation, got %+v ok=%v", cached, ok)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
@@ -363,7 +387,7 @@ func TestAuthenticateRequestRejectsOrgKeyWithoutCurrentMembership(t *testing.T) 
 			AddRow("removed-user", "free", "org-1"))
 	expectOrgAuthorization(mock, "org-1", "removed-user", "", "owner-1", 3, 1)
 
-	if identity, ok := authenticateRequest(context); ok || identity.UserID != "" {
+	if identity, ok, _ := authenticateRequest(context); ok || identity.UserID != "" {
 		t.Fatalf("removed organization member must not authenticate, got %+v ok=%v", identity, ok)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
@@ -383,7 +407,7 @@ func TestAuthenticateRequestRejectsMemberImmediatelyAfterSubscriptionExpiry(t *t
 	// 无有效订阅时 active_entitlement 回落为 0；已有非 owner 成员必须立即失效。
 	expectOrgAuthorization(mock, "org-1", "member-1", "member", "owner-1", 0, 1)
 
-	if identity, ok := authenticateRequest(context); ok || identity.UserID != "" {
+	if identity, ok, _ := authenticateRequest(context); ok || identity.UserID != "" {
 		t.Fatalf("expired organization seat must not authenticate, got %+v ok=%v", identity, ok)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
@@ -402,7 +426,7 @@ func TestAuthenticateRequestAllowsCanonicalOwnerWithoutPaidSeat(t *testing.T) {
 			AddRow("owner-1", "free", "org-1"))
 	expectOrgAuthorization(mock, "org-1", "owner-1", "owner", "owner-1", 0, 0)
 
-	identity, ok := authenticateRequest(context)
+	identity, ok, _ := authenticateRequest(context)
 	if !ok || identity.OrgRole != orgRoleOwner || identity.TenantID() != "org-1" {
 		t.Fatalf("canonical owner must authenticate without consuming a seat, got %+v ok=%v", identity, ok)
 	}
@@ -422,7 +446,7 @@ func TestAuthenticateRequestFailsClosedWhenStoredMembershipsExceedSeatLimit(t *t
 			AddRow("member-3", "free", "org-1"))
 	expectOrgAuthorization(mock, "org-1", "member-3", "member", "owner-1", 2, 3)
 
-	if identity, ok := authenticateRequest(context); ok || identity.UserID != "" {
+	if identity, ok, _ := authenticateRequest(context); ok || identity.UserID != "" {
 		t.Fatalf("overallocated organization must fail closed, got %+v ok=%v", identity, ok)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {

@@ -38,8 +38,13 @@ func TestMigrateErrorDetailsTableEnforcesCascadeDelete(t *testing.T) {
 	db = mockDB
 	defer func() { db = previousDB }()
 
-	mock.ExpectExec(`(?s)CREATE TABLE IF NOT EXISTS error_details .*REFERENCES request_logs\(id\) ON DELETE CASCADE.*DO \$\$.*confdeltype.*ON DELETE CASCADE`).
+	mock.ExpectExec(`(?s)CREATE TABLE IF NOT EXISTS error_details .*REFERENCES request_logs\(id\) ON DELETE CASCADE.*DO \$\$.*confdeltype.*ON DELETE CASCADE NOT VALID`).
 		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec(`(?s)DO.*NOT convalidated.*VALIDATE CONSTRAINT`).WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec(`SELECT pg_advisory_lock`).WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery(`SELECT EXISTS.*pg_index`).WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
+	mock.ExpectExec(`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_error_details_request_id`).WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec(`SELECT pg_advisory_unlock`).WillReturnResult(sqlmock.NewResult(0, 1))
 
 	if err := migrateErrorDetailsTable(); err != nil {
 		t.Fatalf("migrateErrorDetailsTable() error = %v", err)

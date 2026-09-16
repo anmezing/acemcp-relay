@@ -115,10 +115,14 @@ func newIndexOperationLease(ctx context.Context, userID, token string) *indexOpe
 // Only acquisition has a short deadline; the lease belongs to the caller's
 // operation context and must survive that acquisition deadline.
 func tryExclusiveIndexOperation(ctx context.Context, tenantID, kind string) (*indexOperationLease, error) {
+	return tryIndexOperation(ctx, tenantID, "*", kind, indexOperationExclusive)
+}
+
+func tryIndexOperation(ctx context.Context, tenantID, resource, kind string, mode indexOperationMode) (*indexOperationLease, error) {
 	acquireCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	token := uuid.NewString()
-	acquired, err := tryAcquireIndexOperation(acquireCtx, tenantID, "*", kind, token, indexOperationExclusive)
+	acquired, err := tryAcquireIndexOperation(acquireCtx, tenantID, resource, kind, token, mode)
 	if err != nil {
 		return nil, err
 	}
@@ -159,6 +163,9 @@ func tryAcquireIndexOperation(
 				SELECT 1 FROM root_deletion_jobs
 				WHERE user_id = $2 AND status IN ('queued', 'running')
 				  AND $5::text <> 'delete-root-job'
+			)
+			AND NOT EXISTS (
+				SELECT 1 FROM platform_config_jobs WHERE embedding_changed AND status IN ('pending','running')
 			)
 			RETURNING 1
 		)

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -9,7 +10,55 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 )
+
+func TestContractPinDurableRecoveryAndSwiftAccounting(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("contracts", "cloud-protocol.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var contract struct {
+		SwiftSync struct {
+			PartBytes, MaxParts int
+			Accounting          struct {
+				RequestsPerMinutePerTenant                   int
+				PartLedgerRetentionMs                        int64
+				InteractiveRequestQuota                      bool
+				UploadByteUnit, UploadBytePool, UsageLogPath string
+			}
+		}
+		RootDeletions struct {
+			AutomaticAttempts int
+			Fields            []string
+		}
+		PlatformConfiguration struct {
+			AutomaticAttempts int
+			SaveStatus        int
+		}
+	}
+	if err := json.Unmarshal(raw, &contract); err != nil {
+		t.Fatal(err)
+	}
+	a := contract.SwiftSync.Accounting
+	if contract.SwiftSync.PartBytes != swiftSyncPartBytes || contract.SwiftSync.MaxParts != swiftSyncMaxParts || a.RequestsPerMinutePerTenant != swiftSyncRequestsPerMinute || a.PartLedgerRetentionMs != int64(swiftPartChargeRetention/time.Millisecond) || a.InteractiveRequestQuota || a.UploadByteUnit != "decoded_bytes" || a.UploadBytePool != "index_bytes" || a.UsageLogPath != "/mcp/tools/call/"+swiftSyncToolName {
+		t.Fatalf("Swift accounting contract drift: %+v", contract.SwiftSync)
+	}
+	if contract.RootDeletions.AutomaticAttempts != rootDeletionMaxAttempts || contract.PlatformConfiguration.AutomaticAttempts != platformConfigJobMaxAttempts || contract.PlatformConfiguration.SaveStatus != 202 {
+		t.Fatal("durable recovery contract drift")
+	}
+	var fields []string
+	typeOf := reflect.TypeOf(rootDeletionJob{})
+	for i := 0; i < typeOf.NumField(); i++ {
+		field := strings.Split(typeOf.Field(i).Tag.Get("json"), ",")[0]
+		if field != "-" {
+			fields = append(fields, field)
+		}
+	}
+	if diff := diffStringSets("root deletion fields", fields, contract.RootDeletions.Fields); diff != "" {
+		t.Fatal(diff)
+	}
+}
 
 // ── 跨仓库契约钉住 ─────────────────────────────────────────────────────────
 //
@@ -25,10 +74,12 @@ import (
 // 三仓联动验证中比较文件摘要，避免依赖 sibling checkout 和静默 skip。
 
 type cloudProtocolContract struct {
-	SchemaVersion    string   `json:"schemaVersion"`
-	CloudToolSurface []string `json:"cloudToolSurface"`
-	ClientSyncTools  []string `json:"clientSyncTools"`
-	SwiftSync        struct {
+	SchemaVersion         string   `json:"schemaVersion"`
+	CloudToolSurface      []string `json:"cloudToolSurface"`
+	ClientSyncTools       []string `json:"clientSyncTools"`
+	OptionalUpstreamTools []string `json:"optionalUpstreamTools"`
+	IndexPathPolicySHA256 string   `json:"indexPathPolicySha256"`
+	SwiftSync             struct {
 		RequiredFields      []string `json:"requiredFields"`
 		OptionalFields      []string `json:"optionalFields"`
 		RelayInjectedFields []string `json:"relayInjectedFields"`
@@ -362,8 +413,8 @@ func TestContractPinIndexLimitNegotiation(t *testing.T) {
 
 func TestContractPinIndexStartOutcomes(t *testing.T) {
 	contract := loadCloudProtocolContract(t)
-	if contract.SchemaVersion != "1.10" {
-		t.Fatalf("cloud protocol schema version: got %q, want 1.10", contract.SchemaVersion)
+	if contract.SchemaVersion != "1.11" {
+		t.Fatalf("cloud protocol schema version: got %q, want 1.11", contract.SchemaVersion)
 	}
 	outcomes := contract.CodebaseIndex.StartOutcomes
 	if !reflect.DeepEqual(outcomes.Created.RequiredFields, []string{"job"}) ||
@@ -524,6 +575,18 @@ func TestContractPinRelayServerToolSurfaceMatchesContract(t *testing.T) {
 
 func TestContractPinSwiftSyncPolicy(t *testing.T) {
 	contract := loadCloudProtocolContract(t)
+	var optional []string
+	for name, policy := range chatMCPToolPolicies {
+		if policy.optional {
+			optional = append(optional, name)
+		}
+	}
+	if diff := diffStringSets("optional upstream tools", optional, contract.OptionalUpstreamTools); diff != "" {
+		t.Fatal(diff)
+	}
+	if got := fmt.Sprintf("%x", sha256.Sum256([]byte(strings.ReplaceAll(string(indexPathPolicyJSON), "\r\n", "\n")))); got != contract.IndexPathPolicySHA256 {
+		t.Fatalf("embedded index path policy differs from protocol digest: %s", got)
+	}
 	policy := chatMCPToolPolicies["codebase_swift_sync"]
 	var got []string
 	for key := range policy.arguments {

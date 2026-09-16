@@ -197,7 +197,16 @@ services:
     build: ../../lce
     container_name: lce-index
     restart: unless-stopped
+    # The worker drains active publication claims and releases its lease before
+    # exit. This must cover the documented cleanup deadline, not Docker's 10s default.
+    stop_grace_period: 45s
     command: ["node", "dist/cloud/indexPublicationEntry.js"]
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:3011/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
     extra_hosts: *host-gateway
     volumes:
       - lce_data:/data
@@ -223,6 +232,9 @@ services:
     build: ../
     container_name: relay
     restart: unless-stopped
+    # Relay drains HTTP requests, background writes, and worker claims during
+    # the bounded shutdown path. Keep the container alive through that drain.
+    stop_grace_period: 45s
     ports:
       - "127.0.0.1:3009:3009"
     extra_hosts: *host-gateway

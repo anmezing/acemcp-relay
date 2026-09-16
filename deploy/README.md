@@ -22,8 +22,8 @@ chmod 600 deploy/.env
 ./deploy/deploy.sh
 ```
 
-The normal deployment starts `neo4j`, `lce`, `neo4j-projector`, `relay`, and
-`frontend`. Neo4j data, logs, and the projector spool use persistent Compose
+The normal deployment starts `neo4j`, `lce`, `index-publication-worker`,
+`neo4j-projector`, `relay`, and `frontend`. Neo4j data, logs, and the projector spool use persistent Compose
 volumes. Never run `docker compose down -v` for a routine application update.
 
 All containers that can access host-managed PostgreSQL or Redis share the
@@ -41,13 +41,19 @@ The deploy script updates repositories independently: LCE follows
 `feat/multi-tenant-relay`, while relay and frontend follow `main`, unless an
 explicit `DEPLOY_REF_*` or `DEPLOY_BRANCH_*` override is supplied.
 
-Model configuration saves have a 90-second Relay deadline. Concurrent saves
-return a conflict instead of queueing. Prompt-enhancement and rerank updates
-do not acquire the index-reset barrier, and MCP notification SSE connections
-do not hold that barrier. Embedding switches retain exclusive index protection;
-when an index operation is active, saving returns a conflict without clearing
-indexes or switching configuration. A lost save response is not proof that the
-write failed: reload the current configuration before retrying.
+Model configuration saves have a 90-second Relay admission and provider-
+validation deadline. Accepted changes become durable operations with an
+immutable encrypted snapshot and a stable operation UUID; Relay returns `202`
+and the publication worker performs the cloud commit. Concurrent saves return a
+conflict instead of queueing. Prompt-enhancement and rerank updates do not
+acquire the index-reset barrier, and MCP notification SSE connections do not
+hold that barrier. Embedding switches retain exclusive index protection; when
+an index operation is active, saving returns a conflict without clearing
+indexes or switching configuration. The cloud operation can run for up to
+300 seconds and Relay keeps the durable task bounded by its worker deadline.
+After a lost response, recover the original operation by ID and wait for its
+terminal receipt; do not submit a second configuration change from an uncertain
+request. See `deploy/platform-config-recovery.md` for the recovery procedure.
 
 ## Root deletion jobs
 
@@ -107,14 +113,30 @@ activation. Health/readiness probes alone do not verify Host/Origin acceptance.
 Requests without Origin remain accepted; mismatched headers return 403. No index
 rebuild or data-volume removal is involved.
 
-Keep the same explicit `-f` list on subsequent allowlisted deployments. Normal
-`deploy.sh` uses only the base file and will remove overlay-provided allowlists
-when it recreates LCE. To deliberately return to phase 1, recreate only LCE with
+For subsequent allowlisted deployments, export `DEPLOY_HTTP_ACCESS=true` in the
+deployment environment and run `./deploy/deploy.sh`. The script includes both
+Compose files for startup and stability checks. This deployment switch is read
+from the shell environment, not from the Compose `.env` file. The default is
+`false`; retain the exported setting in the deployment job to keep allowlists.
+To deliberately return to phase 1, recreate only LCE with
 the base file; do not run `down -v` or delete indexes:
 
 ```bash
 docker compose --env-file .env -f docker-compose.yml up -d --no-deps --wait lce
 ```
+
+The normal rollout also starts `index-publication-worker`. Its loopback
+`127.0.0.1:3011/healthz` reports independent progress of source and Swift
+publication loops. Idle loops must complete a poll within 30 seconds; active
+work has its operation deadline plus cleanup allowance. HTTP LCE readiness is
+not a substitute for this worker check.
+
+Relay reconciles durable publication intent under the same job lease as its
+initial handoff. After one hour it requests upstream cancellation; it releases
+the tenant fence only after confirmed cancellation or a durable terminal result.
+Watch `relay_publication_recovery_total{result="overdue"}` and recovery logs.
+An unavailable upstream deliberately keeps the fence until reconciliation can
+establish that no late publication remains possible.
 
 ## Enabling graph algorithms
 
