@@ -436,13 +436,14 @@ func TestHandleListRootsReturnsEmptyArrayNotNull(t *testing.T) {
 // ── POST /mcp/dismiss-root-failure ─────────────────────────────────────────
 
 func expectDismissRootFailureTx(mock sqlmock.Sqlmock, userID, rootID string, dismissed int64, hasPublishedIndex bool) {
+	// 已发布索引的判断在事务外、云端清理之前完成
+	mock.ExpectQuery("SELECT EXISTS").
+		WithArgs(userID, rootID).
+		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(hasPublishedIndex))
 	mock.ExpectBegin()
 	mock.ExpectExec("pg_advisory_xact_lock").
 		WithArgs(userID).
 		WillReturnResult(sqlmock.NewResult(0, 0))
-	// 检查是否有已发布的索引
-	mock.ExpectQuery("SELECT EXISTS").
-		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(hasPublishedIndex))
 	// 删除失败任务
 	mock.ExpectExec("DELETE FROM index_jobs").
 		WithArgs(userID, rootID, indexJobStatusFailed, indexJobStatusTimedOut).
@@ -481,7 +482,12 @@ func TestHandleDismissRootFailureClearsWorkspaceWhenNoPublishedIndex(t *testing.
 		mock.ExpectQuery("SELECT EXISTS").
 			WithArgs("user-1", "repo-b").
 			WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
-		// 没有已发布索引（首次索引失败），完全清理 workspace
+		// 没有已发布索引（首次索引失败）：先清云端 root，再完全清理 workspace
+		var cleared []string
+		stubLCEClearIndexRoot(t, func(ctx context.Context, userID, rootID string) (*mcpToolResult, error) {
+			cleared = append(cleared, userID+"/"+rootID)
+			return &mcpToolResult{Content: []byte(`{"deleted_files":0}`)}, nil
+		})
 		expectDismissRootFailureTx(mock, "user-1", "repo-b", 1, false)
 
 		c, recorder := newRootAdminContext(t, "user-1", "POST", `{"root_id":"repo-b"}`)
@@ -492,7 +498,30 @@ func TestHandleDismissRootFailureClearsWorkspaceWhenNoPublishedIndex(t *testing.
 		if !strings.Contains(recorder.Body.String(), `"dismissed_jobs":1`) {
 			t.Fatalf("unexpected response: %s", recorder.Body.String())
 		}
-		// 测试确认：没有已发布索引时会删除 workspace（expectDismissRootFailureTx 中已配置）
+		if len(cleared) != 1 || cleared[0] != "user-1/repo-b" {
+			t.Fatalf("LCE root must be cleared before the workspace is dropped, got %v", cleared)
+		}
+	})
+}
+
+func TestHandleDismissRootFailureKeepsWorkspaceWhenCloudClearFails(t *testing.T) {
+	withMockDB(t, func(mock sqlmock.Sqlmock) {
+		mock.ExpectQuery("SELECT EXISTS").
+			WithArgs("user-1", "repo-b").
+			WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
+		mock.ExpectQuery("SELECT EXISTS").
+			WithArgs("user-1", "repo-b").
+			WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
+		stubLCEClearIndexRoot(t, func(ctx context.Context, userID, rootID string) (*mcpToolResult, error) {
+			return nil, errors.New("lce unreachable")
+		})
+		// 云端失败时不得进入本地事务：workspace 与失败记录保留，用户可重试
+
+		c, recorder := newRootAdminContext(t, "user-1", "POST", `{"root_id":"repo-b"}`)
+		handleDismissRootFailure(c)
+		if recorder.Code != 502 {
+			t.Fatalf("status = %d, want 502, body = %s", recorder.Code, recorder.Body.String())
+		}
 	})
 }
 
@@ -501,6 +530,9 @@ func TestHandleDismissRootFailureIsIdempotent(t *testing.T) {
 		mock.ExpectQuery("SELECT EXISTS").
 			WithArgs("user-1", "repo-a").
 			WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
+		stubLCEClearIndexRoot(t, func(ctx context.Context, userID, rootID string) (*mcpToolResult, error) {
+			return &mcpToolResult{Content: []byte(`{"deleted_files":0}`)}, nil
+		})
 		expectDismissRootFailureTx(mock, "user-1", "repo-a", 0, false)
 
 		c, recorder := newRootAdminContext(t, "user-1", "POST", `{"root_id":"repo-a"}`)

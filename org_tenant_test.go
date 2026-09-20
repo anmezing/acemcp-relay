@@ -614,12 +614,20 @@ func TestHandleDismissRootFailureOrgOwnerUsesOrgTenant(t *testing.T) {
 		mock.ExpectQuery("SELECT EXISTS").
 			WithArgs("org-1", "repo-a").
 			WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
+		var clearedTenant string
+		stubLCEClearIndexRoot(t, func(ctx context.Context, userID, rootID string) (*mcpToolResult, error) {
+			clearedTenant = userID
+			return &mcpToolResult{Content: []byte(`{"deleted_files":0}`)}, nil
+		})
 		expectDismissRootFailureTx(mock, "org-1", "repo-a", 1, false)
 
 		c, recorder := newOrgContext(t, "owner-1", "org-1", "owner", "POST", `{"root_id":"repo-a"}`)
 		handleDismissRootFailure(c)
 		if recorder.Code != 200 || !strings.Contains(recorder.Body.String(), `"dismissed_jobs":1`) {
 			t.Fatalf("unexpected response: %d %s", recorder.Code, recorder.Body.String())
+		}
+		if clearedTenant != "org-1" {
+			t.Fatalf("cloud clear must use the org tenant, got %q", clearedTenant)
 		}
 	})
 }

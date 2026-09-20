@@ -509,22 +509,10 @@ func deleteRootIndexState(ctx context.Context, userID, rootID string) (int64, er
 	return deletedFiles, tx.Commit()
 }
 
-// dismissRootFailureState 清理该 root 的失败/超时任务。如果该 root 没有任何已发布的
-// 索引数据（首次索引失败），则完全清理 workspace 和相关状态，让用户重启 IDE 后能够
-// 重新开始干净的索引；如果有已发布的快照（更新失败但旧索引可用），则只删除失败任务，
-// 保留 workspace、indexed_files 与 LCE 云端快照，不会误删仍可检索的数据。
-func dismissRootFailureState(ctx context.Context, userID, rootID string) (int64, error) {
-	tx, err := beginLockedIndexUserTx(ctx, userID)
-	if err != nil {
-		return 0, err
-	}
-	defer tx.Rollback()
-
-	normalizedRootID := lceIndexRootID(rootID)
-
-	// 检查该 root 是否有已发布的索引数据
+// rootHasPublishedIndex 报告该 root 是否有已发布（可检索）的索引数据。
+func rootHasPublishedIndex(ctx context.Context, userID, rootID string) (bool, error) {
 	var hasPublishedIndex bool
-	err = tx.QueryRowContext(ctx, `
+	err := db.QueryRowContext(ctx, `
 		SELECT EXISTS(
 			SELECT 1 FROM indexed_files AS files
 			JOIN index_workspaces AS workspaces
@@ -533,10 +521,23 @@ func dismissRootFailureState(ctx context.Context, userID, rootID string) (int64,
 			WHERE workspaces.user_id = $1
 			  AND CASE WHEN BTRIM(workspaces.root_id) = '' THEN 'default' ELSE BTRIM(workspaces.root_id) END = $2
 		)
-	`, userID, normalizedRootID).Scan(&hasPublishedIndex)
+	`, userID, lceIndexRootID(rootID)).Scan(&hasPublishedIndex)
+	return hasPublishedIndex, err
+}
+
+// dismissRootFailureState 清理该 root 的失败/超时任务。如果该 root 没有任何已发布的
+// 索引数据（首次索引失败），则完全清理 workspace 和相关状态，让用户重启 IDE 后能够
+// 重新开始干净的索引；如果有已发布的快照（更新失败但旧索引可用），则只删除失败任务，
+// 保留 workspace、indexed_files 与 LCE 云端快照，不会误删仍可检索的数据。
+// 调用方在 hasPublishedIndex 为 false 时必须先清掉 LCE 侧的 root，再进入这里。
+func dismissRootFailureState(ctx context.Context, userID, rootID string, hasPublishedIndex bool) (int64, error) {
+	tx, err := beginLockedIndexUserTx(ctx, userID)
 	if err != nil {
 		return 0, err
 	}
+	defer tx.Rollback()
+
+	normalizedRootID := lceIndexRootID(rootID)
 
 	// 删除失败/超时的任务
 	result, err := tx.ExecContext(ctx, `
@@ -609,7 +610,32 @@ func handleDismissRootFailure(c *gin.Context) {
 		return
 	}
 
-	dismissed, err := dismissRootFailureState(opCtx, tenantID, rootID)
+	hasPublishedIndex, err := rootHasPublishedIndex(opCtx, tenantID, rootID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "检查已发布索引失败: " + err.Error()})
+		completeRequestLogAsync(getRequestLogEntry(c, http.StatusInternalServerError))
+		return
+	}
+	// 首次索引失败时 workspace 会被整个删除，之后 UI 上再也看不到这个 root。
+	// LCE 在 begin 时已为它建了 roots 行，极端情况下（LCE 发布成功但 Relay 未记录）
+	// 还有完整文件；不先清云端就会留下用户无法发现也无法删除的残留。
+	// 与 delete-root 一致：先云端后本地，云端失败则本地不动，用户可重试。
+	if !hasPublishedIndex {
+		result, err := lceClearIndexRoot(opCtx, tenantID, rootID)
+		if err != nil || result == nil || result.IsError {
+			detail := "empty LCE response"
+			if err != nil {
+				detail = err.Error()
+			} else if result != nil {
+				detail = string(result.Content)
+			}
+			c.JSON(http.StatusBadGateway, gin.H{"error": "清除云端索引失败: " + detail})
+			completeRequestLogWithErrorAsync(getRequestLogEntry(c, http.StatusBadGateway), "lce", detail)
+			return
+		}
+	}
+
+	dismissed, err := dismissRootFailureState(opCtx, tenantID, rootID, hasPublishedIndex)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "清理索引失败记录失败: " + err.Error()})
 		completeRequestLogAsync(getRequestLogEntry(c, http.StatusInternalServerError))
