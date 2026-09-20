@@ -169,3 +169,58 @@ func TestPublicationReconcileConsumesCompletedRevisionWithoutRepublishing(t *tes
 		t.Fatalf("calls: %v", calls)
 	}
 }
+
+func TestBeginLCEIndexJobRetriesTransientPoolTimeout(t *testing.T) {
+	previousBackoff := lceBeginRetryBackoff
+	lceBeginRetryBackoff = [...]time.Duration{time.Millisecond, time.Millisecond}
+	t.Cleanup(func() { lceBeginRetryBackoff = previousBackoff })
+
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "application/json")
+		text := `{"ok":true}`
+		isError := false
+		if calls < 3 {
+			text = `{"error":{"message":"timeout exceeded when trying to connect"}}`
+			isError = true
+		}
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"jsonrpc": "2.0", "id": 1, "result": map[string]interface{}{
+			"isError": isError,
+			"content": []interface{}{map[string]string{"type": "text", "text": text}},
+		}})
+	}))
+	previous, previousURL := lce, lceMCPURL
+	lce, lceMCPURL = &mcpClient{http: server.Client(), sessionID: "begin-retry"}, server.URL
+	t.Cleanup(func() { lce, lceMCPURL = previous, previousURL; server.Close() })
+
+	if err := beginLCEIndexJob(context.Background(), "tenant", "job", "root", false); err != nil {
+		t.Fatalf("begin should succeed after transient pool timeouts: %v", err)
+	}
+	if calls != 3 {
+		t.Fatalf("expected 2 retries then success, got %d calls", calls)
+	}
+}
+
+func TestBeginLCEIndexJobDoesNotRetryPermanentErrors(t *testing.T) {
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"jsonrpc": "2.0", "id": 1, "result": map[string]interface{}{
+			"isError": true,
+			"content": []interface{}{map[string]string{"type": "text", "text": `{"error":{"message":"cloud embedding space changed"}}`}},
+		}})
+	}))
+	previous, previousURL := lce, lceMCPURL
+	lce, lceMCPURL = &mcpClient{http: server.Client(), sessionID: "begin-permanent"}, server.URL
+	t.Cleanup(func() { lce, lceMCPURL = previous, previousURL; server.Close() })
+
+	err := beginLCEIndexJob(context.Background(), "tenant", "job", "root", false)
+	if err == nil || !errors.As(err, new(*indexUpstreamError)) {
+		t.Fatalf("expected upstream error, got %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("permanent errors must not be retried, got %d calls", calls)
+	}
+}

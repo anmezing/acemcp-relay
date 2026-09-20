@@ -1427,14 +1427,47 @@ func beginLCEIndexJob(ctx context.Context, userID, jobID, rootID string, replace
 	if _, err := validateMCPToolCallBody("codebase_remote_index", args); err != nil {
 		return err
 	}
-	result, err := lce.callToolWithTimeout(ctx, "codebase_remote_index", args, remoteIndexMCPCallTimeout)
-	if err != nil {
-		return newIndexUpstreamError("LCE cloud index begin failed: %w", err)
+	// begin is idempotent on the LCE side (an existing job for the same id is
+	// returned as-is), so a transient upstream shortage may be retried without
+	// creating duplicate state. Each attempt keeps its own call budget.
+	var err error
+	for attempt := 0; ; attempt++ {
+		var result *mcpToolResult
+		result, err = lce.callToolWithTimeout(ctx, "codebase_remote_index", args, remoteIndexMCPCallTimeout)
+		if err != nil {
+			err = newIndexUpstreamError("LCE cloud index begin failed: %w", err)
+		} else if result.IsError {
+			err = lceIndexToolError("LCE cloud index begin failed", result.Content)
+		} else {
+			return nil
+		}
+		if attempt >= lceBeginRetryAttempts || !isTransientLCEResourceError(err) {
+			return err
+		}
+		log.Printf("[INDEX] cloud begin retry job_id=%s attempt=%d: %v", jobID, attempt+1, err)
+		select {
+		case <-ctx.Done():
+			return err
+		case <-time.After(lceBeginRetryBackoff[attempt]):
+		}
 	}
-	if result.IsError {
-		return lceIndexToolError("LCE cloud index begin failed", result.Content)
+}
+
+const lceBeginRetryAttempts = 2
+
+var lceBeginRetryBackoff = [...]time.Duration{time.Second, 3 * time.Second}
+
+// isTransientLCEResourceError recognizes LCE-side resource contention that
+// resolves on its own within seconds: waiting for a PostgreSQL pool slot
+// (pg-pool's "timeout exceeded when trying to connect") and lock timeouts.
+// Network or provider failures are not retried here; they have their own paths.
+func isTransientLCEResourceError(err error) bool {
+	if err == nil {
+		return false
 	}
-	return nil
+	lower := strings.ToLower(err.Error())
+	return strings.Contains(lower, "timeout exceeded when trying to connect") ||
+		strings.Contains(lower, "canceling statement due to lock timeout")
 }
 
 func lceBeginIndexJobArgs(userID, jobID, rootID string, replaceRoot bool) map[string]interface{} {

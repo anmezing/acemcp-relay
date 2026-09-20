@@ -341,6 +341,8 @@ func TestClassifyIndexFailure(t *testing.T) {
 		{"generic provider quota is not relay quota", indexJobStatusFailed, "embedding provider quota exceeded", indexFailureDiagnostic{"index_failed", "unknown", "contact_admin"}},
 		{"credentials", indexJobStatusFailed, "remote-index 401: invalid api key", indexFailureDiagnostic{"provider_authentication", "provider", "fix_credentials"}},
 		{"network", indexJobStatusFailed, "dial tcp: connection refused", indexFailureDiagnostic{"network_unavailable", "network", "restart_client"}},
+		{"lce pg pool saturated", indexJobStatusFailed, "LCE cloud index begin failed: LCE cloud index begin failed: timeout exceeded when trying to connect", indexFailureDiagnostic{"upstream_bad_gateway", "remote_index", "retry_after_service_recovers"}},
+		{"lce lock timeout", indexJobStatusFailed, "LCE index call failed: canceling statement due to lock timeout", indexFailureDiagnostic{"upstream_bad_gateway", "remote_index", "retry_after_service_recovers"}},
 		{"unknown", indexJobStatusFailed, "manifest rejected", indexFailureDiagnostic{"index_failed", "unknown", "contact_admin"}},
 	}
 	for _, tc := range cases {

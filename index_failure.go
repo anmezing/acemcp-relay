@@ -96,6 +96,11 @@ func classifyIndexFailure(status, detail string) indexFailureDiagnostic {
 		return indexFailureDiagnosticsByCode["embedding_space_changed"]
 	case containsAny("remote-index 502", "bad gateway", "cloudflare", "origin web server returned"):
 		return indexFailureDiagnosticsByCode["upstream_bad_gateway"]
+	// pg-pool wording: LCE could not obtain a PostgreSQL connection in time.
+	// The service is up but saturated; it recovers on its own, unlike a client
+	// network fault, so it must not be labeled network_unavailable below.
+	case containsAny("timeout exceeded when trying to connect", "canceling statement due to lock timeout"):
+		return indexFailureDiagnosticsByCode["upstream_bad_gateway"]
 	case containsAny("payment required", "insufficient balance", "insufficient credit", "余额不足", "欠费", "billing", "remote-index 402"):
 		return indexFailureDiagnosticsByCode["provider_billing"]
 	case containsAny("too many requests", "rate limit", "rate-limit", "remote-index 429"):
