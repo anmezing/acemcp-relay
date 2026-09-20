@@ -99,7 +99,7 @@ func classifyIndexFailure(status, detail string) indexFailureDiagnostic {
 	// pg-pool wording: LCE could not obtain a PostgreSQL connection in time.
 	// The service is up but saturated; it recovers on its own, unlike a client
 	// network fault, so it must not be labeled network_unavailable below.
-	case containsAny("timeout exceeded when trying to connect", "canceling statement due to lock timeout"):
+	case containsAny("timeout exceeded when trying to connect", "canceling statement due to lock timeout", "cloud platform maintenance in progress"):
 		return indexFailureDiagnosticsByCode["upstream_bad_gateway"]
 	case containsAny("payment required", "insufficient balance", "insufficient credit", "余额不足", "欠费", "billing", "remote-index 402"):
 		return indexFailureDiagnosticsByCode["provider_billing"]

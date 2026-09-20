@@ -82,6 +82,10 @@ func lceIndexToolError(prefix string, content []byte) error {
 			return newIndexUpstreamDiagnosticError(
 				"provider_invalid_request", "%s: %s", prefix, message,
 			)
+		case "PLATFORM_MAINTENANCE_IN_PROGRESS":
+			return newIndexUpstreamDiagnosticError(
+				"upstream_bad_gateway", "%s: %s", prefix, message,
+			)
 		}
 		return newIndexUpstreamError("%s: %s", prefix, message)
 	}
@@ -1457,17 +1461,19 @@ const lceBeginRetryAttempts = 2
 
 var lceBeginRetryBackoff = [...]time.Duration{time.Second, 3 * time.Second}
 
-// isTransientLCEResourceError recognizes LCE-side resource contention that
-// resolves on its own within seconds: waiting for a PostgreSQL pool slot
-// (pg-pool's "timeout exceeded when trying to connect") and lock timeouts.
-// Network or provider failures are not retried here; they have their own paths.
+// isTransientLCEResourceError recognizes LCE-side contention that resolves on
+// its own within seconds: waiting for a PostgreSQL pool slot (pg-pool's
+// "timeout exceeded when trying to connect"), lock timeouts, and the platform
+// lock being held by a configuration write. Network or provider failures are
+// not retried here; they have their own paths.
 func isTransientLCEResourceError(err error) bool {
 	if err == nil {
 		return false
 	}
 	lower := strings.ToLower(err.Error())
 	return strings.Contains(lower, "timeout exceeded when trying to connect") ||
-		strings.Contains(lower, "canceling statement due to lock timeout")
+		strings.Contains(lower, "canceling statement due to lock timeout") ||
+		strings.Contains(lower, "cloud platform maintenance in progress")
 }
 
 func lceBeginIndexJobArgs(userID, jobID, rootID string, replaceRoot bool) map[string]interface{} {

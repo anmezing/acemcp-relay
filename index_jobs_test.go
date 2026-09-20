@@ -785,6 +785,22 @@ func TestLCEIndexToolErrorPreservesProviderInvalidRequestDiagnostic(t *testing.T
 	}
 }
 
+func TestLCEIndexToolErrorMapsPlatformMaintenanceToUpstream(t *testing.T) {
+	content := []byte(`{"ok":false,"error":{"message":"cloud platform maintenance in progress; retry shortly","code":"PLATFORM_MAINTENANCE_IN_PROGRESS"}}`)
+	err := lceIndexToolError("LCE cloud index begin failed", content)
+
+	upstream, ok := err.(*indexUpstreamError)
+	if !ok {
+		t.Fatalf("expected indexUpstreamError, got %T: %v", err, err)
+	}
+	if upstream.code != "upstream_bad_gateway" {
+		t.Fatalf("diagnostic code = %q, want upstream_bad_gateway", upstream.code)
+	}
+	if !isTransientLCEResourceError(err) {
+		t.Fatal("platform maintenance must be retried by begin")
+	}
+}
+
 func TestLCEIndexToolErrorKeepsUnknownStructuredErrorGeneric(t *testing.T) {
 	content := []byte(`{"ok":false,"error":{"message":"provider unavailable","code":"SOME_FUTURE_CODE"}}`)
 	err := lceIndexToolError("LCE index call failed", content)
