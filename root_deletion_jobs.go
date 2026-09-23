@@ -220,7 +220,7 @@ func loadRootDeletions(ctx context.Context, tenantID string) ([]rootDeletionJob,
 func claimRootDeletion(ctx context.Context) (rootDeletionJob, error) {
 	return scanRootDeletion(db.QueryRowContext(ctx, `WITH exhausted AS (
 		UPDATE root_deletion_jobs SET recovery_required=TRUE, updated_at=NOW(),
-			error='自动恢复已暂停，删除结果仍未确认。请恢复此任务；索引保护将继续保留。'
+			error='自动重试已停止，删除结果仍未确认。请点击该索引行的「重试删除」；在此之前该工作区的索引会保持暂停。'
 		WHERE id IN (SELECT id FROM root_deletion_jobs
 			WHERE status='running' AND claim_until < NOW() AND attempt_count >= $3 AND NOT recovery_required
 			ORDER BY created_at LIMIT 100 FOR UPDATE SKIP LOCKED)
@@ -252,7 +252,7 @@ func recordRootDeletionError(job rootDeletionJob, deferOnly bool, detail string)
 	}
 	recoveryRequired := attempts >= rootDeletionMaxAttempts
 	if recoveryRequired {
-		message = "自动恢复已暂停，删除结果仍未确认。请恢复此任务；索引保护将继续保留。"
+		message = "自动重试已停止，删除结果仍未确认。请点击该索引行的「重试删除」；在此之前该工作区的索引会保持暂停。"
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), rootDeletionRequestTimeout)
 	defer cancel()
