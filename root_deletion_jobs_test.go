@@ -521,7 +521,7 @@ func TestRootDeletionLegacyEndpointReturnsBusyImmediately(t *testing.T) {
 		}
 		expectIndexOperationLock(mock, "actor-a")
 		mock.ExpectQuery("WITH expired AS").
-			WithArgs(sqlmock.AnyArg(), "actor-a", "*", indexOperationExclusive, "delete-root", indexOperationLeaseDuration.Milliseconds(), indexOperationExclusive).
+			WithArgs(sqlmock.AnyArg(), "actor-a", "*", indexOperationExclusive, "delete-root", indexOperationLeaseDuration.Milliseconds(), indexOperationExclusive, indexUploadBatchKind, maxConcurrentIndexUploadsPerJob).
 			WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
 		mock.ExpectCommit()
 		c, recorder := newRootAdminContext(t, "actor-a", "POST", `{"root_id":"repo-a"}`)
@@ -536,7 +536,7 @@ func TestRootDeletionAcquiredLeaseOutlivesAcquireContext(t *testing.T) {
 	withMockDB(t, func(mock sqlmock.Sqlmock) {
 		expectIndexOperationLock(mock, "actor-a")
 		mock.ExpectQuery("WITH expired AS").
-			WithArgs(sqlmock.AnyArg(), "actor-a", "*", indexOperationExclusive, "delete-root", indexOperationLeaseDuration.Milliseconds(), indexOperationExclusive).
+			WithArgs(sqlmock.AnyArg(), "actor-a", "*", indexOperationExclusive, "delete-root", indexOperationLeaseDuration.Milliseconds(), indexOperationExclusive, indexUploadBatchKind, maxConcurrentIndexUploadsPerJob).
 			WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
 		mock.ExpectCommit()
 		mock.ExpectExec(regexp.QuoteMeta("DELETE FROM index_operation_leases WHERE user_id = $1 AND lease_token = $2")).
@@ -586,7 +586,7 @@ func TestRootDeletionWorkerMayAcquireLeaseThroughOwnDurableMarker(t *testing.T) 
 	withMockDB(t, func(mock sqlmock.Sqlmock) {
 		expectIndexOperationLock(mock, "tenant-a")
 		mock.ExpectQuery(`(?s)WITH expired AS.*AND NOT EXISTS \(.*FROM root_deletion_jobs.*AND \$5::text <> 'delete-root-job'`).
-			WithArgs(sqlmock.AnyArg(), "tenant-a", "*", indexOperationExclusive, "delete-root-job", indexOperationLeaseDuration.Milliseconds(), indexOperationExclusive).
+			WithArgs(sqlmock.AnyArg(), "tenant-a", "*", indexOperationExclusive, "delete-root-job", indexOperationLeaseDuration.Milliseconds(), indexOperationExclusive, indexUploadBatchKind, maxConcurrentIndexUploadsPerJob).
 			WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
 		mock.ExpectCommit()
 		mock.ExpectExec("DELETE FROM index_operation_leases").

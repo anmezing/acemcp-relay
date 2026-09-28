@@ -126,7 +126,7 @@ func TestCreateIndexJobReturnsBusyWithoutCreatingProviderWork(t *testing.T) {
 		mock.ExpectQuery("WITH expired AS").
 			WithArgs(
 				sqlmock.AnyArg(), "user-a", "*", indexOperationExclusive, "create-job",
-				indexOperationLeaseDuration.Milliseconds(), indexOperationExclusive,
+				indexOperationLeaseDuration.Milliseconds(), indexOperationExclusive, indexUploadBatchKind, maxConcurrentIndexUploadsPerJob,
 			).
 			WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
 		mock.ExpectCommit()
@@ -184,7 +184,7 @@ func TestCreateIndexJobReturnsUnchangedWithoutCreatingProviderWork(t *testing.T)
 		mock.ExpectQuery("WITH expired AS").
 			WithArgs(
 				sqlmock.AnyArg(), "user-a", "*", indexOperationExclusive, "create-job",
-				indexOperationLeaseDuration.Milliseconds(), indexOperationExclusive,
+				indexOperationLeaseDuration.Milliseconds(), indexOperationExclusive, indexUploadBatchKind, maxConcurrentIndexUploadsPerJob,
 			).
 			WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
 		mock.ExpectCommit()

@@ -915,7 +915,7 @@ func uploadIndexBatch(ctx context.Context, userID string, req indexUploadRequest
 		return indexBatchResponse{}, err
 	}
 	lease, err := acquireSharedIndexOperation(
-		ctx, userID, indexJobOperationResource(req.JobID), "upload-batch",
+		ctx, userID, indexJobOperationResource(req.JobID), indexUploadBatchKind,
 	)
 	if err != nil {
 		return indexBatchResponse{}, err

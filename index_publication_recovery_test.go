@@ -51,7 +51,7 @@ func publicationUpstream(t *testing.T, replies map[string]string, calls *[]strin
 
 func expectPublicationLease(mock sqlmock.Sqlmock, acquired bool) {
 	expectIndexOperationLock(mock, "tenant")
-	mock.ExpectQuery("WITH expired AS").WithArgs(sqlmock.AnyArg(), "tenant", "job:job", indexOperationShared, "reconcile-publication", indexOperationLeaseDuration.Milliseconds(), indexOperationExclusive).
+	mock.ExpectQuery("WITH expired AS").WithArgs(sqlmock.AnyArg(), "tenant", "job:job", indexOperationShared, "reconcile-publication", indexOperationLeaseDuration.Milliseconds(), indexOperationExclusive, indexUploadBatchKind, maxConcurrentIndexUploadsPerJob).
 		WillReturnRows(sqlmock.NewRows([]string{"acquired"}).AddRow(acquired))
 	mock.ExpectCommit()
 	if acquired {

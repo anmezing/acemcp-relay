@@ -24,7 +24,7 @@ func TestTryAcquireIndexOperationInsertsAvailableSharedLease(t *testing.T) {
 
 	expectIndexOperationLock(mock, "user-1")
 	mock.ExpectQuery("WITH expired AS").
-		WithArgs("lease-1", "user-1", "job:job-1", indexOperationShared, "upload-batch", indexOperationLeaseDuration.Milliseconds(), indexOperationExclusive).
+		WithArgs("lease-1", "user-1", "job:job-1", indexOperationShared, "upload-batch", indexOperationLeaseDuration.Milliseconds(), indexOperationExclusive, indexUploadBatchKind, maxConcurrentIndexUploadsPerJob).
 		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
 	mock.ExpectCommit()
 
@@ -54,7 +54,7 @@ func TestTryAcquireIndexOperationDoesNotInsertOnConflict(t *testing.T) {
 
 	expectIndexOperationLock(mock, "user-1")
 	mock.ExpectQuery("WITH expired AS").
-		WithArgs("lease-2", "user-1", "job:job-1", indexOperationShared, "upload-batch", indexOperationLeaseDuration.Milliseconds(), indexOperationExclusive).
+		WithArgs("lease-2", "user-1", "job:job-1", indexOperationShared, "upload-batch", indexOperationLeaseDuration.Milliseconds(), indexOperationExclusive, indexUploadBatchKind, maxConcurrentIndexUploadsPerJob).
 		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
 	mock.ExpectCommit()
 
@@ -84,7 +84,7 @@ func TestTryAcquireExclusiveIndexOperationConflictsWithAnyActiveLease(t *testing
 
 	expectIndexOperationLock(mock, "user-1")
 	mock.ExpectQuery("WITH expired AS").
-		WithArgs("lease-3", "user-1", "*", indexOperationExclusive, "clear-index", indexOperationLeaseDuration.Milliseconds(), indexOperationExclusive).
+		WithArgs("lease-3", "user-1", "*", indexOperationExclusive, "clear-index", indexOperationLeaseDuration.Milliseconds(), indexOperationExclusive, indexUploadBatchKind, maxConcurrentIndexUploadsPerJob).
 		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
 	mock.ExpectCommit()
 

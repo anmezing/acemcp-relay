@@ -21,6 +21,11 @@ const (
 	indexOperationLeaseDuration = 2 * time.Minute
 	indexOperationRenewInterval = 30 * time.Second
 	indexOperationAcquirePoll   = 100 * time.Millisecond
+
+	indexUploadBatchKind = "upload-batch"
+	// Batches of one job carry disjoint paths and LCE serializes their staging
+	// commit on the job row, so they may overlap up to this bound.
+	maxConcurrentIndexUploadsPerJob = 4
 )
 
 type indexOperationLease struct {
@@ -53,7 +58,8 @@ func (l *indexOperationLease) Release() {
 
 func acquireSharedIndexOperation(ctx context.Context, userID, resource, kind string) (*indexOperationLease, error) {
 	// "shared" means shared at the user scope: different resources may run in
-	// parallel, while the SQL conflict predicate still serializes one resource.
+	// parallel, while the SQL conflict predicate still serializes one resource,
+	// except that upload batches of one job may overlap with each other.
 	return acquireIndexOperation(ctx, userID, resource, kind, indexOperationShared)
 }
 
@@ -157,8 +163,13 @@ func tryAcquireIndexOperation(
 				SELECT 1 FROM index_operation_leases
 				WHERE user_id = $2
 				  AND lease_expires_at > NOW()
-				  AND (mode = $7::text OR $4::text = $7::text OR resource = $3)
+				  AND (mode = $7::text OR $4::text = $7::text
+				       OR (resource = $3 AND NOT (kind = $8::text AND $5::text = $8::text)))
 			)
+			AND ($5::text <> $8::text OR (
+				SELECT COUNT(*) FROM index_operation_leases
+				WHERE user_id = $2 AND lease_expires_at > NOW() AND resource = $3 AND kind = $8::text
+			) < $9)
 			AND NOT EXISTS (
 				SELECT 1 FROM root_deletion_jobs
 				WHERE user_id = $2 AND status IN ('queued', 'running')
@@ -170,7 +181,8 @@ func tryAcquireIndexOperation(
 			RETURNING 1
 		)
 		SELECT EXISTS(SELECT 1 FROM inserted)
-	`, token, userID, resource, mode, kind, indexOperationLeaseDuration.Milliseconds(), indexOperationExclusive).Scan(&acquired); err != nil {
+	`, token, userID, resource, mode, kind, indexOperationLeaseDuration.Milliseconds(), indexOperationExclusive,
+		indexUploadBatchKind, maxConcurrentIndexUploadsPerJob).Scan(&acquired); err != nil {
 		return false, err
 	}
 	if err := tx.Commit(); err != nil {
