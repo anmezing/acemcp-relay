@@ -212,6 +212,8 @@ services:
       - lce_data:/data
     environment:
       LCE_HOME: /data
+      # This worker runs graph extraction, so the opt-in compiler backends can be switched on here.
+      GRAPH_GO_COMPILER_ENABLED: ${GRAPH_GO_COMPILER_ENABLED:-false}
       LCE_CLOUD_DATABASE_URL: ${LCE_CLOUD_DATABASE_URL:?set a PostgreSQL URL whose server has pgvector installed}
       # Decrypts the persisted platform model config this worker loads each iteration.
       LCE_TENANT_ASSERTION_SECRET: ${LCE_TENANT_ASSERTION_SECRET:?set LCE_TENANT_ASSERTION_SECRET in .env (>=32 chars, shared with lce)}
