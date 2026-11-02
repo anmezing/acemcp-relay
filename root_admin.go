@@ -42,6 +42,26 @@ func loadActiveIndexJob(ctx context.Context, userID string) (*activeIndexJob, er
 	return &job, nil
 }
 
+// loadActiveIndexJobForRoot 取该租户在 rootID 上的 running 任务；没有则返回 (nil, nil)。
+// root 限定的检索只能报告这个 root 自己的构建进度：租户里另一个 root 正在构建
+// 与本次响应用到的索引无关，塞进去会让调用方以为自己查的视图没就绪。
+func loadActiveIndexJobForRoot(ctx context.Context, userID, rootID string) (*activeIndexJob, error) {
+	var job activeIndexJob
+	err := db.QueryRowContext(ctx, `
+		SELECT root_id, indexed_files, total_files, phase
+		FROM index_jobs
+		WHERE user_id = $1 AND root_id = $2 AND status = 'running'
+		ORDER BY started_at DESC LIMIT 1
+	`, userID, rootID).Scan(&job.RootID, &job.IndexedFiles, &job.TotalFiles, &job.Phase)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &job, nil
+}
+
 // indexStatusPayload 是检索响应顶层 _index_status 的契约字段，前端依赖，不可改名。
 func (j *activeIndexJob) indexStatusPayload() map[string]interface{} {
 	return map[string]interface{}{

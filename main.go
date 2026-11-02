@@ -2602,10 +2602,16 @@ func handleMCPToolsCall(c *gin.Context, id json.RawMessage, params json.RawMessa
 	}
 
 	// _index_status 只注入 codebase-retrieval 的成功 JSON 响应；查询失败只降级为
-	// 不注入（进度可见是 best-effort，不能拖垮检索本身）。
+	// 不注入（进度可见是 best-effort，不能拖垮检索本身）。带 root_id 的请求只看
+	// 该 root 的任务（root_id 已在参数校验里保证是非空字符串）。
 	var activeJob *activeIndexJob
 	if p.Name == "codebase-retrieval" && !result.IsError {
-		if activeJob, err = loadActiveIndexJob(c.Request.Context(), tenantID); err != nil {
+		if rootID, _ := p.Arguments["root_id"].(string); rootID != "" {
+			activeJob, err = loadActiveIndexJobForRoot(c.Request.Context(), tenantID, rootID)
+		} else {
+			activeJob, err = loadActiveIndexJob(c.Request.Context(), tenantID)
+		}
+		if err != nil {
 			log.Printf("[INDEX_STATUS] active job lookup failed (tenant=%s): %v", tenantID, err)
 			activeJob = nil
 		}

@@ -126,6 +126,31 @@ func TestLoadActiveIndexJobReturnsNilWithoutRunningJob(t *testing.T) {
 	})
 }
 
+func TestLoadActiveIndexJobForRootIgnoresOtherRootsJobs(t *testing.T) {
+	withMockDB(t, func(mock sqlmock.Sqlmock) {
+		mock.ExpectQuery("FROM index_jobs").
+			WithArgs("user-1", "repo-b@dev").
+			WillReturnRows(activeJobRows())
+		job, err := loadActiveIndexJobForRoot(context.Background(), "user-1", "repo-b@dev")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if job != nil {
+			t.Fatalf("a job on another root must not surface for a root-scoped retrieval, got %+v", job)
+		}
+		mock.ExpectQuery("FROM index_jobs").
+			WithArgs("user-1", "repo-b@dev").
+			WillReturnRows(activeJobRows().AddRow("repo-b@dev", 2, 8, "indexing"))
+		job, err = loadActiveIndexJobForRoot(context.Background(), "user-1", "repo-b@dev")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if job == nil || job.RootID != "repo-b@dev" || job.IndexedFiles != 2 || job.TotalFiles != 8 {
+			t.Fatalf("unexpected root-scoped active job: %+v", job)
+		}
+	})
+}
+
 func TestInjectRetrievalIndexStatusAddsStatus(t *testing.T) {
 	active := &activeIndexJob{RootID: "repo-a", IndexedFiles: 3, TotalFiles: 9, Phase: "indexing"}
 	out := injectRetrievalIndexStatus([]byte(`{"results":[1]}`), active)
